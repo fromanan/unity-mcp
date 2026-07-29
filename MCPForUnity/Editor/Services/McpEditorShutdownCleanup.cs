@@ -59,7 +59,13 @@ namespace MCPForUnity.Editor.Services
             // domain reloads must NOT stop the server (and don't — this handler is gated on EditorApplication.quitting).
             try
             {
-                MCPServiceLocator.Server.StopManagedLocalHttpServer();
+                bool stopped = MCPServiceLocator.Server.StopManagedLocalHttpServer();
+                if (!stopped && MCPServiceLocator.Server.IsLocalHttpServerRunning())
+                {
+                    McpLog.Warn(
+                        "Shutdown cleanup: the managed local HTTP server is still running. " +
+                        "Launch tracking was preserved for a later cleanup retry.");
+                }
             }
             catch (Exception ex)
             {

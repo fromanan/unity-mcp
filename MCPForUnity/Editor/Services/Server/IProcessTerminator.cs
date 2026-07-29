@@ -12,7 +12,8 @@ namespace MCPForUnity.Editor.Services.Server
         /// On Windows: Tries taskkill, then taskkill /F.
         /// </summary>
         /// <param name="pid">The process ID to terminate</param>
+        /// <param name="expectedPort">Optional port that must also be released</param>
         /// <returns>True if the process was terminated successfully</returns>
-        bool Terminate(int pid);
+        bool Terminate(int pid, int? expectedPort = null);
     }
 }

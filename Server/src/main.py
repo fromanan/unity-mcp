@@ -15,6 +15,11 @@ from services.custom_tool_service import (
     resolve_project_id_for_unity_instance,
 )
 from core.config import config
+from http_runtime import (
+    add_local_control_routes,
+    http_runtime_controller,
+    run_http_server,
+)
 from starlette.routing import WebSocketRoute
 from starlette.responses import JSONResponse
 import argparse
@@ -392,6 +397,9 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
             "message": "MCP for Unity server is running"
         })
 
+    if not config.http_remote_hosted:
+        add_local_control_routes(mcp)
+
     @mcp.custom_route("/api/auth/login-url", methods=["GET"])
     async def auth_login_url(_: Request) -> JSONResponse:
         """Return the login URL for users to obtain/manage API keys."""
@@ -727,6 +735,23 @@ Examples:
              "Can also set via UNITY_MCP_HTTP_REMOTE_HOSTED=true."
     )
     parser.add_argument(
+        "--http-session-idle-timeout",
+        type=float,
+        default=1800.0,
+        metavar="SECONDS",
+        help="Expire inactive Streamable HTTP sessions after this many seconds "
+             "(default: 1800). Can also set via "
+             "UNITY_MCP_HTTP_SESSION_IDLE_TIMEOUT."
+    )
+    parser.add_argument(
+        "--http-max-sessions",
+        type=int,
+        default=64,
+        metavar="COUNT",
+        help="Maximum concurrent Streamable HTTP sessions (default: 64). "
+             "Can also set via UNITY_MCP_HTTP_MAX_SESSIONS."
+    )
+    parser.add_argument(
         "--api-key-validation-url",
         type=str,
         default=None,
@@ -808,6 +833,32 @@ Examples:
         bool(args.http_remote_hosted)
         or os.environ.get("UNITY_MCP_HTTP_REMOTE_HOSTED", "").lower() in ("true", "1", "yes", "on")
     )
+    try:
+        config.http_session_idle_timeout_seconds = float(
+            os.environ.get(
+                "UNITY_MCP_HTTP_SESSION_IDLE_TIMEOUT",
+                str(args.http_session_idle_timeout),
+            )
+        )
+    except ValueError:
+        logger.error("HTTP session idle timeout must be a number")
+        raise SystemExit(2)
+    try:
+        config.http_max_sessions = int(
+            os.environ.get(
+                "UNITY_MCP_HTTP_MAX_SESSIONS",
+                str(args.http_max_sessions),
+            )
+        )
+    except ValueError:
+        logger.error("HTTP max sessions must be an integer")
+        raise SystemExit(2)
+    if config.http_session_idle_timeout_seconds <= 0:
+        logger.error("HTTP session idle timeout must be positive")
+        raise SystemExit(2)
+    if config.http_max_sessions <= 0:
+        logger.error("HTTP max sessions must be positive")
+        raise SystemExit(2)
 
     # API key authentication configuration
     config.api_key_validation_url = (
@@ -919,16 +970,27 @@ Examples:
 
     # Determine transport mode
     if config.transport_mode == 'http':
-        # Use HTTP transport for FastMCP
-        transport = 'http'
         # Use the parsed host and port from URL/args
         http_url = os.environ.get("UNITY_MCP_HTTP_URL", args.http_url)
         parsed_url = urlparse(http_url)
         host = args.http_host or os.environ.get(
             "UNITY_MCP_HTTP_HOST") or parsed_url.hostname or "127.0.0.1"
         port = args.http_port or _env_port or parsed_url.port or 8080
-        logger.info(f"Starting FastMCP with HTTP transport on {host}:{port}")
-        mcp.run(transport=transport, host=host, port=port)
+        logger.info(
+            "Starting FastMCP with HTTP transport on %s:%s "
+            "(session idle timeout=%ss, max sessions=%s)",
+            host,
+            port,
+            config.http_session_idle_timeout_seconds,
+            config.http_max_sessions,
+        )
+        run_http_server(
+            mcp,
+            host=host,
+            port=port,
+            session_idle_timeout=config.http_session_idle_timeout_seconds,
+            max_sessions=config.http_max_sessions,
+        )
     else:
         # Use stdio transport for traditional MCP
         logger.info("Starting FastMCP with stdio transport")

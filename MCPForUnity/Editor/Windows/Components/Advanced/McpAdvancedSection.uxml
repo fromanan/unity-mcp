@@ -62,6 +62,32 @@
             </ui:VisualElement>
 
             <ui:VisualElement class="override-row" style="margin-top: 8px;">
+                <ui:Label text="Managed Server Limits" class="override-label" />
+            </ui:VisualElement>
+            <ui:VisualElement class="setting-row">
+                <ui:Label text="Memory Warning (MiB):" class="setting-label" />
+                <uie:IntegerField name="server-memory-soft-limit-mb" value="512" class="override-field" />
+            </ui:VisualElement>
+            <ui:VisualElement class="setting-row">
+                <ui:Label text="Enable Hard Memory Limit:" class="setting-label" />
+                <ui:Toggle name="server-memory-hard-limit-enabled" class="setting-toggle" />
+            </ui:VisualElement>
+            <ui:VisualElement class="setting-row">
+                <ui:Label text="Hard Memory Limit (MiB):" class="setting-label" />
+                <uie:IntegerField name="server-memory-hard-limit-mb" value="768" class="override-field" />
+            </ui:VisualElement>
+            <ui:VisualElement class="setting-row">
+                <ui:Label text="Session Idle Timeout (s):" class="setting-label" />
+                <uie:IntegerField name="server-session-idle-timeout-seconds" value="1800" class="override-field" />
+            </ui:VisualElement>
+            <ui:VisualElement class="setting-row">
+                <ui:Label text="Maximum HTTP Sessions:" class="setting-label" />
+                <uie:IntegerField name="server-max-sessions" value="64" class="override-field" />
+            </ui:VisualElement>
+            <ui:Label name="server-runtime-status" class="help-text" />
+            <ui:Button name="stop-server-tree-button" text="Stop Managed Server Tree" class="action-button" />
+
+            <ui:VisualElement class="override-row" style="margin-top: 8px;">
                 <ui:Label text="Screenshots Folder:" class="override-label" />
             </ui:VisualElement>
             <ui:VisualElement class="path-override-controls">

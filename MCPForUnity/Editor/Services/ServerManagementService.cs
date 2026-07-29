@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Server;
@@ -21,13 +23,14 @@ namespace MCPForUnity.Editor.Services
         private readonly IProcessTerminator _processTerminator;
         private readonly IServerCommandBuilder _commandBuilder;
         private readonly ITerminalLauncher _terminalLauncher;
+        private readonly IServerRuntimeInstaller _runtimeInstaller;
 
         private System.Diagnostics.Process _lastLaunchedProcess;
 
         /// <summary>
         /// Creates a new ServerManagementService with default dependencies.
         /// </summary>
-        public ServerManagementService() : this(null, null, null, null, null) { }
+        public ServerManagementService() : this(null, null, null, null, null, null) { }
 
         /// <summary>
         /// Creates a new ServerManagementService with injected dependencies (for testing).
@@ -42,13 +45,15 @@ namespace MCPForUnity.Editor.Services
             IPidFileManager pidFileManager = null,
             IProcessTerminator processTerminator = null,
             IServerCommandBuilder commandBuilder = null,
-            ITerminalLauncher terminalLauncher = null)
+            ITerminalLauncher terminalLauncher = null,
+            IServerRuntimeInstaller runtimeInstaller = null)
         {
             _processDetector = processDetector ?? new ProcessDetector();
             _pidFileManager = pidFileManager ?? new PidFileManager();
             _processTerminator = processTerminator ?? new ProcessTerminator(_processDetector);
             _commandBuilder = commandBuilder ?? new ServerCommandBuilder();
             _terminalLauncher = terminalLauncher ?? new TerminalLauncher();
+            _runtimeInstaller = runtimeInstaller ?? new ServerRuntimeInstaller();
         }
 
         private string QuoteIfNeeded(string s)
@@ -241,7 +246,7 @@ namespace MCPForUnity.Editor.Services
             /// Clean stale Python build artifacts when using a local dev server path
             AssetPathUtility.CleanLocalServerBuildArtifacts();
 
-            if (!TryGetLocalHttpServerCommandParts(out _, out _, out var displayCommand, out var error))
+            if (!TryGetLocalHttpServerCommandParts(out _, out _, out _, out var error))
             {
                 if (!quiet)
                 {
@@ -288,12 +293,9 @@ namespace MCPForUnity.Editor.Services
             int portForPid = uriForPid?.Port ?? 0;
             string instanceToken = Guid.NewGuid().ToString("N");
             string pidFilePath = portForPid > 0 ? GetLocalHttpServerPidFilePath(portForPid) : null;
-
-            string launchCommand = displayCommand;
-            if (!string.IsNullOrEmpty(pidFilePath))
-            {
-                launchCommand = $"{displayCommand} --pidfile {QuoteIfNeeded(pidFilePath)} --unity-instance-token {instanceToken}";
-            }
+            string stateFilePath = portForPid > 0
+                ? GetLocalHttpServerStateFilePath(portForPid)
+                : null;
 
             // First-time-only confirmation. Subsequent launches (and the quiet auto-start path) skip the dialog.
             if (!quiet && !EditorPrefs.GetBool(EditorPrefKeys.HttpServerLaunchConfirmed, false))
@@ -342,6 +344,23 @@ namespace MCPForUnity.Editor.Services
 
                 McpLog.Info("Starting local HTTP server… (first run may take a minute while dependencies install)");
 
+                if (!_runtimeInstaller.EnsureInstalled(out var runtime, out var installError))
+                {
+                    throw new InvalidOperationException(installError);
+                }
+                if (!_commandBuilder.TryBuildInstalledCommand(
+                    runtime,
+                    GetCurrentProcessIdSafe(),
+                    portForPid,
+                    stateFilePath,
+                    pidFilePath,
+                    instanceToken,
+                    out var launchCommand,
+                    out var commandError))
+                {
+                    throw new InvalidOperationException(commandError);
+                }
+
                 // Launch the server headless (no terminal window); stdout+stderr go to the launch log.
                 string effectiveLog = launchLog ?? Path.Combine(Path.GetTempPath(), "mcp-for-unity-server-launch.log");
                 var startInfo = CreateHeadlessProcessStartInfo(launchCommand, effectiveLog);
@@ -363,6 +382,12 @@ namespace MCPForUnity.Editor.Services
                 if (!string.IsNullOrEmpty(pidFilePath))
                 {
                     StoreLocalHttpServerHandshake(pidFilePath, instanceToken);
+                    if (!string.IsNullOrEmpty(stateFilePath))
+                    {
+                        EditorPrefs.SetString(
+                            EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                            stateFilePath);
+                    }
                 }
                 return true;
             }
@@ -698,7 +723,8 @@ namespace MCPForUnity.Editor.Services
 
                             if (pidIsListener && allowKill)
                             {
-                                if (TerminateProcess(pidFromFile))
+                                if (TryRequestGracefulShutdown(instanceToken, pidFromFile, port)
+                                    || TerminateProcess(pidFromFile, port))
                                 {
                                     stoppedAny = true;
                                     try { DeletePidFile(pidFilePath); } catch { }
@@ -812,7 +838,7 @@ namespace MCPForUnity.Editor.Services
                                                 || storedArgsLowerNow.Contains("python");
                                 }
 
-                                if (allowKill && TerminateProcess(storedPid))
+                                if (allowKill && TerminateProcess(storedPid, port))
                                 {
                                     if (!quiet)
                                     {
@@ -858,7 +884,7 @@ namespace MCPForUnity.Editor.Services
                         continue;
                     }
 
-                    if (TerminateProcess(pid))
+                    if (TerminateProcess(pid, port))
                     {
                         McpLog.Info($"Stopped local HTTP server on port {port} (PID: {pid})");
                         stoppedAny = true;
@@ -872,11 +898,12 @@ namespace MCPForUnity.Editor.Services
                     }
                 }
 
-                if (stoppedAny)
+                if (stoppedAny && GetListeningProcessIdsForPort(port).Count == 0)
                 {
                     ClearLocalServerPidTracking();
+                    return true;
                 }
-                return stoppedAny;
+                return false;
             }
             catch (Exception ex)
             {
@@ -918,9 +945,53 @@ namespace MCPForUnity.Editor.Services
             return _processDetector.LooksLikeMcpServerProcess(pid);
         }
 
-        private bool TerminateProcess(int pid)
+        private bool TerminateProcess(int pid, int? expectedPort = null)
         {
-            return _processTerminator.Terminate(pid);
+            return _processTerminator.Terminate(pid, expectedPort);
+        }
+
+        private bool TryRequestGracefulShutdown(string instanceToken, int pid, int port)
+        {
+            if (string.IsNullOrWhiteSpace(instanceToken) || pid <= 1 || port <= 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                string shutdownUrl = $"http://127.0.0.1:{port}/api/shutdown";
+                var request = (HttpWebRequest)WebRequest.Create(shutdownUrl);
+                request.Method = "POST";
+                request.Timeout = 1000;
+                request.ReadWriteTimeout = 1000;
+                request.ContentLength = 0;
+                request.Headers["X-Unity-MCP-Instance-Token"] = instanceToken;
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    if ((int)response.StatusCode != 202)
+                    {
+                        return false;
+                    }
+                }
+
+                DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+                while (DateTime.UtcNow < deadline)
+                {
+                    if (!_processDetector.ProcessExists(pid)
+                        && GetListeningProcessIdsForPort(port).Count == 0)
+                    {
+                        return true;
+                    }
+                    Thread.Sleep(100);
+                }
+            }
+            catch
+            {
+                // Compatibility servers do not expose the endpoint. The verified
+                // process-tree termination path handles those versions.
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -930,7 +1001,24 @@ namespace MCPForUnity.Editor.Services
         {
             command = null;
             error = null;
-            if (!TryGetLocalHttpServerCommandParts(out var fileName, out var args, out var displayCommand, out error))
+            string baseUrl = HttpEndpointUtility.GetLocalBaseUrl();
+            if (_runtimeInstaller.TryGetInstalled(out var runtime)
+                && Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
+                && uri.Port > 0
+                && _commandBuilder.TryBuildInstalledCommand(
+                    runtime,
+                    GetCurrentProcessIdSafe(),
+                    uri.Port,
+                    GetLocalHttpServerStateFilePath(uri.Port),
+                    GetLocalHttpServerPidFilePath(uri.Port),
+                    "<generated-at-launch>",
+                    out command,
+                    out error))
+            {
+                return true;
+            }
+
+            if (!TryGetLocalHttpServerCommandParts(out _, out _, out var displayCommand, out error))
             {
                 return false;
             }
@@ -1013,6 +1101,17 @@ namespace MCPForUnity.Editor.Services
         {
             string dir = Path.Combine(_terminalLauncher.GetProjectRootPath(), "Library", "MCPForUnity", "Logs");
             return Path.Combine(dir, $"server-launch-{port}.log");
+        }
+
+        private string GetLocalHttpServerStateFilePath(int port)
+        {
+            string dir = Path.Combine(
+                _terminalLauncher.GetProjectRootPath(),
+                "Library",
+                "MCPForUnity",
+                "RunState");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, $"mcp_http_{port}.state.json");
         }
 
         public bool HasManagedServerLaunchHandle => _lastLaunchedProcess != null;

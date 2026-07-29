@@ -38,6 +38,7 @@ MCP tools call Unity via WebSocket (`send_with_unity_instance`). CLI commands ca
 
 - **Stdio**: Single-agent only. Separate Python process per client. Legacy TCP bridge to Unity. New connections stomp old ones.
 - **HTTP**: Multi-agent ready. Single shared Python server. WebSocket hub at `/hub/plugin`. Session isolation via `client_id`.
+- **Managed local HTTP lifecycle**: Unity installs a project-local server runtime, then launches it directly. On Windows a small supervisor owns a Job Object that contains the complete server process tree. See `docs/development/server-memory-lifecycle.md`.
 
 ## Code Philosophy
 

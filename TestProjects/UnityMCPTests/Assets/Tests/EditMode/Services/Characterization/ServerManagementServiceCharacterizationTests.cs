@@ -145,10 +145,49 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 return true;
             }
 
+            public bool TryBuildInstalledCommand(
+                InstalledServerRuntime runtime,
+                int parentPid,
+                int port,
+                string stateFilePath,
+                string pidFilePath,
+                string instanceToken,
+                out string command,
+                out string error)
+            {
+                command = "echo server-started";
+                error = null;
+                return true;
+            }
+
             public string BuildUvPathFromUvx(string uvxPath) => uvxPath;
             public string GetPlatformSpecificPathPrepend() => string.Empty;
             public string QuoteIfNeeded(string input) =>
                 (!string.IsNullOrEmpty(input) && input.Contains(" ")) ? "\"" + input + "\"" : input;
+        }
+
+        private sealed class FakeRuntimeInstaller : IServerRuntimeInstaller
+        {
+            private readonly InstalledServerRuntime _runtime = new InstalledServerRuntime(
+                "fake",
+                "fake-server",
+                "fake-supervisor",
+                "fake-manifest",
+                "1.0.0",
+                "fake");
+
+            public bool EnsureInstalled(out InstalledServerRuntime runtime, out string error)
+            {
+                runtime = _runtime;
+                error = null;
+                return true;
+            }
+
+            public bool TryGetInstalled(out InstalledServerRuntime runtime)
+            {
+                runtime = _runtime;
+                return true;
+            }
         }
 
         // A fake process detector that reports no listeners (so the "port in use" branch is skipped).
@@ -169,7 +208,8 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 null,
                 null,
                 new FakeCommandBuilder(),
-                launcher);
+                launcher,
+                new FakeRuntimeInstaller());
         }
 
         [Test]
@@ -198,8 +238,8 @@ namespace MCPForUnityTests.Editor.Services.Characterization
 
             // Assert - the headless launch path was taken (gate passed without a dialog).
             Assert.IsTrue(launcher.HeadlessCalled, "Confirmed launch should reach the headless launcher without a dialog");
-            StringAssert.Contains("uvx run mcp-for-unity", launcher.LastCommand,
-                "The headless command should be the built server command");
+            StringAssert.Contains("echo server-started", launcher.LastCommand,
+                "The headless command should be the installed-runtime command");
         }
 
         [Test]

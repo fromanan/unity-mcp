@@ -16,6 +16,16 @@ namespace MCPForUnity.Editor.Services.Server
         /// <returns>True if the command was built successfully</returns>
         bool TryBuildCommand(out string fileName, out string arguments, out string displayCommand, out string error);
 
+        bool TryBuildInstalledCommand(
+            InstalledServerRuntime runtime,
+            int parentPid,
+            int port,
+            string stateFilePath,
+            string pidFilePath,
+            string instanceToken,
+            out string command,
+            out string error);
+
         /// <summary>
         /// Builds the uv path from the uvx path by replacing uvx with uv.
         /// </summary>

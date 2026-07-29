@@ -67,6 +67,79 @@ namespace MCPForUnity.Editor.Services.Server
         }
 
         /// <inheritdoc/>
+        public bool TryBuildInstalledCommand(
+            InstalledServerRuntime runtime,
+            int parentPid,
+            int port,
+            string stateFilePath,
+            string pidFilePath,
+            string instanceToken,
+            out string command,
+            out string error)
+        {
+            command = null;
+            error = null;
+            if (runtime == null
+                || string.IsNullOrWhiteSpace(runtime.ServerExecutable)
+                || !File.Exists(runtime.ServerExecutable))
+            {
+                error = "The project-local MCP server runtime is missing or invalid.";
+                return false;
+            }
+            if (parentPid <= 1 || port <= 0 || string.IsNullOrWhiteSpace(instanceToken))
+            {
+                error = "Invalid managed-server launch identity.";
+                return false;
+            }
+
+            string httpUrl = HttpEndpointUtility.GetLocalBaseUrl();
+            if (!HttpEndpointUtility.IsHttpLocalUrlAllowedForLaunch(httpUrl, out error))
+            {
+                return false;
+            }
+
+            bool projectScopedTools = EditorPrefs.GetBool(
+                EditorPrefKeys.ProjectScopedToolsLocalHttp,
+                true);
+            string scopedFlag = projectScopedTools ? " --project-scoped-tools" : string.Empty;
+            var config = EditorConfigurationCache.Instance;
+            string serverArguments =
+                $"--transport http --http-url {QuoteIfNeeded(httpUrl)}" +
+                $" --http-session-idle-timeout {config.ServerSessionIdleTimeoutSeconds}" +
+                $" --http-max-sessions {config.ServerMaxSessions}" +
+                scopedFlag +
+                $" --pidfile {QuoteIfNeeded(pidFilePath)}" +
+                $" --unity-instance-token {instanceToken}";
+
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+            {
+                if (string.IsNullOrWhiteSpace(runtime.SupervisorExecutable)
+                    || !File.Exists(runtime.SupervisorExecutable))
+                {
+                    error = "The Windows MCP server supervisor entry point is missing.";
+                    return false;
+                }
+                int hardLimit = config.ServerMemoryHardLimitEnabled
+                    ? config.ServerMemoryHardLimitMb
+                    : 0;
+                command =
+                    $"{QuoteIfNeeded(runtime.SupervisorExecutable)}" +
+                    $" --parent-pid {parentPid}" +
+                    $" --port {port}" +
+                    $" --state-file {QuoteIfNeeded(stateFilePath)}" +
+                    $" --instance-token {instanceToken}" +
+                    $" --runtime-version {QuoteIfNeeded(runtime.Version)}" +
+                    $" --soft-memory-limit-mb {config.ServerMemorySoftLimitMb}" +
+                    $" --hard-memory-limit-mb {hardLimit}" +
+                    $" -- {QuoteIfNeeded(runtime.ServerExecutable)} {serverArguments}";
+                return true;
+            }
+
+            command = $"{QuoteIfNeeded(runtime.ServerExecutable)} {serverArguments}";
+            return true;
+        }
+
+        /// <inheritdoc/>
         public string BuildUvPathFromUvx(string uvxPath)
         {
             if (string.IsNullOrWhiteSpace(uvxPath))

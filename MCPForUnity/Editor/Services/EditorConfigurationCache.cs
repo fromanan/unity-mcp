@@ -56,6 +56,11 @@ namespace MCPForUnity.Editor.Services
         private string _claudeCliPathOverride;
         private string _httpTransportScope;
         private int _unitySocketPort;
+        private int _serverMemorySoftLimitMb;
+        private bool _serverMemoryHardLimitEnabled;
+        private int _serverMemoryHardLimitMb;
+        private int _serverSessionIdleTimeoutSeconds;
+        private int _serverMaxSessions;
 
         /// <summary>
         /// Whether to use HTTP transport (true) or Stdio transport (false).
@@ -116,6 +121,11 @@ namespace MCPForUnity.Editor.Services
         /// Default: 0 (auto-assign)
         /// </summary>
         public int UnitySocketPort => _unitySocketPort;
+        public int ServerMemorySoftLimitMb => _serverMemorySoftLimitMb;
+        public bool ServerMemoryHardLimitEnabled => _serverMemoryHardLimitEnabled;
+        public int ServerMemoryHardLimitMb => _serverMemoryHardLimitMb;
+        public int ServerSessionIdleTimeoutSeconds => _serverSessionIdleTimeoutSeconds;
+        public int ServerMaxSessions => _serverMaxSessions;
 
         private EditorConfigurationCache()
         {
@@ -138,6 +148,21 @@ namespace MCPForUnity.Editor.Services
             _claudeCliPathOverride = EditorPrefs.GetString(EditorPrefKeys.ClaudeCliPathOverride, string.Empty);
             _httpTransportScope = EditorPrefs.GetString(EditorPrefKeys.HttpTransportScope, string.Empty);
             _unitySocketPort = EditorPrefs.GetInt(EditorPrefKeys.UnitySocketPort, 0);
+            _serverMemorySoftLimitMb = Math.Max(
+                64,
+                EditorPrefs.GetInt(EditorPrefKeys.ServerMemorySoftLimitMb, 512));
+            _serverMemoryHardLimitEnabled = EditorPrefs.GetBool(
+                EditorPrefKeys.ServerMemoryHardLimitEnabled,
+                false);
+            _serverMemoryHardLimitMb = Math.Max(
+                128,
+                EditorPrefs.GetInt(EditorPrefKeys.ServerMemoryHardLimitMb, 768));
+            _serverSessionIdleTimeoutSeconds = Math.Max(
+                30,
+                EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 1800));
+            _serverMaxSessions = Math.Max(
+                1,
+                EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 64));
         }
 
         /// <summary>
@@ -276,6 +301,50 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
+        public void SetServerMemorySoftLimitMb(int value)
+        {
+            value = Math.Max(64, value);
+            if (_serverMemorySoftLimitMb == value) return;
+            _serverMemorySoftLimitMb = value;
+            EditorPrefs.SetInt(EditorPrefKeys.ServerMemorySoftLimitMb, value);
+            OnConfigurationChanged?.Invoke(nameof(ServerMemorySoftLimitMb));
+        }
+
+        public void SetServerMemoryHardLimitEnabled(bool value)
+        {
+            if (_serverMemoryHardLimitEnabled == value) return;
+            _serverMemoryHardLimitEnabled = value;
+            EditorPrefs.SetBool(EditorPrefKeys.ServerMemoryHardLimitEnabled, value);
+            OnConfigurationChanged?.Invoke(nameof(ServerMemoryHardLimitEnabled));
+        }
+
+        public void SetServerMemoryHardLimitMb(int value)
+        {
+            value = Math.Max(128, value);
+            if (_serverMemoryHardLimitMb == value) return;
+            _serverMemoryHardLimitMb = value;
+            EditorPrefs.SetInt(EditorPrefKeys.ServerMemoryHardLimitMb, value);
+            OnConfigurationChanged?.Invoke(nameof(ServerMemoryHardLimitMb));
+        }
+
+        public void SetServerSessionIdleTimeoutSeconds(int value)
+        {
+            value = Math.Max(30, value);
+            if (_serverSessionIdleTimeoutSeconds == value) return;
+            _serverSessionIdleTimeoutSeconds = value;
+            EditorPrefs.SetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, value);
+            OnConfigurationChanged?.Invoke(nameof(ServerSessionIdleTimeoutSeconds));
+        }
+
+        public void SetServerMaxSessions(int value)
+        {
+            value = Math.Max(1, value);
+            if (_serverMaxSessions == value) return;
+            _serverMaxSessions = value;
+            EditorPrefs.SetInt(EditorPrefKeys.ServerMaxSessions, value);
+            OnConfigurationChanged?.Invoke(nameof(ServerMaxSessions));
+        }
+
         /// <summary>
         /// Force refresh of a single cached value from EditorPrefs.
         /// Useful when external code modifies EditorPrefs directly.
@@ -313,6 +382,21 @@ namespace MCPForUnity.Editor.Services
                     break;
                 case nameof(UnitySocketPort):
                     _unitySocketPort = EditorPrefs.GetInt(EditorPrefKeys.UnitySocketPort, 0);
+                    break;
+                case nameof(ServerMemorySoftLimitMb):
+                    _serverMemorySoftLimitMb = Math.Max(64, EditorPrefs.GetInt(EditorPrefKeys.ServerMemorySoftLimitMb, 512));
+                    break;
+                case nameof(ServerMemoryHardLimitEnabled):
+                    _serverMemoryHardLimitEnabled = EditorPrefs.GetBool(EditorPrefKeys.ServerMemoryHardLimitEnabled, false);
+                    break;
+                case nameof(ServerMemoryHardLimitMb):
+                    _serverMemoryHardLimitMb = Math.Max(128, EditorPrefs.GetInt(EditorPrefKeys.ServerMemoryHardLimitMb, 768));
+                    break;
+                case nameof(ServerSessionIdleTimeoutSeconds):
+                    _serverSessionIdleTimeoutSeconds = Math.Max(30, EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 1800));
+                    break;
+                case nameof(ServerMaxSessions):
+                    _serverMaxSessions = Math.Max(1, EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 64));
                     break;
             }
             OnConfigurationChanged?.Invoke(keyName);

@@ -30,8 +30,10 @@ keywords = ["mcp", "unity", "ai", "model context protocol", "gamedev", "unity3d"
 requires-python = ">=3.10"
 dependencies = [
  "httpx>=0.27.2",
- "fastmcp>=3.0.2,<4",
- "mcp>=1.16.0",
+ # The bounded-session adapter uses FastMCP/SDK internals. Keep these exact
+ # until the required idle-timeout and lifecycle hooks are public upstream.
+ "fastmcp==3.4.5",
+ "mcp==1.29.0",
  "pydantic>=2.12.5",
  "tomli>=2.3.0",
  "fastapi>=0.104.0",
@@ -55,6 +57,7 @@ Changelog = "https://github.com/CoplayDev/unity-mcp/releases"
 
 [project.scripts]
 mcp-for-unity = "main:main"
+mcp-for-unity-supervisor = "process_supervisor.main:main"
 unity-mcp = "cli.main:main"
 
 [build-system]
@@ -68,7 +71,7 @@ where = ["src"]
 "" = "src"
 
 [tool.setuptools]
-py-modules = ["main"]
+py-modules = ["main", "http_runtime"]
 
 [tool.coverage.run]
 source = ["src"]

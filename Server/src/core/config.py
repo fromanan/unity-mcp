@@ -20,6 +20,8 @@ class ServerConfig:
 
     # HTTP transport behaviour
     http_remote_hosted: bool = False
+    http_session_idle_timeout_seconds: float = 1800.0
+    http_max_sessions: int = 64
 
     # API key authentication (required when http_remote_hosted=True)
     api_key_validation_url: str | None = None  # POST endpoint to validate keys

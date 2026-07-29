@@ -70,6 +70,8 @@ def restore_global_config():
     prior = {
         "transport_mode": global_config.transport_mode,
         "http_remote_hosted": global_config.http_remote_hosted,
+        "http_session_idle_timeout_seconds": global_config.http_session_idle_timeout_seconds,
+        "http_max_sessions": global_config.http_max_sessions,
         "api_key_validation_url": global_config.api_key_validation_url,
         "api_key_login_url": global_config.api_key_login_url,
         "api_key_cache_ttl": global_config.api_key_cache_ttl,

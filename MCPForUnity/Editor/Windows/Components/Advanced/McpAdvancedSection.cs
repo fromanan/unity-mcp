@@ -4,7 +4,9 @@ using System.Runtime.InteropServices;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Server;
 using UnityEditor;
+using UnityEditor.UIElements;
 using UnityEngine;
 using UnityEngine.UIElements;
 
@@ -30,6 +32,13 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private Toggle devModeForceRefreshToggle;
         private Toggle allowLanHttpBindToggle;
         private Toggle allowInsecureRemoteHttpToggle;
+        private IntegerField serverMemorySoftLimitMb;
+        private Toggle serverMemoryHardLimitEnabled;
+        private IntegerField serverMemoryHardLimitMb;
+        private IntegerField serverSessionIdleTimeoutSeconds;
+        private IntegerField serverMaxSessions;
+        private Label serverRuntimeStatus;
+        private Button stopServerTreeButton;
         private TextField screenshotsFolderOverride;
         private Button browseScreenshotsFolderButton;
         private Button clearScreenshotsFolderButton;
@@ -76,6 +85,13 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
             allowLanHttpBindToggle = Root.Q<Toggle>("allow-lan-http-bind-toggle");
             allowInsecureRemoteHttpToggle = Root.Q<Toggle>("allow-insecure-remote-http-toggle");
+            serverMemorySoftLimitMb = Root.Q<IntegerField>("server-memory-soft-limit-mb");
+            serverMemoryHardLimitEnabled = Root.Q<Toggle>("server-memory-hard-limit-enabled");
+            serverMemoryHardLimitMb = Root.Q<IntegerField>("server-memory-hard-limit-mb");
+            serverSessionIdleTimeoutSeconds = Root.Q<IntegerField>("server-session-idle-timeout-seconds");
+            serverMaxSessions = Root.Q<IntegerField>("server-max-sessions");
+            serverRuntimeStatus = Root.Q<Label>("server-runtime-status");
+            stopServerTreeButton = Root.Q<Button>("stop-server-tree-button");
             screenshotsFolderOverride = Root.Q<TextField>("screenshots-folder-override");
             browseScreenshotsFolderButton = Root.Q<Button>("browse-screenshots-folder-button");
             clearScreenshotsFolderButton = Root.Q<Button>("clear-screenshots-folder-button");
@@ -134,6 +150,18 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 if (insecureRemoteLabel != null)
                     insecureRemoteLabel.tooltip = allowInsecureRemoteHttpToggle.tooltip;
             }
+            if (serverMemorySoftLimitMb != null)
+                serverMemorySoftLimitMb.tooltip = "Warn when the managed server tree exceeds this amount of private memory.";
+            if (serverMemoryHardLimitEnabled != null)
+                serverMemoryHardLimitEnabled.tooltip = "Opt in to a Windows Job Object hard memory ceiling. Exceeding it can terminate memory-intensive requests.";
+            if (serverMemoryHardLimitMb != null)
+                serverMemoryHardLimitMb.tooltip = "Windows Job Object committed-memory ceiling. Disabled unless the hard-limit toggle is enabled.";
+            if (serverSessionIdleTimeoutSeconds != null)
+                serverSessionIdleTimeoutSeconds.tooltip = "Expire abandoned MCP HTTP sessions after this many inactive seconds.";
+            if (serverMaxSessions != null)
+                serverMaxSessions.tooltip = "Reject new MCP HTTP sessions while this many sessions remain active.";
+            if (stopServerTreeButton != null)
+                stopServerTreeButton.tooltip = "Gracefully stop the managed server, then terminate its supervised process tree if needed.";
             if (testConnectionButton != null)
                 testConnectionButton.tooltip = "Test the connection between Unity and the MCP server.";
             if (screenshotsFolderOverride != null)
@@ -195,6 +223,14 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             {
                 allowInsecureRemoteHttpToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.AllowInsecureRemoteHttp, false));
             }
+            var serverConfig = EditorConfigurationCache.Instance;
+            serverMemorySoftLimitMb?.SetValueWithoutNotify(serverConfig.ServerMemorySoftLimitMb);
+            serverMemoryHardLimitEnabled?.SetValueWithoutNotify(serverConfig.ServerMemoryHardLimitEnabled);
+            serverMemoryHardLimitMb?.SetValueWithoutNotify(serverConfig.ServerMemoryHardLimitMb);
+            serverMemoryHardLimitMb?.SetEnabled(serverConfig.ServerMemoryHardLimitEnabled);
+            serverSessionIdleTimeoutSeconds?.SetValueWithoutNotify(serverConfig.ServerSessionIdleTimeoutSeconds);
+            serverMaxSessions?.SetValueWithoutNotify(serverConfig.ServerMaxSessions);
+            UpdateServerRuntimeStatus();
             UpdatePathOverrides();
             UpdateDeploymentSection();
         }
@@ -277,6 +313,49 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                     EditorPrefs.SetBool(EditorPrefKeys.AllowInsecureRemoteHttp, evt.newValue);
                     OnHttpServerCommandUpdateRequested?.Invoke();
                 });
+            }
+
+            serverMemorySoftLimitMb?.RegisterValueChangedCallback(evt =>
+            {
+                EditorConfigurationCache.Instance.SetServerMemorySoftLimitMb(evt.newValue);
+                serverMemorySoftLimitMb.SetValueWithoutNotify(
+                    EditorConfigurationCache.Instance.ServerMemorySoftLimitMb);
+                OnHttpServerCommandUpdateRequested?.Invoke();
+            });
+            serverMemoryHardLimitEnabled?.RegisterValueChangedCallback(evt =>
+            {
+                EditorConfigurationCache.Instance.SetServerMemoryHardLimitEnabled(evt.newValue);
+                serverMemoryHardLimitMb?.SetEnabled(evt.newValue);
+                OnHttpServerCommandUpdateRequested?.Invoke();
+            });
+            serverMemoryHardLimitMb?.RegisterValueChangedCallback(evt =>
+            {
+                EditorConfigurationCache.Instance.SetServerMemoryHardLimitMb(evt.newValue);
+                serverMemoryHardLimitMb.SetValueWithoutNotify(
+                    EditorConfigurationCache.Instance.ServerMemoryHardLimitMb);
+                OnHttpServerCommandUpdateRequested?.Invoke();
+            });
+            serverSessionIdleTimeoutSeconds?.RegisterValueChangedCallback(evt =>
+            {
+                EditorConfigurationCache.Instance.SetServerSessionIdleTimeoutSeconds(evt.newValue);
+                serverSessionIdleTimeoutSeconds.SetValueWithoutNotify(
+                    EditorConfigurationCache.Instance.ServerSessionIdleTimeoutSeconds);
+                OnHttpServerCommandUpdateRequested?.Invoke();
+            });
+            serverMaxSessions?.RegisterValueChangedCallback(evt =>
+            {
+                EditorConfigurationCache.Instance.SetServerMaxSessions(evt.newValue);
+                serverMaxSessions.SetValueWithoutNotify(
+                    EditorConfigurationCache.Instance.ServerMaxSessions);
+                OnHttpServerCommandUpdateRequested?.Invoke();
+            });
+            if (stopServerTreeButton != null)
+            {
+                stopServerTreeButton.clicked += () =>
+                {
+                    MCPServiceLocator.Server.StopManagedLocalHttpServer();
+                    UpdateServerRuntimeStatus();
+                };
             }
 
             deploySourcePath.RegisterValueChangedCallback(evt =>
@@ -414,6 +493,35 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 allowInsecureRemoteHttpToggle.value = EditorPrefs.GetBool(EditorPrefKeys.AllowInsecureRemoteHttp, false);
             }
             UpdateDeploymentSection();
+            UpdateServerRuntimeStatus();
+        }
+
+        private void UpdateServerRuntimeStatus()
+        {
+            if (serverRuntimeStatus == null)
+            {
+                return;
+            }
+            if (!ServerRunStateReader.TryReadLast(out var status))
+            {
+                serverRuntimeStatus.text = "No managed server state available.";
+                return;
+            }
+            double currentMb = status.CurrentPrivateBytes / (1024d * 1024d);
+            double peakMb = status.PeakJobMemoryBytes / (1024d * 1024d);
+            string exit = string.IsNullOrWhiteSpace(status.ExitReason)
+                ? "running"
+                : status.ExitReason;
+            string sessions = status.ActiveHttpSessions.HasValue
+                ? $", sessions {status.ActiveHttpSessions}/{status.MaximumHttpSessions}"
+                : string.Empty;
+            string hardLimit = status.HardMemoryLimitBytes > 0
+                ? $", hard limit {status.HardMemoryLimitBytes / (1024d * 1024d):F0} MiB"
+                : ", hard limit disabled";
+            serverRuntimeStatus.text =
+                $"Runtime {status.RuntimeVersion}, supervisor {status.SupervisorPid}, server {status.ServerPid}, " +
+                $"{status.ActiveProcesses} process(es), {currentMb:F1} MiB private, " +
+                $"{peakMb:F1} MiB peak{sessions}{hardLimit}, state: {exit}.";
         }
 
         private void OnBrowseUvxClicked()

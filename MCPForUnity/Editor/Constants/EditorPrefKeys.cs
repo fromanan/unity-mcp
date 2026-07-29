@@ -13,7 +13,13 @@ namespace MCPForUnity.Editor.Constants
         internal const string LastLocalHttpServerStartedUtc = "MCPForUnity.LocalHttpServer.LastStartedUtc";
         internal const string LastLocalHttpServerPidArgsHash = "MCPForUnity.LocalHttpServer.LastPidArgsHash";
         internal const string LastLocalHttpServerPidFilePath = "MCPForUnity.LocalHttpServer.LastPidFilePath";
+        internal const string LastLocalHttpServerStateFilePath = "MCPForUnity.LocalHttpServer.LastStateFilePath";
         internal const string LastLocalHttpServerInstanceToken = "MCPForUnity.LocalHttpServer.LastInstanceToken";
+        internal const string ServerMemorySoftLimitMb = "MCPForUnity.LocalHttpServer.MemorySoftLimitMb";
+        internal const string ServerMemoryHardLimitEnabled = "MCPForUnity.LocalHttpServer.MemoryHardLimitEnabled";
+        internal const string ServerMemoryHardLimitMb = "MCPForUnity.LocalHttpServer.MemoryHardLimitMb";
+        internal const string ServerSessionIdleTimeoutSeconds = "MCPForUnity.LocalHttpServer.SessionIdleTimeoutSeconds";
+        internal const string ServerMaxSessions = "MCPForUnity.LocalHttpServer.MaxSessions";
         internal const string DebugLogs = "MCPForUnity.DebugLogs";
         internal const string ValidationLevel = "MCPForUnity.ValidationLevel";
         internal const string UnitySocketPort = "MCPForUnity.UnitySocketPort";

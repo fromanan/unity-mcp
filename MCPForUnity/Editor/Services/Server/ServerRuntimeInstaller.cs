@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
 using Newtonsoft.Json.Linq;
 using UnityEngine;
@@ -14,142 +16,206 @@ namespace MCPForUnity.Editor.Services.Server
     /// </summary>
     public sealed class ServerRuntimeInstaller : IServerRuntimeInstaller
     {
-        private static readonly object InstallLock = new object();
+        private static readonly SemaphoreSlim InstallGate = new SemaphoreSlim(1, 1);
         private const int InstallTimeoutMs = 180000;
 
         public bool EnsureInstalled(out InstalledServerRuntime runtime, out string error)
         {
-            lock (InstallLock)
+            if (!InstallGate.Wait(0))
             {
                 runtime = null;
-                error = null;
+                error = "A server runtime installation is already in progress.";
+                return false;
+            }
+            try
+            {
+                var result = EnsureInstalledCoreAsync(null, false).GetAwaiter().GetResult();
+                runtime = result.Runtime;
+                error = result.Error;
+                return result.Success;
+            }
+            finally
+            {
+                InstallGate.Release();
+            }
+        }
+
+        public async Task<ServerRuntimeInstallResult> EnsureInstalledAsync(
+            IProgress<ServerStartProgress> progress = null)
+        {
+            await InstallGate.WaitAsync();
+            try
+            {
+                return await EnsureInstalledCoreAsync(progress, true);
+            }
+            finally
+            {
+                InstallGate.Release();
+            }
+        }
+
+        private async Task<ServerRuntimeInstallResult> EnsureInstalledCoreAsync(
+            IProgress<ServerStartProgress> progress,
+            bool runCommandsAsynchronously)
+        {
+            progress?.Report(new ServerStartProgress(0.05f, "Preparing server runtime…"));
+            try
+            {
+                string source = AssetPathUtility.GetMcpServerPackageSource();
+                string version = AssetPathUtility.GetPackageVersion();
+                string runtimeRoot = GetRuntimeRoot();
+                string runtimeName = BuildRuntimeName(version, source);
+                string target = Path.Combine(runtimeRoot, runtimeName);
+                bool forceRefresh = AssetPathUtility.ShouldForceUvxRefresh();
+                RuntimePlatform platform = Application.platform;
+
+                if (!forceRefresh
+                    && TryCreateRuntime(target, version, source, out var existingRuntime))
+                {
+                    progress?.Report(new ServerStartProgress(0.88f, "Server runtime is ready"));
+                    return ServerRuntimeInstallResult.Succeeded(existingRuntime);
+                }
+
+                string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
+                string uvPath = BuildUvPathFromUvx(uvxPath);
+                if (string.IsNullOrWhiteSpace(uvPath))
+                {
+                    return ServerRuntimeInstallResult.Failed(
+                        "uv is not installed or could not be located.");
+                }
+
+                Directory.CreateDirectory(runtimeRoot);
+                string staging = Path.Combine(
+                    runtimeRoot,
+                    runtimeName + ".staging-" + Guid.NewGuid().ToString("N"));
                 try
                 {
-                    string source = AssetPathUtility.GetMcpServerPackageSource();
-                    string version = AssetPathUtility.GetPackageVersion();
-                    string runtimeRoot = GetRuntimeRoot();
-                    string runtimeName = BuildRuntimeName(version, source);
-                    string target = Path.Combine(runtimeRoot, runtimeName);
-                    bool forceRefresh = AssetPathUtility.ShouldForceUvxRefresh();
+                    string projectRoot = GetProjectRoot();
+                    string pathPrepend = GetPlatformSpecificPathPrepend();
 
-                    if (!forceRefresh && TryCreateRuntime(target, version, source, out runtime))
+                    progress?.Report(new ServerStartProgress(
+                        0.12f,
+                        "Creating isolated Python environment…"));
+                    string venvArgs = BuildVenvArguments(staging, platform);
+                    CommandResult venvResult = await RunCommandAsync(
+                        uvPath,
+                        venvArgs,
+                        projectRoot,
+                        InstallTimeoutMs,
+                        pathPrepend,
+                        runCommandsAsynchronously);
+                    if (!venvResult.Success)
                     {
-                        return true;
+                        return ServerRuntimeInstallResult.Failed(
+                            BuildCommandError(
+                                "create the server virtual environment",
+                                venvResult.Stdout,
+                                venvResult.Stderr));
                     }
 
-                    string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
-                    string uvPath = BuildUvPathFromUvx(uvxPath);
-                    if (string.IsNullOrWhiteSpace(uvPath))
+                    progress?.Report(new ServerStartProgress(
+                        0.32f,
+                        "Installing MCP server dependencies…"));
+                    string pythonPath = GetPythonExecutable(staging, platform);
+                    string prerelease = source != null && source.Contains(">=0.0.0a0")
+                        ? " --prerelease=allow"
+                        : string.Empty;
+                    string installArgs =
+                        $"pip install --python {Quote(pythonPath)} --reinstall{prerelease} {Quote(source)}";
+                    CommandResult installResult = await RunCommandAsync(
+                        uvPath,
+                        installArgs,
+                        projectRoot,
+                        InstallTimeoutMs,
+                        pathPrepend,
+                        runCommandsAsynchronously);
+                    if (!installResult.Success)
                     {
-                        error = "uv is not installed or could not be located.";
-                        return false;
+                        return ServerRuntimeInstallResult.Failed(
+                            BuildCommandError(
+                                "install the MCP server runtime",
+                                installResult.Stdout,
+                                installResult.Stderr));
                     }
 
-                    Directory.CreateDirectory(runtimeRoot);
-                    string staging = Path.Combine(
-                        runtimeRoot,
-                        runtimeName + ".staging-" + Guid.NewGuid().ToString("N"));
-                    try
+                    if (!TryCreateRuntime(
+                        staging,
+                        version,
+                        source,
+                        platform,
+                        out var stagedRuntime))
                     {
-                        string stdout;
-                        string stderr;
-                        string projectRoot = GetProjectRoot();
-                        string pathPrepend = GetPlatformSpecificPathPrepend();
-                        string venvArgs = BuildVenvArguments(staging, Application.platform);
-                        if (!ExecPath.TryRun(
-                            uvPath,
-                            venvArgs,
-                            projectRoot,
-                            out stdout,
-                            out stderr,
-                            InstallTimeoutMs,
-                            pathPrepend))
-                        {
-                            error = BuildCommandError("create the server virtual environment", stdout, stderr);
-                            return false;
-                        }
-
-                        string pythonPath = GetPythonExecutable(staging);
-                        string prerelease = source != null && source.Contains(">=0.0.0a0")
-                            ? " --prerelease=allow"
-                            : string.Empty;
-                        string installArgs =
-                            $"pip install --python {Quote(pythonPath)} --reinstall{prerelease} {Quote(source)}";
-                        if (!ExecPath.TryRun(
-                            uvPath,
-                            installArgs,
-                            projectRoot,
-                            out stdout,
-                            out stderr,
-                            InstallTimeoutMs,
-                            pathPrepend))
-                        {
-                            error = BuildCommandError("install the MCP server runtime", stdout, stderr);
-                            return false;
-                        }
-
-                        if (!TryCreateRuntime(staging, version, source, out var stagedRuntime))
-                        {
-                            error =
-                                "The server package installed, but its mcp-for-unity and " +
-                                "mcp-for-unity-supervisor entry points were not found.";
-                            return false;
-                        }
-                        if (!TryProbeRuntime(
-                            stagedRuntime,
-                            pythonPath,
-                            projectRoot,
-                            pathPrepend,
-                            out string pythonVersion,
-                            out string probeError))
-                        {
-                            error = probeError;
-                            return false;
-                        }
-
-                        if (Directory.Exists(target))
-                        {
-                            EnsureChildOfRuntimeRoot(target);
-                            Directory.Delete(target, true);
-                        }
-                        Directory.Move(staging, target);
-
-                        if (!TryCreateRuntime(target, version, source, out runtime))
-                        {
-                            error = "Installed server runtime failed final validation.";
-                            return false;
-                        }
-
-                        var manifest = BuildRuntimeManifest(
-                            runtime,
-                            version,
-                            source,
-                            pythonVersion,
-                            Application.platform == RuntimePlatform.WindowsEditor);
-                        File.WriteAllText(runtime.ManifestPath, manifest.ToString());
-                        return true;
+                        return ServerRuntimeInstallResult.Failed(
+                            "The server package installed, but its mcp-for-unity and " +
+                            "mcp-for-unity-supervisor entry points were not found.");
                     }
-                    finally
+
+                    progress?.Report(new ServerStartProgress(
+                        0.78f,
+                        "Validating installed server…"));
+                    ProbeResult probeResult = await ProbeRuntimeAsync(
+                        stagedRuntime,
+                        pythonPath,
+                        projectRoot,
+                        pathPrepend,
+                        platform,
+                        runCommandsAsynchronously);
+                    if (!probeResult.Success)
                     {
-                        if (Directory.Exists(staging))
-                        {
-                            try
-                            {
-                                EnsureChildOfRuntimeRoot(staging);
-                                Directory.Delete(staging, true);
-                            }
-                            catch
-                            {
-                                // A failed staging cleanup is harmless and remains under Library.
-                            }
-                        }
+                        return ServerRuntimeInstallResult.Failed(probeResult.Error);
                     }
+
+                    progress?.Report(new ServerStartProgress(
+                        0.92f,
+                        "Finalizing server runtime…"));
+                    if (Directory.Exists(target))
+                    {
+                        EnsureChildOfRuntimeRoot(target);
+                        Directory.Delete(target, true);
+                    }
+                    Directory.Move(staging, target);
+
+                    if (!TryCreateRuntime(
+                        target,
+                        version,
+                        source,
+                        platform,
+                        out var runtime))
+                    {
+                        return ServerRuntimeInstallResult.Failed(
+                            "Installed server runtime failed final validation.");
+                    }
+
+                    var manifest = BuildRuntimeManifest(
+                        runtime,
+                        version,
+                        source,
+                        probeResult.PythonVersion,
+                        platform == RuntimePlatform.WindowsEditor);
+                    File.WriteAllText(runtime.ManifestPath, manifest.ToString());
+                    progress?.Report(new ServerStartProgress(0.96f, "Server runtime installed"));
+                    return ServerRuntimeInstallResult.Succeeded(runtime);
                 }
-                catch (Exception ex)
+                finally
                 {
-                    error = $"Failed to install project-local MCP server runtime: {ex.Message}";
-                    return false;
+                    if (Directory.Exists(staging))
+                    {
+                        try
+                        {
+                            EnsureChildOfRuntimeRoot(staging);
+                            Directory.Delete(staging, true);
+                        }
+                        catch
+                        {
+                            // A failed staging cleanup is harmless and remains under Library.
+                        }
+                    }
                 }
+            }
+            catch (Exception ex)
+            {
+                return ServerRuntimeInstallResult.Failed(
+                    $"Failed to install project-local MCP server runtime: {ex.Message}");
             }
         }
 
@@ -158,7 +224,7 @@ namespace MCPForUnity.Editor.Services.Server
             string source = AssetPathUtility.GetMcpServerPackageSource();
             string version = AssetPathUtility.GetPackageVersion();
             string target = Path.Combine(GetRuntimeRoot(), BuildRuntimeName(version, source));
-            return TryCreateRuntime(target, version, source, out runtime);
+            return TryCreateRuntime(target, version, source, Application.platform, out runtime);
         }
 
         private static bool TryCreateRuntime(
@@ -167,11 +233,21 @@ namespace MCPForUnity.Editor.Services.Server
             string source,
             out InstalledServerRuntime runtime)
         {
+            return TryCreateRuntime(root, version, source, Application.platform, out runtime);
+        }
+
+        private static bool TryCreateRuntime(
+            string root,
+            string version,
+            string source,
+            RuntimePlatform platform,
+            out InstalledServerRuntime runtime)
+        {
             runtime = null;
-            string scripts = Application.platform == RuntimePlatform.WindowsEditor
+            string scripts = platform == RuntimePlatform.WindowsEditor
                 ? Path.Combine(root, "Scripts")
                 : Path.Combine(root, "bin");
-            string extension = Application.platform == RuntimePlatform.WindowsEditor ? ".exe" : string.Empty;
+            string extension = platform == RuntimePlatform.WindowsEditor ? ".exe" : string.Empty;
             string server = Path.Combine(scripts, "mcp-for-unity" + extension);
             string supervisor = Path.Combine(scripts, "mcp-for-unity-supervisor" + extension);
             string manifest = Path.Combine(root, "runtime.json");
@@ -226,9 +302,11 @@ namespace MCPForUnity.Editor.Services.Server
             return string.IsNullOrEmpty(directory) ? file : Path.Combine(directory, file);
         }
 
-        private static string GetPythonExecutable(string runtimeRoot)
+        private static string GetPythonExecutable(
+            string runtimeRoot,
+            RuntimePlatform platform)
         {
-            return Application.platform == RuntimePlatform.WindowsEditor
+            return platform == RuntimePlatform.WindowsEditor
                 ? Path.Combine(runtimeRoot, "Scripts", "python.exe")
                 : Path.Combine(runtimeRoot, "bin", "python");
         }
@@ -274,68 +352,148 @@ namespace MCPForUnity.Editor.Services.Server
             };
         }
 
-        private static bool TryProbeRuntime(
+        private static async Task<ProbeResult> ProbeRuntimeAsync(
             InstalledServerRuntime runtime,
             string pythonPath,
             string workingDirectory,
             string pathPrepend,
-            out string pythonVersion,
-            out string error)
+            RuntimePlatform platform,
+            bool runCommandsAsynchronously)
         {
-            pythonVersion = string.Empty;
-            error = null;
-            if (!ExecPath.TryRun(
+            CommandResult pythonResult = await RunCommandAsync(
                 pythonPath,
                 "--version",
                 workingDirectory,
-                out string pythonStdout,
-                out string pythonStderr,
                 15000,
-                pathPrepend))
+                pathPrepend,
+                runCommandsAsynchronously);
+            if (!pythonResult.Success)
             {
-                error = BuildCommandError(
+                return ProbeResult.Failed(BuildCommandError(
                     "validate the installed Python runtime",
-                    pythonStdout,
-                    pythonStderr);
-                return false;
+                    pythonResult.Stdout,
+                    pythonResult.Stderr));
             }
-            pythonVersion = string.IsNullOrWhiteSpace(pythonStdout)
-                ? pythonStderr.Trim()
-                : pythonStdout.Trim();
+            string pythonVersion = string.IsNullOrWhiteSpace(pythonResult.Stdout)
+                ? pythonResult.Stderr.Trim()
+                : pythonResult.Stdout.Trim();
 
-            if (!ExecPath.TryRun(
+            CommandResult serverResult = await RunCommandAsync(
                 runtime.ServerExecutable,
                 "--help",
                 workingDirectory,
-                out string serverStdout,
-                out string serverStderr,
                 30000,
-                pathPrepend))
+                pathPrepend,
+                runCommandsAsynchronously);
+            if (!serverResult.Success)
             {
-                error = BuildCommandError(
+                return ProbeResult.Failed(BuildCommandError(
                     "validate the installed MCP server entry point",
-                    serverStdout,
-                    serverStderr);
-                return false;
+                    serverResult.Stdout,
+                    serverResult.Stderr));
             }
 
-            if (Application.platform == RuntimePlatform.WindowsEditor
-                && !ExecPath.TryRun(
+            if (platform == RuntimePlatform.WindowsEditor)
+            {
+                CommandResult supervisorResult = await RunCommandAsync(
                     runtime.SupervisorExecutable,
                     "--help",
                     workingDirectory,
-                    out string supervisorStdout,
-                    out string supervisorStderr,
                     15000,
-                    pathPrepend))
-            {
-                error = BuildCommandError(
-                    "validate the installed Windows supervisor entry point",
-                    supervisorStdout,
-                    supervisorStderr);
-                return false;
+                    pathPrepend,
+                    runCommandsAsynchronously);
+                if (!supervisorResult.Success)
+                {
+                    return ProbeResult.Failed(BuildCommandError(
+                        "validate the installed Windows supervisor entry point",
+                        supervisorResult.Stdout,
+                        supervisorResult.Stderr));
+                }
             }
-            return true;
+
+            return ProbeResult.Succeeded(pythonVersion);
+        }
+
+        private static Task<CommandResult> RunCommandAsync(
+            string file,
+            string args,
+            string workingDirectory,
+            int timeoutMs,
+            string pathPrepend,
+            bool runAsynchronously)
+        {
+            if (!runAsynchronously)
+            {
+                return Task.FromResult(RunCommand(
+                    file,
+                    args,
+                    workingDirectory,
+                    timeoutMs,
+                    pathPrepend));
+            }
+
+            return Task.Run(() => RunCommand(
+                file,
+                args,
+                workingDirectory,
+                timeoutMs,
+                pathPrepend));
+        }
+
+        private static CommandResult RunCommand(
+            string file,
+            string args,
+            string workingDirectory,
+            int timeoutMs,
+            string pathPrepend)
+        {
+            bool success = ExecPath.TryRun(
+                file,
+                args,
+                workingDirectory,
+                out string stdout,
+                out string stderr,
+                timeoutMs,
+                pathPrepend);
+            return new CommandResult(success, stdout, stderr);
+        }
+
+        private readonly struct CommandResult
+        {
+            public CommandResult(bool success, string stdout, string stderr)
+            {
+                Success = success;
+                Stdout = stdout ?? string.Empty;
+                Stderr = stderr ?? string.Empty;
+            }
+
+            public bool Success { get; }
+            public string Stdout { get; }
+            public string Stderr { get; }
+        }
+
+        private sealed class ProbeResult
+        {
+            private ProbeResult(bool success, string pythonVersion, string error)
+            {
+                Success = success;
+                PythonVersion = pythonVersion ?? string.Empty;
+                Error = error;
+            }
+
+            public bool Success { get; }
+            public string PythonVersion { get; }
+            public string Error { get; }
+
+            public static ProbeResult Succeeded(string pythonVersion)
+            {
+                return new ProbeResult(true, pythonVersion, null);
+            }
+
+            public static ProbeResult Failed(string error)
+            {
+                return new ProbeResult(false, string.Empty, error);
+            }
         }
 
         private static string Quote(string value)

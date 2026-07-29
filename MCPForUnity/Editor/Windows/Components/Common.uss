@@ -230,6 +230,17 @@
     margin-left: 0px;
 }
 
+.server-start-progress-container {
+    display: none;
+    margin-top: 2px;
+    margin-bottom: 6px;
+}
+
+.server-start-progress {
+    flex-grow: 1;
+    min-width: 180px;
+}
+
 /* When the HTTP server/session is running, we show the Start/Stop button as "danger" (red) */
 .action-button.server-running {
     background-color: rgba(200, 50, 50, 0.85);

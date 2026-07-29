@@ -1,3 +1,7 @@
+using System;
+using System.Threading.Tasks;
+using MCPForUnity.Editor.Services.Server;
+
 namespace MCPForUnity.Editor.Services
 {
     /// <summary>
@@ -18,6 +22,14 @@ namespace MCPForUnity.Editor.Services
         /// <param name="quiet">When true, skip confirmation dialogs (used by auto-start).</param>
         /// <returns>True if server was started successfully, false otherwise</returns>
         bool StartLocalHttpServer(bool quiet = false);
+
+        /// <summary>
+        /// Starts the local HTTP server without blocking the Unity main thread while the
+        /// project-local Python runtime is created and dependencies are installed.
+        /// </summary>
+        Task<bool> StartLocalHttpServerAsync(
+            bool quiet = false,
+            IProgress<ServerStartProgress> progress = null);
 
         /// <summary>
         /// Gets the launch-log path for the configured local HTTP server port, or null if unavailable.

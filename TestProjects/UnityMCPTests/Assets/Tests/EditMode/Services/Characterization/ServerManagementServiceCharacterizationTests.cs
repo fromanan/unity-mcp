@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using NUnit.Framework;
 using MCPForUnity.Editor.Services;
 using MCPForUnity.Editor.Services.Server;
@@ -29,6 +30,10 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         private bool _savedAllowLanHttpBind;
         private bool _savedAllowInsecureRemoteHttp;
         private bool _savedLaunchConfirmed;
+        private readonly Dictionary<string, (bool Exists, string Value)> _savedTrackingStrings =
+            new Dictionary<string, (bool Exists, string Value)>();
+        private readonly Dictionary<string, (bool Exists, int Value)> _savedTrackingInts =
+            new Dictionary<string, (bool Exists, int Value)>();
 
         [SetUp]
         public void SetUp()
@@ -42,6 +47,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             _savedHttpTransportScope = EditorPrefs.GetString(EditorPrefKeys.HttpTransportScope, string.Empty);
             _savedAllowLanHttpBind = EditorPrefs.GetBool(EditorPrefKeys.AllowLanHttpBind, false);
             _savedAllowInsecureRemoteHttp = EditorPrefs.GetBool(EditorPrefKeys.AllowInsecureRemoteHttp, false);
+            SaveServerTrackingPrefs();
         }
 
         [TearDown]
@@ -76,8 +82,66 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             EditorPrefs.SetBool(EditorPrefKeys.AllowLanHttpBind, _savedAllowLanHttpBind);
             EditorPrefs.SetBool(EditorPrefKeys.AllowInsecureRemoteHttp, _savedAllowInsecureRemoteHttp);
             EditorPrefs.SetBool(EditorPrefKeys.HttpServerLaunchConfirmed, _savedLaunchConfirmed);
+            RestoreServerTrackingPrefs();
             // Refresh cache to reflect restored values
             EditorConfigurationCache.Instance.Refresh();
+        }
+
+        private void SaveServerTrackingPrefs()
+        {
+            _savedTrackingStrings.Clear();
+            foreach (string key in new[]
+            {
+                EditorPrefKeys.LastLocalHttpServerStartedUtc,
+                EditorPrefKeys.LastLocalHttpServerPidArgsHash,
+                EditorPrefKeys.LastLocalHttpServerPidFilePath,
+                EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                EditorPrefKeys.LastLocalHttpServerInstanceToken
+            })
+            {
+                bool exists = EditorPrefs.HasKey(key);
+                _savedTrackingStrings[key] =
+                    (exists, exists ? EditorPrefs.GetString(key, string.Empty) : string.Empty);
+            }
+
+            _savedTrackingInts.Clear();
+            foreach (string key in new[]
+            {
+                EditorPrefKeys.LastLocalHttpServerPid,
+                EditorPrefKeys.LastLocalHttpServerPort
+            })
+            {
+                bool exists = EditorPrefs.HasKey(key);
+                _savedTrackingInts[key] =
+                    (exists, exists ? EditorPrefs.GetInt(key, 0) : 0);
+            }
+        }
+
+        private void RestoreServerTrackingPrefs()
+        {
+            foreach (var pair in _savedTrackingStrings)
+            {
+                if (pair.Value.Exists)
+                {
+                    EditorPrefs.SetString(pair.Key, pair.Value.Value);
+                }
+                else
+                {
+                    EditorPrefs.DeleteKey(pair.Key);
+                }
+            }
+
+            foreach (var pair in _savedTrackingInts)
+            {
+                if (pair.Value.Exists)
+                {
+                    EditorPrefs.SetInt(pair.Key, pair.Value.Value);
+                }
+                else
+                {
+                    EditorPrefs.DeleteKey(pair.Key);
+                }
+            }
         }
 
         #region StartLocalHttpServer First-Time-Confirm Gating
@@ -176,6 +240,8 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 "1.0.0",
                 "fake");
 
+            public bool EnsureInstalledAsyncCalled { get; private set; }
+
             public bool EnsureInstalled(out InstalledServerRuntime runtime, out string error)
             {
                 runtime = _runtime;
@@ -183,10 +249,29 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 return true;
             }
 
+            public Task<ServerRuntimeInstallResult> EnsureInstalledAsync(
+                IProgress<ServerStartProgress> progress = null)
+            {
+                EnsureInstalledAsyncCalled = true;
+                progress?.Report(new ServerStartProgress(1f, "Fake runtime ready"));
+                return Task.FromResult(ServerRuntimeInstallResult.Succeeded(_runtime));
+            }
+
             public bool TryGetInstalled(out InstalledServerRuntime runtime)
             {
                 runtime = _runtime;
                 return true;
+            }
+        }
+
+        private sealed class RecordingProgress : IProgress<ServerStartProgress>
+        {
+            public readonly List<ServerStartProgress> Updates =
+                new List<ServerStartProgress>();
+
+            public void Report(ServerStartProgress value)
+            {
+                Updates.Add(value);
             }
         }
 
@@ -201,7 +286,92 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             public string NormalizeForMatch(string input) => (input ?? string.Empty).Replace(" ", string.Empty).ToLowerInvariant();
         }
 
-        private ServerManagementService BuildServiceWithFakeLauncher(RecordingTerminalLauncher launcher)
+        private sealed class MutableListenerProcessDetector : IProcessDetector
+        {
+            public const int ListenerPid = 43210;
+            public bool Listening = true;
+
+            public bool LooksLikeMcpServerProcess(int pid) =>
+                Listening && pid == ListenerPid;
+
+            public bool TryGetProcessCommandLine(int pid, out string argsLower)
+            {
+                argsLower = pid == ListenerPid
+                    ? "python mcp-for-unity --transport http"
+                    : string.Empty;
+                return pid == ListenerPid;
+            }
+
+            public List<int> GetListeningProcessIdsForPort(int port) =>
+                Listening ? new List<int> { ListenerPid } : new List<int>();
+
+            public int GetCurrentProcessId() => 999;
+            public bool ProcessExists(int pid) => Listening && pid == ListenerPid;
+            public string NormalizeForMatch(string input) =>
+                (input ?? string.Empty).Replace(" ", string.Empty).ToLowerInvariant();
+        }
+
+        private sealed class RecordingProcessTerminator : IProcessTerminator
+        {
+            private readonly MutableListenerProcessDetector _detector;
+
+            public RecordingProcessTerminator(MutableListenerProcessDetector detector)
+            {
+                _detector = detector;
+            }
+
+            public bool Called { get; private set; }
+
+            public bool Terminate(int pid, int? expectedPort = null)
+            {
+                Called = pid == MutableListenerProcessDetector.ListenerPid;
+                if (Called)
+                {
+                    _detector.Listening = false;
+                }
+                return Called;
+            }
+        }
+
+        private sealed class StaleHandshakePidFileManager : IPidFileManager
+        {
+            public string GetPidDirectory() => System.IO.Path.GetTempPath();
+            public string GetPidFilePath(int port) =>
+                System.IO.Path.Combine(GetPidDirectory(), $"mcp_http_{port}.pid");
+            public bool TryReadPid(string pidFilePath, out int pid)
+            {
+                pid = 0;
+                return false;
+            }
+            public bool TryGetPortFromPidFilePath(string pidFilePath, out int port)
+            {
+                port = 59995;
+                return true;
+            }
+            public void DeletePidFile(string pidFilePath) { }
+            public void StoreHandshake(string pidFilePath, string instanceToken) { }
+            public bool TryGetHandshake(out string pidFilePath, out string instanceToken)
+            {
+                pidFilePath = System.IO.Path.Combine(
+                    GetPidDirectory(),
+                    "mcp_http_59995.pid");
+                instanceToken = "stale-test-token";
+                return true;
+            }
+            public void StoreTracking(int pid, int port, string argsHash = null) { }
+            public bool TryGetStoredPid(int expectedPort, out int pid)
+            {
+                pid = 0;
+                return false;
+            }
+            public string GetStoredArgsHash() => string.Empty;
+            public void ClearTracking() { }
+            public string ComputeShortHash(string input) => string.Empty;
+        }
+
+        private ServerManagementService BuildServiceWithFakeLauncher(
+            RecordingTerminalLauncher launcher,
+            FakeRuntimeInstaller runtimeInstaller = null)
         {
             return new ServerManagementService(
                 new NoListenersProcessDetector(),
@@ -209,7 +379,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 null,
                 new FakeCommandBuilder(),
                 launcher,
-                new FakeRuntimeInstaller());
+                runtimeInstaller ?? new FakeRuntimeInstaller());
         }
 
         [Test]
@@ -298,6 +468,62 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             Assert.IsTrue(launcher.HeadlessCalled, "Launch should reach the headless launcher");
             StringAssert.Contains("server-launch-59996.log", launcher.LastLogPath,
                 "Headless launch should redirect output to the per-port launch log");
+        }
+
+        [Test]
+        public void StartLocalHttpServerAsync_UsesAsyncInstallerAndReportsProgress()
+        {
+            EditorPrefs.SetBool(EditorPrefKeys.UseHttpTransport, true);
+            EditorPrefs.SetString(EditorPrefKeys.HttpBaseUrl, "http://localhost:59995");
+            EditorPrefs.SetBool(EditorPrefKeys.HttpServerLaunchConfirmed, true);
+            EditorConfigurationCache.Instance.Refresh();
+
+            var launcher = new RecordingTerminalLauncher();
+            var runtimeInstaller = new FakeRuntimeInstaller();
+            var progress = new RecordingProgress();
+            var service = BuildServiceWithFakeLauncher(launcher, runtimeInstaller);
+
+            LogAssert.ignoreFailingMessages = true;
+            try
+            {
+                service.StartLocalHttpServerAsync(quiet: false, progress: progress)
+                    .GetAwaiter()
+                    .GetResult();
+            }
+            finally
+            {
+                LogAssert.ignoreFailingMessages = false;
+            }
+
+            Assert.IsTrue(runtimeInstaller.EnsureInstalledAsyncCalled);
+            Assert.IsTrue(launcher.HeadlessCalled);
+            Assert.That(progress.Updates, Is.Not.Empty);
+            Assert.That(
+                progress.Updates.Max(update => update.NormalizedProgress),
+                Is.GreaterThanOrEqualTo(0.98f));
+        }
+
+        [Test]
+        public void StopLocalHttpServer_MissingStalePidfile_UsesGuardedPortFallback()
+        {
+            EditorPrefs.SetString(EditorPrefKeys.HttpBaseUrl, "http://localhost:59994");
+            EditorConfigurationCache.Instance.Refresh();
+
+            var detector = new MutableListenerProcessDetector();
+            var terminator = new RecordingProcessTerminator(detector);
+            var service = new ServerManagementService(
+                detector,
+                new StaleHandshakePidFileManager(),
+                terminator,
+                new FakeCommandBuilder(),
+                new RecordingTerminalLauncher(),
+                new FakeRuntimeInstaller());
+
+            bool stopped = service.StopLocalHttpServer();
+
+            Assert.IsTrue(stopped);
+            Assert.IsTrue(terminator.Called);
+            Assert.IsFalse(detector.Listening);
         }
 
         #endregion

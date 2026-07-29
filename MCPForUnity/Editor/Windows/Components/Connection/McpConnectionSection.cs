@@ -5,6 +5,7 @@ using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Models;
 using MCPForUnity.Editor.Services;
+using MCPForUnity.Editor.Services.Server;
 using MCPForUnity.Editor.Services.Transport;
 using UnityEditor;
 using UnityEditor.UIElements;
@@ -19,6 +20,21 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
     /// </summary>
     public class McpConnectionSection
     {
+        private sealed class InlineServerStartProgress : IProgress<ServerStartProgress>
+        {
+            private readonly Action<ServerStartProgress> callback;
+
+            public InlineServerStartProgress(Action<ServerStartProgress> callback)
+            {
+                this.callback = callback;
+            }
+
+            public void Report(ServerStartProgress value)
+            {
+                callback?.Invoke(value);
+            }
+        }
+
         // Transport protocol enum
         private enum TransportProtocol
         {
@@ -42,6 +58,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
         private Label httpServerCommandHint;
         private TextField httpUrlField;
         private Button startHttpServerButton;
+        private VisualElement serverStartProgressContainer;
+        private ProgressBar serverStartProgress;
         private VisualElement unitySocketPortRow;
         private TextField unityPortField;
         private VisualElement statusIndicator;
@@ -103,6 +121,9 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             httpServerCommandHint = Root.Q<Label>("http-server-command-hint");
             httpUrlField = Root.Q<TextField>("http-url");
             startHttpServerButton = Root.Q<Button>("start-http-server-button");
+            serverStartProgressContainer =
+                Root.Q<VisualElement>("server-start-progress-container");
+            serverStartProgress = Root.Q<ProgressBar>("server-start-progress");
             unitySocketPortRow = Root.Q<VisualElement>("unity-socket-port-row");
             unityPortField = Root.Q<TextField>("unity-port");
             statusIndicator = Root.Q<VisualElement>("status-indicator");
@@ -123,6 +144,7 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             {
                 manualCommandFoldout.value = false;
             }
+            SetServerStartProgressVisible(false);
 
             transportDropdown.Init(TransportProtocol.HTTPLocal);
             bool useHttpTransport = EditorConfigurationCache.Instance.UseHttpTransport;
@@ -689,6 +711,8 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             var bridgeService = MCPServiceLocator.Bridge;
             httpServerToggleInProgress = true;
             startHttpServerButton?.SetEnabled(false);
+            int editorProgressId = -1;
+            bool startOperationSucceeded = false;
 
             try
             {
@@ -728,10 +752,32 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     // Reflect the transient "Starting…" state on the button before the (possibly long) launch.
                     UpdateStartHttpButtonState();
 
-                    bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer();
+                    SetServerStartProgressVisible(true);
+                    UpdateServerStartProgress(new ServerStartProgress(
+                        0f,
+                        "Preparing local MCP server…"));
+                    editorProgressId = UnityEditor.Progress.Start(
+                        "MCP for Unity — Start local server",
+                        "Preparing server runtime…");
+                    var startProgress = new InlineServerStartProgress(update =>
+                    {
+                        UpdateServerStartProgress(update);
+                        if (editorProgressId >= 0)
+                        {
+                            UnityEditor.Progress.Report(
+                                editorProgressId,
+                                update.NormalizedProgress,
+                                update.Message);
+                        }
+                    });
+
+                    bool serverStarted = await MCPServiceLocator.Server
+                        .StartLocalHttpServerAsync(false, startProgress);
                     if (serverStarted)
                     {
-                        await TryAutoStartSessionAsync();
+                        await TryAutoStartSessionAsync(startProgress);
+                        startOperationSucceeded =
+                            MCPServiceLocator.Server.IsLocalHttpServerReachable();
                     }
                     else
                     {
@@ -746,13 +792,23 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             }
             finally
             {
+                if (editorProgressId >= 0)
+                {
+                    UnityEditor.Progress.Finish(
+                        editorProgressId,
+                        startOperationSucceeded
+                            ? UnityEditor.Progress.Status.Succeeded
+                            : UnityEditor.Progress.Status.Failed);
+                }
+                SetServerStartProgressVisible(false);
                 httpServerToggleInProgress = false;
                 RefreshHttpUi();
                 UpdateConnectionStatus();
             }
         }
 
-        private async Task TryAutoStartSessionAsync()
+        private async Task TryAutoStartSessionAsync(
+            IProgress<ServerStartProgress> progress = null)
         {
             // Wait for the HTTP server to become ready, then start the session.
             // This is called when THIS instance starts the server (not when detecting an external server).
@@ -768,15 +824,24 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
 
             while (true)
             {
+                progress?.Report(new ServerStartProgress(
+                    0.985f,
+                    $"Waiting for MCP server on {url}…"));
                 if (server.IsLocalHttpServerReachable())
                 {
                     McpLog.Info($"Server ready on {url}");
+                    progress?.Report(new ServerStartProgress(
+                        0.995f,
+                        "Connecting Unity session…"));
                     bool started = await bridgeService.StartAsync();
                     if (started)
                     {
                         McpLog.Info("Session connected");
                         await VerifyBridgeConnectionAsync();
                         UpdateConnectionStatus();
+                        progress?.Report(new ServerStartProgress(
+                            1f,
+                            "MCP server ready"));
                         return;
                     }
                 }
@@ -801,6 +866,27 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
 
                 await Task.Delay(pollDelay);
             }
+        }
+
+        private void SetServerStartProgressVisible(bool visible)
+        {
+            if (serverStartProgressContainer != null)
+            {
+                serverStartProgressContainer.style.display = visible
+                    ? DisplayStyle.Flex
+                    : DisplayStyle.None;
+            }
+        }
+
+        private void UpdateServerStartProgress(ServerStartProgress update)
+        {
+            if (serverStartProgress == null)
+            {
+                return;
+            }
+
+            serverStartProgress.value = update.NormalizedProgress * 100f;
+            serverStartProgress.title = update.Message;
         }
 
         private void PersistUnityPortFromField()

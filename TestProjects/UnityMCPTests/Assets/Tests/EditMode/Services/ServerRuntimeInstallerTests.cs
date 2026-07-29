@@ -55,5 +55,18 @@ namespace MCPForUnityTests.Editor.Services
                 manifest["supervisorExecutable"]?.ToString());
             StringAssert.DoesNotContain(".staging-", manifest.ToString());
         }
+
+        [TestCase(-1f, 0f)]
+        [TestCase(0.4f, 0.4f)]
+        [TestCase(2f, 1f)]
+        public void ServerStartProgress_ClampsNormalizedProgress(
+            float input,
+            float expected)
+        {
+            var update = new ServerStartProgress(input, null);
+
+            Assert.AreEqual(expected, update.NormalizedProgress);
+            Assert.AreEqual(string.Empty, update.Message);
+        }
     }
 }

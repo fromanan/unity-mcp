@@ -1,4 +1,5 @@
 using System.IO;
+using System.Collections.Generic;
 using NUnit.Framework;
 using MCPForUnity.Editor.Services.Server;
 using MCPForUnity.Editor.Constants;
@@ -15,11 +16,16 @@ namespace MCPForUnityTests.Editor.Services.Server
     {
         private PidFileManager _manager;
         private string _testPidFilePath;
+        private readonly Dictionary<string, (bool Exists, string Value)> _savedTrackingStrings =
+            new Dictionary<string, (bool Exists, string Value)>();
+        private readonly Dictionary<string, (bool Exists, int Value)> _savedTrackingInts =
+            new Dictionary<string, (bool Exists, int Value)>();
 
         [SetUp]
         public void SetUp()
         {
             _manager = new PidFileManager();
+            SaveTrackingEditorPrefs();
             // Clear any test state
             ClearTestEditorPrefs();
         }
@@ -34,6 +40,7 @@ namespace MCPForUnityTests.Editor.Services.Server
             }
             // Clear test state
             ClearTestEditorPrefs();
+            RestoreTrackingEditorPrefs();
         }
 
         private void ClearTestEditorPrefs()
@@ -43,7 +50,65 @@ namespace MCPForUnityTests.Editor.Services.Server
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStartedUtc); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidArgsHash); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidFilePath); } catch { }
+            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStateFilePath); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerInstanceToken); } catch { }
+        }
+
+        private void SaveTrackingEditorPrefs()
+        {
+            _savedTrackingStrings.Clear();
+            foreach (string key in new[]
+            {
+                EditorPrefKeys.LastLocalHttpServerStartedUtc,
+                EditorPrefKeys.LastLocalHttpServerPidArgsHash,
+                EditorPrefKeys.LastLocalHttpServerPidFilePath,
+                EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                EditorPrefKeys.LastLocalHttpServerInstanceToken
+            })
+            {
+                bool exists = EditorPrefs.HasKey(key);
+                _savedTrackingStrings[key] =
+                    (exists, exists ? EditorPrefs.GetString(key, string.Empty) : string.Empty);
+            }
+
+            _savedTrackingInts.Clear();
+            foreach (string key in new[]
+            {
+                EditorPrefKeys.LastLocalHttpServerPid,
+                EditorPrefKeys.LastLocalHttpServerPort
+            })
+            {
+                bool exists = EditorPrefs.HasKey(key);
+                _savedTrackingInts[key] =
+                    (exists, exists ? EditorPrefs.GetInt(key, 0) : 0);
+            }
+        }
+
+        private void RestoreTrackingEditorPrefs()
+        {
+            foreach (var pair in _savedTrackingStrings)
+            {
+                if (pair.Value.Exists)
+                {
+                    EditorPrefs.SetString(pair.Key, pair.Value.Value);
+                }
+                else
+                {
+                    EditorPrefs.DeleteKey(pair.Key);
+                }
+            }
+
+            foreach (var pair in _savedTrackingInts)
+            {
+                if (pair.Value.Exists)
+                {
+                    EditorPrefs.SetInt(pair.Key, pair.Value.Value);
+                }
+                else
+                {
+                    EditorPrefs.DeleteKey(pair.Key);
+                }
+            }
         }
 
         #region GetPidFilePath Tests
@@ -342,6 +407,9 @@ namespace MCPForUnityTests.Editor.Services.Server
             // Arrange
             _manager.StoreTracking(12345, 8080, "somehash");
             _manager.StoreHandshake("/path.pid", "token");
+            EditorPrefs.SetString(
+                EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                "/state.json");
 
             // Act
             _manager.ClearTracking();
@@ -351,6 +419,8 @@ namespace MCPForUnityTests.Editor.Services.Server
             // Assert
             Assert.IsFalse(hasTracking);
             Assert.IsFalse(hasHandshake);
+            Assert.IsFalse(
+                EditorPrefs.HasKey(EditorPrefKeys.LastLocalHttpServerStateFilePath));
         }
 
         [Test]

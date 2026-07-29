@@ -26,23 +26,21 @@ namespace MCPForUnityTests.Editor.Clients
         }
 
         [Test]
-        public void Codex_SupportsStdioOnly()
+        public void Codex_SupportsStdioAndHttp()
         {
-            // Regression guard for #1193: Codex does not expose tools over the HTTP block, so it
-            // must advertise stdio only and let CoerceTransportFor pick stdio before Configure().
             var codex = new CodexConfigurator();
             CollectionAssert.AreEqual(
-                new[] { ConfiguredTransport.Stdio },
+                new[] { ConfiguredTransport.Stdio, ConfiguredTransport.Http },
                 codex.SupportedTransports.ToList(),
-                "Codex must advertise stdio and nothing else");
-            Assert.IsFalse(codex.Client.SupportsHttpTransport, "Codex must not be treated as HTTP-capable");
+                "Codex supports local stdio and Streamable HTTP MCP servers");
+            Assert.IsTrue(
+                codex.Client.SupportsHttpTransport,
+                "Codex must be treated as HTTP-capable");
         }
 
         [Test]
-        public void Codex_ManualSnippet_IsStdio_EvenWhenHttpPreferred()
+        public void Codex_ManualSnippet_UsesHttpWhenHttpPreferred()
         {
-            // The snippet path does not go through ConfigureWithTransportCoercion, so with the
-            // global HTTP pref on it used to render a url block for a client that cannot use one.
             var cache = EditorConfigurationCache.Instance;
             bool original = cache.UseHttpTransport;
             try
@@ -50,8 +48,11 @@ namespace MCPForUnityTests.Editor.Clients
                 cache.SetUseHttpTransport(true);
                 string snippet = new CodexConfigurator().GetManualSnippet();
 
-                StringAssert.Contains("command", snippet, "Codex snippet must configure stdio");
-                Assert.IsFalse(snippet.Contains("url ="), "Codex snippet must not configure an HTTP url");
+                StringAssert.Contains("url", snippet, "Codex snippet must configure HTTP");
+                StringAssert.Contains("/mcp", snippet, "Codex HTTP URL must target the MCP endpoint");
+                Assert.IsFalse(
+                    snippet.Contains("command ="),
+                    "HTTP configuration must not include a stdio command");
                 Assert.IsTrue(cache.UseHttpTransport, "The global transport pref must be restored");
             }
             finally

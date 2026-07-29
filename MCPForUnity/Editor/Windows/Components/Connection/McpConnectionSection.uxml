@@ -31,6 +31,9 @@
                 <ui:Label text="Local Server:" class="setting-label" />
                 <ui:Button name="start-http-server-button" text="Start Server" class="action-button start-server-button" />
             </ui:VisualElement>
+            <ui:VisualElement name="server-start-progress-container" class="server-start-progress-container">
+                <ui:ProgressBar name="server-start-progress" title="Preparing server…" low-value="0" high-value="100" value="0" class="server-start-progress" />
+            </ui:VisualElement>
             <ui:VisualElement class="setting-row" name="unity-socket-port-row">
                 <ui:Label text="Unity Socket Port:" class="setting-label" />
                 <ui:TextField name="unity-port" class="port-field" />

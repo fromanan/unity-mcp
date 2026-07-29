@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Server;
@@ -243,6 +244,24 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         public bool StartLocalHttpServer(bool quiet = false)
         {
+            return StartLocalHttpServerCoreAsync(quiet, null, false)
+                .GetAwaiter()
+                .GetResult();
+        }
+
+        public Task<bool> StartLocalHttpServerAsync(
+            bool quiet = false,
+            IProgress<ServerStartProgress> progress = null)
+        {
+            return StartLocalHttpServerCoreAsync(quiet, progress, true);
+        }
+
+        private async Task<bool> StartLocalHttpServerCoreAsync(
+            bool quiet,
+            IProgress<ServerStartProgress> progress,
+            bool installAsynchronously)
+        {
+            progress?.Report(new ServerStartProgress(0.01f, "Checking server configuration…"));
             /// Clean stale Python build artifacts when using a local dev server path
             AssetPathUtility.CleanLocalServerBuildArtifacts();
 
@@ -259,6 +278,7 @@ namespace MCPForUnity.Editor.Services
             }
 
             // First, try to stop any existing server (quietly; we'll only warn if the port remains occupied).
+            progress?.Report(new ServerStartProgress(0.03f, "Checking for an existing server…"));
             StopLocalHttpServerInternal(quiet: true);
 
             // If the port is still occupied, don't start and explain why (avoid confusing "refusing to stop" warnings).
@@ -344,10 +364,25 @@ namespace MCPForUnity.Editor.Services
 
                 McpLog.Info("Starting local HTTP server… (first run may take a minute while dependencies install)");
 
-                if (!_runtimeInstaller.EnsureInstalled(out var runtime, out var installError))
+                InstalledServerRuntime runtime;
+                string installError;
+                if (installAsynchronously)
+                {
+                    ServerRuntimeInstallResult installResult =
+                        await _runtimeInstaller.EnsureInstalledAsync(progress);
+                    runtime = installResult.Runtime;
+                    installError = installResult.Error;
+                    if (!installResult.Success)
+                    {
+                        throw new InvalidOperationException(installError);
+                    }
+                }
+                else if (!_runtimeInstaller.EnsureInstalled(out runtime, out installError))
                 {
                     throw new InvalidOperationException(installError);
                 }
+
+                progress?.Report(new ServerStartProgress(0.97f, "Launching MCP server process…"));
                 if (!_commandBuilder.TryBuildInstalledCommand(
                     runtime,
                     GetCurrentProcessIdSafe(),
@@ -389,6 +424,7 @@ namespace MCPForUnity.Editor.Services
                             stateFilePath);
                     }
                 }
+                progress?.Report(new ServerStartProgress(0.98f, "MCP server process launched"));
                 return true;
             }
             catch (Exception ex)
@@ -410,7 +446,20 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         public bool StopLocalHttpServer()
         {
-            return StopLocalHttpServerInternal(quiet: false);
+            int? configuredPort = null;
+            string baseUrl = HttpEndpointUtility.GetLocalBaseUrl();
+            if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) && uri.Port > 0)
+            {
+                configuredPort = uri.Port;
+            }
+
+            // Supplying the configured port permits the existing guarded process-identity
+            // fallback when launch tracking is stale or the server has not produced its
+            // pidfile. This is still fail-closed: only a verified mcp-for-unity listener
+            // can be terminated.
+            return StopLocalHttpServerInternal(
+                quiet: false,
+                portOverride: configuredPort);
         }
 
         public bool StopManagedLocalHttpServer()

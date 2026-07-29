@@ -233,6 +233,7 @@ namespace MCPForUnity.Editor.Services.Server
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStartedUtc); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidArgsHash); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidFilePath); } catch { }
+            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStateFilePath); } catch { }
             try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerInstanceToken); } catch { }
         }
 

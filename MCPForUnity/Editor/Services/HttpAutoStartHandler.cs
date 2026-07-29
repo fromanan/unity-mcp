@@ -222,7 +222,8 @@ namespace MCPForUnity.Editor.Services
                     // Check if server is already reachable (e.g. user started it externally).
                     if (!MCPServiceLocator.Server.IsLocalHttpServerReachable())
                     {
-                        bool serverStarted = MCPServiceLocator.Server.StartLocalHttpServer(quiet: true);
+                        bool serverStarted = await MCPServiceLocator.Server
+                            .StartLocalHttpServerAsync(quiet: true);
                         if (!serverStarted)
                         {
                             McpLog.Warn("[HTTP Auto-Start] Failed to start local HTTP server");

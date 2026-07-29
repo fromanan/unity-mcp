@@ -491,13 +491,9 @@ namespace MCPForUnityTests.Editor.Helpers
 
             var unityMcp = unityMcpNode as TomlTable;
 
-            // Verify features.rmcp_client is enabled for HTTP transport
-            Assert.IsTrue(parsed.TryGetNode("features", out var featuresNode), "HTTP mode should include features table");
-            Assert.IsInstanceOf<TomlTable>(featuresNode, "features should be a table");
-            var features = featuresNode as TomlTable;
-            Assert.IsTrue(features.TryGetNode("rmcp_client", out var rmcpNode), "features should include rmcp_client flag");
-            Assert.IsInstanceOf<TomlBoolean>(rmcpNode, "rmcp_client should be a boolean");
-            Assert.IsTrue((rmcpNode as TomlBoolean).Value, "rmcp_client should be true");
+            Assert.IsFalse(
+                parsed.TryGetNode("features", out _),
+                "Current Codex HTTP support must not require an experimental feature flag");
             
             // Verify url field is present
             Assert.IsTrue(unityMcp.TryGetNode("url", out var urlNode), "unityMCP should contain url in HTTP mode");
@@ -572,13 +568,9 @@ namespace MCPForUnityTests.Editor.Helpers
 
             var unityMcp = unityMcpNode as TomlTable;
 
-            // Verify features.rmcp_client is enabled for HTTP transport
-            Assert.IsTrue(parsed.TryGetNode("features", out var featuresNode), "HTTP mode should include features table");
-            Assert.IsInstanceOf<TomlTable>(featuresNode, "features should be a table");
-            var features = featuresNode as TomlTable;
-            Assert.IsTrue(features.TryGetNode("rmcp_client", out var rmcpNode), "features should include rmcp_client flag");
-            Assert.IsInstanceOf<TomlBoolean>(rmcpNode, "rmcp_client should be a boolean");
-            Assert.IsTrue((rmcpNode as TomlBoolean).Value, "rmcp_client should be true");
+            Assert.IsFalse(
+                parsed.TryGetNode("features", out _),
+                "Current Codex HTTP support must not add an experimental feature flag");
 
             // Verify url field is present
             Assert.IsTrue(unityMcp.TryGetNode("url", out var urlNode), "unityMCP should contain url in HTTP mode");
@@ -590,6 +582,34 @@ namespace MCPForUnityTests.Editor.Helpers
             // Verify command and args are NOT present in HTTP mode
             Assert.IsFalse(unityMcp.TryGetNode("command", out _), "HTTP mode should not contain command field");
             Assert.IsFalse(unityMcp.TryGetNode("args", out _), "HTTP mode should not contain args field");
+        }
+
+        [Test]
+        public void UpsertCodexServerBlock_RemovesLegacyRmcpFlagAndPreservesOtherFeatures()
+        {
+            EditorPrefs.SetBool(EditorPrefKeys.UseHttpTransport, true);
+            string existingToml = string.Join("\n", new[]
+            {
+                "[features]",
+                "rmcp_client = true",
+                "other_feature = true"
+            });
+
+            string result = CodexConfigHelper.UpsertCodexServerBlock(
+                existingToml,
+                "C:\\path\\to\\uv.exe");
+
+            TomlTable parsed;
+            using (var reader = new StringReader(result))
+            {
+                parsed = TOML.Parse(reader);
+            }
+
+            Assert.IsTrue(parsed.TryGetNode("features", out var featuresNode));
+            var features = featuresNode as TomlTable;
+            Assert.IsNotNull(features);
+            Assert.IsFalse(features.TryGetNode("rmcp_client", out _));
+            Assert.IsTrue(features.TryGetNode("other_feature", out _));
         }
     }
 }

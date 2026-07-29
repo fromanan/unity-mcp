@@ -68,30 +68,14 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
 
     logger.info(f"Registered {len(tools)} MCP tools")
 
-    # In HTTP mode, disable non-default groups at the server level so new
-    # sessions start lean.  Unity will re-enable groups via register_tools
-    # (PluginHub._sync_server_tool_visibility) once it connects.
-    # In stdio mode we skip this: the legacy TCP bridge has no register_tools
-    # message, so disabled groups would stay invisible for the entire session.
-    # Tools with group=None (no tag) are unaffected and always visible.
-    from core.config import config as server_config
-
-    if (server_config.transport_mode or "stdio").lower() == "http":
-        groups_to_disable = set(TOOL_GROUPS.keys()) - DEFAULT_ENABLED_GROUPS
-        for group_name in sorted(groups_to_disable):
-            tag = f"group:{group_name}"
-            mcp.disable(tags={tag}, components={"tool"})
-            logger.debug(f"Disabled tool group at startup: {group_name}")
-        logger.info(
-            f"Default tool groups: {', '.join(sorted(DEFAULT_ENABLED_GROUPS))}. "
-            f"Disabled: {', '.join(sorted(groups_to_disable))}. "
-            "Use manage_tools to activate more."
-        )
-    else:
-        logger.info(
-            "Stdio transport: all tool groups enabled at startup. "
-            "Will sync with Unity's tool states after connecting."
-        )
+    # Keep the server registry as a stable superset. HTTP sessions are filtered
+    # per selected Unity instance by UnityInstanceMiddleware; mutating FastMCP's
+    # global transforms from the last plugin to connect contaminates other
+    # projects. Stdio visibility is synchronized explicitly by manage_tools.
+    logger.info(
+        "Registered stable tool superset; session middleware applies "
+        "per-Unity visibility."
+    )
 
 
 async def sync_tool_visibility_from_unity(
@@ -211,7 +195,11 @@ async def sync_tool_visibility_from_unity(
                         )
 
                     service = CustomToolService.get_instance()
-                    service.register_global_tools(custom_tool_models)
+                    owner_id = f"stdio:{instance_id or 'default'}"
+                    service.replace_global_tools_for_owner(
+                        custom_tool_models,
+                        owner_id=owner_id,
+                    )
                     custom_tool_count = len(custom_tool_models)
                     logger.info(
                         "Registered %d custom tool(s) from Unity via stdio sync",

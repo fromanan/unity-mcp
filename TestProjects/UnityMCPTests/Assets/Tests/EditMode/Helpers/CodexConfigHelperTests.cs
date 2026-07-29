@@ -37,6 +37,19 @@ namespace MCPForUnityTests.Editor.Helpers
             }
         }
 
+        [TestCase("10.1.1-beta.2", "10.1.1b2")]
+        [TestCase("10.1.1-alpha.3", "10.1.1a3")]
+        [TestCase("10.1.1-rc.4", "10.1.1rc4")]
+        [TestCase("10.1.1", "10.1.1")]
+        public void ConvertSemVerToPep440_ProducesExactPythonVersion(
+            string unityVersion,
+            string expected)
+        {
+            Assert.AreEqual(
+                expected,
+                AssetPathUtility.ConvertSemVerToPep440(unityVersion));
+        }
+
         /// <summary>
         /// Mock platform service for testing
         /// </summary>
@@ -61,6 +74,11 @@ namespace MCPForUnityTests.Editor.Helpers
         private bool _originalHttpTransport;
         private bool _hadDevForceRefresh;
         private bool _originalDevForceRefresh;
+        private bool _hadHttpScope;
+        private string _originalHttpScope;
+        private bool _hadApiKey;
+        private string _originalApiKey;
+        private string _originalApiKeyEnvironment;
         private IPlatformService _originalPlatformService;
 
         [OneTimeSetUp]
@@ -72,6 +90,12 @@ namespace MCPForUnityTests.Editor.Helpers
             _originalHttpTransport = EditorPrefs.GetBool(EditorPrefKeys.UseHttpTransport, true);
             _hadDevForceRefresh = EditorPrefs.HasKey(EditorPrefKeys.DevModeForceServerRefresh);
             _originalDevForceRefresh = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
+            _hadHttpScope = EditorPrefs.HasKey(EditorPrefKeys.HttpTransportScope);
+            _originalHttpScope = EditorPrefs.GetString(EditorPrefKeys.HttpTransportScope, "local");
+            _hadApiKey = EditorPrefs.HasKey(EditorPrefKeys.ApiKey);
+            _originalApiKey = EditorPrefs.GetString(EditorPrefKeys.ApiKey, string.Empty);
+            _originalApiKeyEnvironment =
+                System.Environment.GetEnvironmentVariable("UNITY_MCP_API_KEY");
             _originalPlatformService = MCPServiceLocator.Platform;
         }
 
@@ -85,6 +109,9 @@ namespace MCPForUnityTests.Editor.Helpers
             // Ensure deterministic uvx args ordering for these tests regardless of editor settings
             // (dev-mode inserts --no-cache/--refresh, which changes the first args).
             EditorPrefs.SetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
+            EditorPrefs.SetString(EditorPrefKeys.HttpTransportScope, "local");
+            EditorPrefs.DeleteKey(EditorPrefKeys.ApiKey);
+            System.Environment.SetEnvironmentVariable("UNITY_MCP_API_KEY", null);
             // Refresh the cache so it picks up the test's pref values
             EditorConfigurationCache.Instance.Refresh();
         }
@@ -138,6 +165,19 @@ namespace MCPForUnityTests.Editor.Helpers
                 EditorPrefs.DeleteKey(EditorPrefKeys.DevModeForceServerRefresh);
             }
 
+            if (_hadHttpScope)
+                EditorPrefs.SetString(EditorPrefKeys.HttpTransportScope, _originalHttpScope);
+            else
+                EditorPrefs.DeleteKey(EditorPrefKeys.HttpTransportScope);
+
+            if (_hadApiKey)
+                EditorPrefs.SetString(EditorPrefKeys.ApiKey, _originalApiKey);
+            else
+                EditorPrefs.DeleteKey(EditorPrefKeys.ApiKey);
+
+            System.Environment.SetEnvironmentVariable(
+                "UNITY_MCP_API_KEY",
+                _originalApiKeyEnvironment);
         }
 
         [Test]
@@ -507,6 +547,62 @@ namespace MCPForUnityTests.Editor.Helpers
             Assert.IsFalse(unityMcp.TryGetNode("command", out _), "HTTP mode should not contain command field");
             Assert.IsFalse(unityMcp.TryGetNode("args", out _), "HTTP mode should not contain args field");
             Assert.IsFalse(unityMcp.TryGetNode("env", out _), "HTTP mode should not contain env field");
+        }
+
+        [Test]
+        public void BuildCodexServerBlock_RemoteHttp_EmitsApiKeyHeader()
+        {
+            EditorPrefs.SetBool(EditorPrefKeys.UseHttpTransport, true);
+            EditorPrefs.SetString(EditorPrefKeys.HttpTransportScope, "remote");
+            EditorPrefs.SetString(EditorPrefKeys.ApiKey, "test-api-key");
+            EditorConfigurationCache.Instance.Refresh();
+
+            string result = CodexConfigHelper.BuildCodexServerBlock("unused");
+            TomlTable parsed;
+            using (var reader = new StringReader(result))
+            {
+                parsed = TOML.Parse(reader);
+            }
+
+            var servers = parsed["mcp_servers"] as TomlTable;
+            var unityMcp = servers?["unityMCP"] as TomlTable;
+            Assert.IsNotNull(unityMcp);
+            Assert.IsTrue(unityMcp.TryGetNode("http_headers", out var headersNode));
+            var headers = headersNode as TomlTable;
+            Assert.IsNotNull(headers);
+            Assert.AreEqual(
+                "test-api-key",
+                (headers["X-API-Key"] as TomlString)?.Value);
+        }
+
+        [Test]
+        public void BuildCodexServerBlock_RemoteHttp_PrefersEnvironmentHeader()
+        {
+            EditorPrefs.SetBool(EditorPrefKeys.UseHttpTransport, true);
+            EditorPrefs.SetString(EditorPrefKeys.HttpTransportScope, "remote");
+            EditorPrefs.SetString(EditorPrefKeys.ApiKey, "editor-pref-key");
+            System.Environment.SetEnvironmentVariable(
+                "UNITY_MCP_API_KEY",
+                "environment-key");
+            EditorConfigurationCache.Instance.Refresh();
+
+            string result = CodexConfigHelper.BuildCodexServerBlock("unused");
+            TomlTable parsed;
+            using (var reader = new StringReader(result))
+            {
+                parsed = TOML.Parse(reader);
+            }
+
+            var servers = parsed["mcp_servers"] as TomlTable;
+            var unityMcp = servers?["unityMCP"] as TomlTable;
+            Assert.IsNotNull(unityMcp);
+            Assert.IsFalse(unityMcp.TryGetNode("http_headers", out _));
+            Assert.IsTrue(
+                unityMcp.TryGetNode("env_http_headers", out var headersNode));
+            var headers = headersNode as TomlTable;
+            Assert.AreEqual(
+                "UNITY_MCP_API_KEY",
+                (headers?["X-API-Key"] as TomlString)?.Value);
         }
 
         [Test]

@@ -1043,7 +1043,7 @@ class TestStressTestSetupPatterns:
 
         Pattern: Atomic frame write with buffering flush
         """
-        mock_writer = AsyncMock()
+        mock_writer = MagicMock()
         mock_writer.drain = AsyncMock()
 
         payload = b"hello world test"

@@ -1292,6 +1292,8 @@ namespace MCPForUnity.Editor.Tools
             string filterType = p.Get("filter_type") ?? p.Get("filterType");
             int pageSize = p.GetInt("page_size") ?? p.GetInt("pageSize") ?? 50;
             int pageNumber = p.GetInt("page_number") ?? p.GetInt("pageNumber") ?? 1;
+            pageSize = Math.Max(1, Math.Min(100, pageSize));
+            pageNumber = Math.Max(1, pageNumber);
 
             scope = AssetPathUtility.SanitizeAssetPath(scope);
             if (scope == null)
@@ -1299,12 +1301,40 @@ namespace MCPForUnity.Editor.Tools
                 return new ErrorResponse("Invalid path: contains traversal sequences.");
             }
 
-            string[] folderScope = AssetDatabase.IsValidFolder(scope)
-                ? new[] { scope }
-                : null;
+            if (!AssetDatabase.IsValidFolder(scope))
+            {
+                return new ErrorResponse(
+                    $"Invalid folder scope '{scope}'. The folder must exist.");
+            }
+            string[] folderScope = { scope };
 
-            // Find UXML and USS assets based on filter
-            var allAssets = new List<object>();
+            long requestedStart = ((long)pageNumber - 1L) * pageSize;
+            var paged = new List<object>(pageSize);
+            long validIndex = 0;
+            int total = 0;
+            Action<string[], string> appendPage = (guids, assetType) =>
+            {
+                foreach (string guid in guids)
+                {
+                    string assetPath = AssetDatabase.GUIDToAssetPath(guid);
+                    if (string.IsNullOrEmpty(assetPath))
+                    {
+                        continue;
+                    }
+
+                    if (validIndex >= requestedStart && paged.Count < pageSize)
+                    {
+                        paged.Add(new Dictionary<string, object>
+                        {
+                            ["path"] = assetPath,
+                            ["type"] = assetType,
+                            ["name"] = Path.GetFileName(assetPath),
+                        });
+                    }
+                    validIndex++;
+                    total++;
+                }
+            };
 
             bool includeUxml = string.IsNullOrEmpty(filterType) ||
                                filterType.Equals("uxml", StringComparison.OrdinalIgnoreCase) ||
@@ -1317,61 +1347,24 @@ namespace MCPForUnity.Editor.Tools
 
             if (includeUxml)
             {
-                string[] guids = AssetDatabase.FindAssets("t:VisualTreeAsset", folderScope);
-                foreach (string guid in guids)
-                {
-                    string assetPath = AssetDatabase.GUIDToAssetPath(guid);
-                    if (!string.IsNullOrEmpty(assetPath))
-                    {
-                        allAssets.Add(new Dictionary<string, object>
-                        {
-                            ["path"] = assetPath,
-                            ["type"] = "uxml",
-                            ["name"] = Path.GetFileName(assetPath),
-                        });
-                    }
-                }
+                appendPage(
+                    AssetDatabase.FindAssets("t:VisualTreeAsset", folderScope),
+                    "uxml");
             }
 
             if (includeUss)
             {
-                string[] guids = AssetDatabase.FindAssets("t:StyleSheet", folderScope);
-                foreach (string guid in guids)
-                {
-                    string assetPath = AssetDatabase.GUIDToAssetPath(guid);
-                    if (!string.IsNullOrEmpty(assetPath))
-                    {
-                        allAssets.Add(new Dictionary<string, object>
-                        {
-                            ["path"] = assetPath,
-                            ["type"] = "uss",
-                            ["name"] = Path.GetFileName(assetPath),
-                        });
-                    }
-                }
+                appendPage(
+                    AssetDatabase.FindAssets("t:StyleSheet", folderScope),
+                    "uss");
             }
 
             if (includePanelSettings)
             {
-                string[] guids = AssetDatabase.FindAssets("t:PanelSettings", folderScope);
-                foreach (string guid in guids)
-                {
-                    string assetPath = AssetDatabase.GUIDToAssetPath(guid);
-                    if (!string.IsNullOrEmpty(assetPath))
-                    {
-                        allAssets.Add(new Dictionary<string, object>
-                        {
-                            ["path"] = assetPath,
-                            ["type"] = "PanelSettings",
-                            ["name"] = Path.GetFileName(assetPath),
-                        });
-                    }
-                }
+                appendPage(
+                    AssetDatabase.FindAssets("t:PanelSettings", folderScope),
+                    "PanelSettings");
             }
-
-            int total = allAssets.Count;
-            int startIndex = (pageNumber - 1) * pageSize;
-            var paged = allAssets.Skip(startIndex).Take(pageSize).ToList();
 
             return new SuccessResponse(
                 $"Found {total} UI asset(s). Returning page {pageNumber} ({paged.Count} items).",
@@ -1380,6 +1373,7 @@ namespace MCPForUnity.Editor.Tools
                     total,
                     pageSize,
                     pageNumber,
+                    hasMore = requestedStart + paged.Count < total,
                     assets = paged,
                 });
         }

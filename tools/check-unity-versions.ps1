@@ -50,11 +50,13 @@ $ErrorActionPreference = "Stop"
 $RepoRoot     = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $VersionsJson = Join-Path $RepoRoot "tools\unity-versions.json"
 $ProjectPath  = Join-Path $RepoRoot "TestProjects\UnityMCPTests"
-$LogDir       = Join-Path $RepoRoot "tools\.unity-check-logs"
+$ResultsDir   = Join-Path $RepoRoot "reports\unity-version-check"
+$LogDir       = Join-Path $ResultsDir "logs"
 
 if (-not (Test-Path $VersionsJson)) { throw "Missing: $VersionsJson" }
 if (-not (Test-Path $ProjectPath))  { throw "Missing project: $ProjectPath" }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+New-Item -ItemType Directory -Force -Path $ResultsDir | Out-Null
 
 # ---- mode setup --------------------------------------------------------------
 
@@ -127,7 +129,7 @@ Write-Host "  Project: $ProjectPath"
 Write-Host "  Logs:    $LogDir"
 Write-Host ""
 
-function Invoke-LocalUnity([string]$Version, [string]$LogFile) {
+function Invoke-LocalUnity([string]$Version, [string]$LogFile, [string]$ResultsFile) {
   $unityBin = Get-UnityBin $Version
   if (-not $unityBin) {
     Write-Host "  [SKIP] $Version -- not installed under any Unity Hub root" -ForegroundColor Yellow
@@ -136,18 +138,23 @@ function Invoke-LocalUnity([string]$Version, [string]$LogFile) {
 
   Write-Host -NoNewline "  [ .. ] $Version -- running...`r"
 
-  # -quit on both paths so Unity batchmode always exits; without it -runTests can hang on test framework shutdown.
   if ($Full) {
-    $unityArgs = @("-batchmode", "-quit", "-nographics", "-projectPath", $ProjectPath, "-runTests", "-testPlatform", "editmode", "-logFile", $LogFile)
+    # The test runner owns shutdown. Passing -quit can make older Unity versions
+    # exit after import without executing any tests.
+    $unityArgs = @("-batchmode", "-nographics", "-projectPath", $ProjectPath, "-runTests", "-testPlatform", "editmode", "-testResults", $ResultsFile, "-logFile", $LogFile)
   } else {
     $unityArgs = @("-batchmode", "-quit", "-nographics", "-projectPath", $ProjectPath, "-logFile", $LogFile)
   }
 
   $proc = Start-Process -FilePath $unityBin -ArgumentList $unityArgs -NoNewWindow -PassThru -Wait
+  if ($Full -and -not (Test-Path $ResultsFile)) {
+    Write-Host "  [FAIL] $Version -- Unity exited without producing test results" -ForegroundColor Red
+    return 1
+  }
   if ($proc.ExitCode -eq 0) { return 0 } else { return 1 }
 }
 
-function Invoke-DockerUnity([string]$Version, [string]$LogFile) {
+function Invoke-DockerUnity([string]$Version, [string]$LogFile, [string]$ResultsFile) {
   $image = "unityci/editor:ubuntu-$Version-$DockerImageTag"
 
   Write-Host -NoNewline "  [ .. ] $Version -- pulling $image ...`r"
@@ -161,11 +168,11 @@ function Invoke-DockerUnity([string]$Version, [string]$LogFile) {
 
   Write-Host -NoNewline "  [ .. ] $Version -- running in container...`r"
 
-  # -quit on both paths (see Invoke-LocalUnity note).
-  $unityExtra = if ($Full) { "-quit -runTests -testPlatform editmode" } else { "-quit" }
+  $unityExtra = if ($Full) { "-runTests -testPlatform editmode -testResults /results/$Version-results.xml" } else { "-quit" }
 
   # Convert Windows path to Docker-friendly format for -v.
   $projectMount = $ProjectPath.Replace('\', '/')
+  $resultsMount = $ResultsDir.Replace('\', '/')
 
   $script = @"
 set -e
@@ -178,10 +185,15 @@ printf '%s' "`$UNITY_LICENSE" > /root/.local/share/unity3d/Unity/Unity_lic.ulf
     --platform linux/amd64 `
     -e UNITY_LICENSE `
     -v "${projectMount}:/project" `
+    -v "${resultsMount}:/results" `
     --entrypoint /bin/bash `
     $image `
     -c $script *>> $LogFile
 
+  if ($Full -and -not (Test-Path $ResultsFile)) {
+    Write-Host "  [FAIL] $Version -- Unity exited without producing test results" -ForegroundColor Red
+    return 1
+  }
   if ($LASTEXITCODE -eq 0) { return 0 } else { return 1 }
 }
 
@@ -189,12 +201,14 @@ $pass = 0; $fail = 0; $skip = 0
 
 foreach ($version in $Versions) {
   $logFile = Join-Path $LogDir "$version.log"
+  $resultsFile = Join-Path $ResultsDir "$version-results.xml"
   "" | Set-Content -Path $logFile  # truncate stale
+  Remove-Item -LiteralPath $resultsFile -Force -ErrorAction SilentlyContinue
 
   if ($Docker) {
-    $rc = Invoke-DockerUnity $version $logFile
+    $rc = Invoke-DockerUnity $version $logFile $resultsFile
   } else {
-    $rc = Invoke-LocalUnity $version $logFile
+    $rc = Invoke-LocalUnity $version $logFile $resultsFile
   }
 
   switch ($rc) {

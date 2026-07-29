@@ -6,6 +6,15 @@ namespace MCPForUnity.Editor.Constants
     /// </summary>
     internal static class EditorPrefKeys
     {
+        internal static string ForCurrentProject(string key)
+        {
+            string projectHash =
+                MCPForUnity.Editor.Helpers.ProjectIdentityUtility.GetProjectHash();
+            return string.IsNullOrWhiteSpace(projectHash)
+                ? key
+                : $"{key}.{projectHash}";
+        }
+
         internal const string UseHttpTransport = "MCPForUnity.UseHttpTransport";
         internal const string HttpTransportScope = "MCPForUnity.HttpTransportScope"; // "local" | "remote"
         internal const string LastLocalHttpServerPid = "MCPForUnity.LocalHttpServer.LastPid";

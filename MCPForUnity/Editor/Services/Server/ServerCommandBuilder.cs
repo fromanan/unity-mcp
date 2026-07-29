@@ -111,31 +111,25 @@ namespace MCPForUnity.Editor.Services.Server
                 $" --pidfile {QuoteIfNeeded(pidFilePath)}" +
                 $" --unity-instance-token {instanceToken}";
 
-            if (Application.platform == RuntimePlatform.WindowsEditor)
+            if (string.IsNullOrWhiteSpace(runtime.SupervisorExecutable)
+                || !File.Exists(runtime.SupervisorExecutable))
             {
-                if (string.IsNullOrWhiteSpace(runtime.SupervisorExecutable)
-                    || !File.Exists(runtime.SupervisorExecutable))
-                {
-                    error = "The Windows MCP server supervisor entry point is missing.";
-                    return false;
-                }
-                int hardLimit = config.ServerMemoryHardLimitEnabled
-                    ? config.ServerMemoryHardLimitMb
-                    : 0;
-                command =
-                    $"{QuoteIfNeeded(runtime.SupervisorExecutable)}" +
-                    $" --parent-pid {parentPid}" +
-                    $" --port {port}" +
-                    $" --state-file {QuoteIfNeeded(stateFilePath)}" +
-                    $" --instance-token {instanceToken}" +
-                    $" --runtime-version {QuoteIfNeeded(runtime.Version)}" +
-                    $" --soft-memory-limit-mb {config.ServerMemorySoftLimitMb}" +
-                    $" --hard-memory-limit-mb {hardLimit}" +
-                    $" -- {QuoteIfNeeded(runtime.ServerExecutable)} {serverArguments}";
-                return true;
+                error = "The MCP server supervisor entry point is missing.";
+                return false;
             }
-
-            command = $"{QuoteIfNeeded(runtime.ServerExecutable)} {serverArguments}";
+            int hardLimit = config.ServerMemoryHardLimitEnabled
+                ? config.ServerMemoryHardLimitMb
+                : 0;
+            command =
+                $"{QuoteIfNeeded(runtime.SupervisorExecutable)}" +
+                $" --parent-pid {parentPid}" +
+                $" --port {port}" +
+                $" --state-file {QuoteIfNeeded(stateFilePath)}" +
+                $" --instance-token {instanceToken}" +
+                $" --runtime-version {QuoteIfNeeded(runtime.Version)}" +
+                $" --soft-memory-limit-mb {config.ServerMemorySoftLimitMb}" +
+                $" --hard-memory-limit-mb {hardLimit}" +
+                $" -- {QuoteIfNeeded(runtime.ServerExecutable)} {serverArguments}";
             return true;
         }
 

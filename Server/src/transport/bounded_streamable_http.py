@@ -11,6 +11,7 @@ import anyio
 import fastmcp
 from fastmcp.server.http import (
     FastMCPStreamableHTTPSessionManager,
+    HostOriginGuardMiddleware,
     RequireAuthMiddleware,
     StreamableHTTPASGIApp,
     build_resource_metadata_url,
@@ -143,6 +144,9 @@ def create_bounded_streamable_http_app(
     stateless_http: bool = False,
     routes: list[BaseRoute] | None = None,
     middleware: list[Middleware] | None = None,
+    host_origin_protection: bool | str = "auto",
+    allowed_hosts: list[str] | None = None,
+    allowed_origins: list[str] | None = None,
 ):
     """Build FastMCP's HTTP app while supplying bounded SDK session settings."""
 
@@ -179,6 +183,20 @@ def create_bounded_streamable_http_app(
     if routes:
         server_routes.extend(routes)
     server_routes.extend(server._get_additional_http_routes())
+    if host_origin_protection not in (True, False, "auto"):
+        raise ValueError(
+            "host_origin_protection must be True, False, or 'auto'"
+        )
+    if host_origin_protection is not False:
+        server_middleware.insert(
+            0,
+            Middleware(
+                HostOriginGuardMiddleware,
+                allowed_hosts=allowed_hosts,
+                allowed_origins=allowed_origins,
+                mode="strict" if host_origin_protection is True else "auto",
+            ),
+        )
     if middleware:
         server_middleware.extend(middleware)
 

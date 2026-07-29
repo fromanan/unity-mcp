@@ -41,7 +41,7 @@ class RegisterMessage(BaseModel):
 
 class RegisterToolsMessage(BaseModel):
     type: str = "register_tools"
-    tools: list[ToolDefinitionModel]
+    tools: list[ToolDefinitionModel] = Field(max_length=1024)
 
 
 class PongMessage(BaseModel):

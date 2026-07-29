@@ -1,4 +1,5 @@
 import asyncio
+from collections import OrderedDict
 import inspect
 import logging
 import time
@@ -47,9 +48,9 @@ async def get_user_id_from_context(ctx: Context) -> str | None:
 
 
 class RegisterToolsPayload(BaseModel):
-    project_id: str
-    project_hash: str | None = None
-    tools: list[ToolDefinitionModel]
+    project_id: str = Field(min_length=1, max_length=256)
+    project_hash: str | None = Field(default=None, max_length=128)
+    tools: list[ToolDefinitionModel] = Field(max_length=256)
 
 
 class ToolRegistrationResponse(BaseModel):
@@ -61,14 +62,22 @@ class ToolRegistrationResponse(BaseModel):
 
 class CustomToolService:
     _instance: "CustomToolService | None" = None
+    MAX_LEGACY_PROJECTS = 64
+    MAX_GLOBAL_CUSTOM_TOOLS = 256
+    MAX_REGISTRATION_BODY_BYTES = 1024 * 1024
 
     def __init__(self, mcp: FastMCP, project_scoped_tools: bool = True):
         CustomToolService._instance = self
         self._mcp = mcp
         self._project_scoped_tools = project_scoped_tools
-        self._project_tools: dict[str, dict[str, ToolDefinitionModel]] = {}
+        self._project_tools: OrderedDict[
+            str, dict[str, ToolDefinitionModel]
+        ] = OrderedDict()
         self._hash_to_project: dict[str, str] = {}
         self._global_tools: dict[str, ToolDefinitionModel] = {}
+        self._global_tool_owners: dict[
+            str, dict[str, ToolDefinitionModel]
+        ] = {}
         self._register_http_routes()
 
     @classmethod
@@ -81,8 +90,22 @@ class CustomToolService:
     def _register_http_routes(self) -> None:
         @self._mcp.custom_route("/register-tools", methods=["POST"])
         async def register_tools(request: Request) -> JSONResponse:
+            # Hosted plugins register over the authenticated WebSocket. Keeping
+            # this legacy local route reachable remotely permits unauthenticated
+            # schema injection and unbounded state growth.
+            if config.http_remote_hosted:
+                return JSONResponse({"error": "Not found"}, status_code=404)
+
             try:
-                payload = RegisterToolsPayload.model_validate(await request.json())
+                body = bytearray()
+                async for chunk in request.stream():
+                    if len(body) + len(chunk) > self.MAX_REGISTRATION_BODY_BYTES:
+                        return JSONResponse(
+                            {"success": False, "error": "Request body too large"},
+                            status_code=413,
+                        )
+                    body.extend(chunk)
+                payload = RegisterToolsPayload.model_validate_json(bytes(body))
             except ValidationError as exc:
                 return JSONResponse({"success": False, "error": exc.errors()}, status_code=400)
 
@@ -108,6 +131,7 @@ class CustomToolService:
         user_id: str | None = None,
     ) -> list[ToolDefinitionModel]:
         legacy = list(self._project_tools.get(project_id, {}).values())
+        self._touch_project(project_id)
         hub_tools = await PluginHub.get_tools_for_project(project_id, user_id=user_id)
         return legacy + hub_tools
 
@@ -311,6 +335,7 @@ class CustomToolService:
         tools: list[ToolDefinitionModel],
         project_hash: str | None = None,
     ) -> tuple[list[str], list[str]]:
+        self._ensure_project_capacity(project_id)
         registered: list[str] = []
         replaced: list[str] = []
         for tool in tools:
@@ -323,10 +348,16 @@ class CustomToolService:
 
         if project_hash:
             self._hash_to_project[project_hash.lower()] = project_id
+        self._touch_project(project_id)
 
         return registered, replaced
 
-    def register_global_tools(self, tools: list[ToolDefinitionModel]) -> None:
+    def register_global_tools(
+        self,
+        tools: list[ToolDefinitionModel],
+        *,
+        owner_id: str,
+    ) -> None:
         # Global custom tools are always registered, even when project-scoped tools
         # are enabled. Project-scoped tools can override globals by name, but
         # disabling globals entirely would break shared tooling that projects expect.
@@ -338,7 +369,48 @@ class CustomToolService:
                     tool.name,
                 )
                 continue
-            self._register_global_tool(tool)
+            owners = self._global_tool_owners.setdefault(tool.name, {})
+            owners[owner_id] = tool
+            canonical_owner = min(owners)
+            canonical = owners[canonical_owner]
+            existing = self._global_tools.get(tool.name)
+            if existing is None:
+                if len(self._global_tools) >= self.MAX_GLOBAL_CUSTOM_TOOLS:
+                    owners.pop(owner_id, None)
+                    if not owners:
+                        self._global_tool_owners.pop(tool.name, None)
+                    logger.warning(
+                        "Global custom tool limit reached; refusing '%s'",
+                        tool.name,
+                    )
+                    continue
+                self._register_global_tool(canonical)
+            elif existing.model_dump() != canonical.model_dump():
+                self._replace_global_tool(canonical)
+
+    def unregister_global_tools_for_owner(self, owner_id: str) -> None:
+        for tool_name, owners in list(self._global_tool_owners.items()):
+            owners.pop(owner_id, None)
+            if not owners:
+                self._global_tool_owners.pop(tool_name, None)
+                if tool_name in self._global_tools:
+                    self._mcp.local_provider.remove_tool(tool_name)
+                    self._global_tools.pop(tool_name, None)
+                continue
+            canonical = owners[min(owners)]
+            existing = self._global_tools.get(tool_name)
+            if existing is None or existing.model_dump() != canonical.model_dump():
+                self._replace_global_tool(canonical)
+
+    def replace_global_tools_for_owner(
+        self,
+        tools: list[ToolDefinitionModel],
+        *,
+        owner_id: str,
+    ) -> None:
+        """Replace one owner's complete advertised tool snapshot."""
+        self.unregister_global_tools_for_owner(owner_id)
+        self.register_global_tools(tools, owner_id=owner_id)
 
     def _get_builtin_tool_names(self) -> set[str]:
         return {tool["name"] for tool in get_registered_tools()}
@@ -371,6 +443,25 @@ class CustomToolService:
             return
 
         self._global_tools[definition.name] = definition
+
+    def _replace_global_tool(self, definition: ToolDefinitionModel) -> None:
+        if definition.name in self._global_tools:
+            self._mcp.local_provider.remove_tool(definition.name)
+            self._global_tools.pop(definition.name, None)
+        self._register_global_tool(definition)
+
+    def _ensure_project_capacity(self, project_id: str) -> None:
+        if project_id in self._project_tools:
+            return
+        while len(self._project_tools) >= self.MAX_LEGACY_PROJECTS:
+            evicted_project, _ = self._project_tools.popitem(last=False)
+            for project_hash, mapped_project in list(self._hash_to_project.items()):
+                if mapped_project == evicted_project:
+                    self._hash_to_project.pop(project_hash, None)
+
+    def _touch_project(self, project_id: str) -> None:
+        if project_id in self._project_tools:
+            self._project_tools.move_to_end(project_id)
 
     def _build_global_tool_handler(self, definition: ToolDefinitionModel):
         async def _handler(ctx: Context, **kwargs) -> MCPResponse:

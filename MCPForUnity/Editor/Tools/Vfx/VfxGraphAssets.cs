@@ -414,6 +414,18 @@ namespace MCPForUnity.Editor.Tools.Vfx
         {
             string searchFolder = @params["folder"]?.ToString();
             string searchPattern = @params["search"]?.ToString();
+            int pageSize = Math.Max(
+                1,
+                Math.Min(
+                    100,
+                    @params["page_size"]?.Value<int?>()
+                    ?? @params["pageSize"]?.Value<int?>()
+                    ?? 50));
+            int pageNumber = Math.Max(
+                1,
+                @params["page_number"]?.Value<int?>()
+                ?? @params["pageNumber"]?.Value<int?>()
+                ?? 1);
 
             string filter = "t:VisualEffectAsset";
             if (!string.IsNullOrEmpty(searchPattern))
@@ -447,6 +459,14 @@ namespace MCPForUnity.Editor.Tools.Vfx
                 {
                     return new { success = false, message = "Invalid folder: would escape project directory" };
                 }
+                if (!AssetDatabase.IsValidFolder(searchFolder))
+                {
+                    return new
+                    {
+                        success = false,
+                        message = $"Invalid folder: '{searchFolder}' does not exist"
+                    };
+                }
 
                 guids = AssetDatabase.FindAssets(filter, new[] { searchFolder });
             }
@@ -455,16 +475,20 @@ namespace MCPForUnity.Editor.Tools.Vfx
                 guids = AssetDatabase.FindAssets(filter);
             }
 
-            var assets = new List<object>();
-            foreach (string guid in guids)
+            long requestedStart = ((long)pageNumber - 1L) * pageSize;
+            int startIndex = requestedStart > int.MaxValue
+                ? int.MaxValue
+                : (int)requestedStart;
+            var page = guids.Skip(startIndex).Take(pageSize);
+            var assets = new List<object>(pageSize);
+            foreach (string guid in page)
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
-                var asset = AssetDatabase.LoadAssetAtPath<VisualEffectAsset>(path);
-                if (asset != null)
+                if (!string.IsNullOrEmpty(path))
                 {
                     assets.Add(new
                     {
-                        name = asset.name,
+                        name = System.IO.Path.GetFileNameWithoutExtension(path),
                         path = path,
                         guid = guid
                     });
@@ -476,7 +500,11 @@ namespace MCPForUnity.Editor.Tools.Vfx
                 success = true,
                 data = new
                 {
+                    total = guids.Length,
                     count = assets.Count,
+                    pageSize = pageSize,
+                    pageNumber = pageNumber,
+                    hasMore = startIndex + assets.Count < guids.Length,
                     assets = assets
                 }
             };

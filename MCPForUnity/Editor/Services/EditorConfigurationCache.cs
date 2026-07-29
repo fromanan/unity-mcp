@@ -153,16 +153,16 @@ namespace MCPForUnity.Editor.Services
                 EditorPrefs.GetInt(EditorPrefKeys.ServerMemorySoftLimitMb, 512));
             _serverMemoryHardLimitEnabled = EditorPrefs.GetBool(
                 EditorPrefKeys.ServerMemoryHardLimitEnabled,
-                false);
+                true);
             _serverMemoryHardLimitMb = Math.Max(
                 128,
                 EditorPrefs.GetInt(EditorPrefKeys.ServerMemoryHardLimitMb, 768));
             _serverSessionIdleTimeoutSeconds = Math.Max(
                 30,
-                EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 1800));
+                EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 300));
             _serverMaxSessions = Math.Max(
                 1,
-                EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 64));
+                EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 16));
         }
 
         /// <summary>
@@ -393,10 +393,10 @@ namespace MCPForUnity.Editor.Services
                     _serverMemoryHardLimitMb = Math.Max(128, EditorPrefs.GetInt(EditorPrefKeys.ServerMemoryHardLimitMb, 768));
                     break;
                 case nameof(ServerSessionIdleTimeoutSeconds):
-                    _serverSessionIdleTimeoutSeconds = Math.Max(30, EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 1800));
+                    _serverSessionIdleTimeoutSeconds = Math.Max(30, EditorPrefs.GetInt(EditorPrefKeys.ServerSessionIdleTimeoutSeconds, 300));
                     break;
                 case nameof(ServerMaxSessions):
-                    _serverMaxSessions = Math.Max(1, EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 64));
+                    _serverMaxSessions = Math.Max(1, EditorPrefs.GetInt(EditorPrefKeys.ServerMaxSessions, 16));
                     break;
             }
             OnConfigurationChanged?.Invoke(keyName);

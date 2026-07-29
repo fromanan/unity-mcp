@@ -34,37 +34,9 @@ if sys.platform == "win32":
 import logging
 from contextlib import asynccontextmanager
 import os
-import threading
 import time
 from typing import AsyncIterator, Any
 from urllib.parse import urlparse
-
-# Workaround for environments where tool signature evaluation runs with a globals
-# dict that does not include common `typing` names (e.g. when annotations are strings
-# and evaluated via `eval()` during schema generation).
-# Making these names available in builtins avoids `NameError: Annotated/Literal/... is not defined`.
-try:  # pragma: no cover - startup safety guard
-    import builtins
-    import typing as _typing
-
-    _typing_names = (
-        "Annotated",
-        "Literal",
-        "Any",
-        "Union",
-        "Optional",
-        "Dict",
-        "List",
-        "Tuple",
-        "Set",
-        "FrozenSet",
-    )
-    for _name in _typing_names:
-        if not hasattr(builtins, _name) and hasattr(_typing, _name):
-            # type: ignore[attr-defined]
-            setattr(builtins, _name, getattr(_typing, _name))
-except Exception:
-    pass
 
 from fastmcp import FastMCP
 from logging.handlers import RotatingFileHandler
@@ -172,14 +144,29 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             f"HTTP tool registry will be available on http://{http_host}:{http_port}")
 
     global _plugin_registry
-    if _plugin_registry is None:
-        _plugin_registry = PluginRegistry()
-        loop = asyncio.get_running_loop()
-        PluginHub.configure(_plugin_registry, loop, mcp=server)
+    _plugin_registry = PluginRegistry()
+    loop = asyncio.get_running_loop()
+    PluginHub.configure(_plugin_registry, loop, mcp=server)
 
     # Record server startup telemetry
     start_time = time.time()
     start_clk = time.perf_counter()
+    deferred_tasks: set[asyncio.Task] = set()
+
+    async def _run_deferred(callback) -> None:
+        await asyncio.sleep(1.0)
+        try:
+            await asyncio.to_thread(callback)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Deferred telemetry failed", exc_info=True)
+
+    def schedule_deferred(callback) -> None:
+        task = asyncio.create_task(_run_deferred(callback))
+        deferred_tasks.add(task)
+        task.add_done_callback(deferred_tasks.discard)
+
     # Defer initial telemetry by 1s to avoid stdio handshake interference
 
     def _emit_startup():
@@ -191,7 +178,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             record_milestone(MilestoneType.FIRST_STARTUP)
         except Exception:
             logger.debug("Deferred startup telemetry failed", exc_info=True)
-    threading.Timer(1.0, _emit_startup).start()
+    schedule_deferred(_emit_startup)
 
     try:
         skip_connect = os.environ.get(
@@ -240,14 +227,14 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
                                 "Stdio startup: tool visibility sync failed: %s", sync_exc)
 
                     # Record successful Unity connection (deferred)
-                    threading.Timer(1.0, lambda: record_telemetry(
+                    schedule_deferred(lambda: record_telemetry(
                         RecordType.UNITY_CONNECTION,
                         {
                             "status": "connected",
                             "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
                             "instance_count": len(instances)
                         }
-                    )).start()
+                    ))
                 except Exception as e:
                     logger.warning(
                         f"Could not connect to default Unity instance: {e}")
@@ -259,25 +246,25 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
         # Record connection failure (deferred)
         _err_msg = str(e)[:200]
-        threading.Timer(1.0, lambda: record_telemetry(
+        schedule_deferred(lambda: record_telemetry(
             RecordType.UNITY_CONNECTION,
             {
                 "status": "failed",
                 "error": _err_msg,
                 "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
             }
-        )).start()
+        ))
     except Exception as e:
         logger.warning(f"Unexpected error connecting to Unity on startup: {e}")
         _err_msg = str(e)[:200]
-        threading.Timer(1.0, lambda: record_telemetry(
+        schedule_deferred(lambda: record_telemetry(
             RecordType.UNITY_CONNECTION,
             {
                 "status": "failed",
                 "error": _err_msg,
                 "connection_time_ms": (time.perf_counter() - start_clk) * 1000,
             }
-        )).start()
+        ))
 
     try:
         # Yield shared state for lifespan consumers (e.g., middleware)
@@ -286,6 +273,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
             "plugin_registry": _plugin_registry,
         }
     finally:
+        for task in deferred_tasks:
+            task.cancel()
+        if deferred_tasks:
+            await asyncio.gather(*deferred_tasks, return_exceptions=True)
+        await PluginHub.shutdown()
+        _plugin_registry = None
         if _unity_connection_pool:
             _unity_connection_pool.disconnect_all()
         logger.info("MCP for Unity Server shut down")
@@ -630,6 +623,7 @@ def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
         ApiKeyService(
             validation_url=config.api_key_validation_url,
             cache_ttl=config.api_key_cache_ttl,
+            cache_max_entries=config.api_key_cache_max_entries,
             service_token_header=config.api_key_service_token_header,
             service_token=config.api_key_service_token,
         )
@@ -737,19 +731,35 @@ Examples:
     parser.add_argument(
         "--http-session-idle-timeout",
         type=float,
-        default=1800.0,
+        default=300.0,
         metavar="SECONDS",
         help="Expire inactive Streamable HTTP sessions after this many seconds "
-             "(default: 1800). Can also set via "
+             "(default: 300). Can also set via "
              "UNITY_MCP_HTTP_SESSION_IDLE_TIMEOUT."
     )
     parser.add_argument(
         "--http-max-sessions",
         type=int,
-        default=64,
+        default=16,
         metavar="COUNT",
-        help="Maximum concurrent Streamable HTTP sessions (default: 64). "
+        help="Maximum concurrent Streamable HTTP sessions (default: 16). "
              "Can also set via UNITY_MCP_HTTP_MAX_SESSIONS."
+    )
+    parser.add_argument(
+        "--http-allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="Host header accepted by a remotely hosted HTTP server. Repeatable. "
+             "Can also set a comma-separated UNITY_MCP_HTTP_ALLOWED_HOSTS."
+    )
+    parser.add_argument(
+        "--http-allowed-origin",
+        action="append",
+        default=[],
+        metavar="ORIGIN",
+        help="Browser origin accepted by a remotely hosted HTTP server. Repeatable. "
+             "Can also set a comma-separated UNITY_MCP_HTTP_ALLOWED_ORIGINS."
     )
     parser.add_argument(
         "--api-key-validation-url",
@@ -776,6 +786,14 @@ Examples:
         metavar="SECONDS",
         help="Cache TTL for validated API keys in seconds (default: 300). "
              "Can also set via UNITY_MCP_API_KEY_CACHE_TTL."
+    )
+    parser.add_argument(
+        "--api-key-cache-max-entries",
+        type=int,
+        default=1024,
+        metavar="COUNT",
+        help="Maximum cached API-key validation results (default: 1024). "
+             "Can also set via UNITY_MCP_API_KEY_CACHE_MAX_ENTRIES."
     )
     parser.add_argument(
         "--api-key-service-token-header",
@@ -833,6 +851,18 @@ Examples:
         bool(args.http_remote_hosted)
         or os.environ.get("UNITY_MCP_HTTP_REMOTE_HOSTED", "").lower() in ("true", "1", "yes", "on")
     )
+    allowed_hosts_env = os.environ.get("UNITY_MCP_HTTP_ALLOWED_HOSTS", "")
+    allowed_origins_env = os.environ.get("UNITY_MCP_HTTP_ALLOWED_ORIGINS", "")
+    config.http_allowed_hosts = tuple(
+        item.strip()
+        for item in [*args.http_allowed_host, *allowed_hosts_env.split(",")]
+        if item.strip()
+    )
+    config.http_allowed_origins = tuple(
+        item.strip()
+        for item in [*args.http_allowed_origin, *allowed_origins_env.split(",")]
+        if item.strip()
+    )
     try:
         config.http_session_idle_timeout_seconds = float(
             os.environ.get(
@@ -879,6 +909,19 @@ Examples:
             "Invalid UNITY_MCP_API_KEY_CACHE_TTL value, using default 300.0"
         )
         config.api_key_cache_ttl = 300.0
+    try:
+        cache_max_env = os.environ.get("UNITY_MCP_API_KEY_CACHE_MAX_ENTRIES")
+        config.api_key_cache_max_entries = (
+            int(cache_max_env)
+            if cache_max_env
+            else args.api_key_cache_max_entries
+        )
+    except ValueError:
+        logger.error("API key cache max entries must be an integer")
+        raise SystemExit(2)
+    if config.api_key_cache_max_entries <= 0:
+        logger.error("API key cache max entries must be positive")
+        raise SystemExit(2)
 
     # Service token for authenticating to validation endpoint
     config.api_key_service_token_header = (
@@ -895,6 +938,16 @@ Examples:
         logger.error(
             "--http-remote-hosted requires --api-key-validation-url or "
             "UNITY_MCP_API_KEY_VALIDATION_URL environment variable"
+        )
+        raise SystemExit(1)
+    if (
+        config.http_remote_hosted
+        and config.transport_mode == "http"
+        and not config.http_allowed_hosts
+    ):
+        logger.error(
+            "--http-remote-hosted requires at least one --http-allowed-host "
+            "or UNITY_MCP_HTTP_ALLOWED_HOSTS value"
         )
         raise SystemExit(1)
 
@@ -990,6 +1043,9 @@ Examples:
             port=port,
             session_idle_timeout=config.http_session_idle_timeout_seconds,
             max_sessions=config.http_max_sessions,
+            remote_hosted=config.http_remote_hosted,
+            allowed_hosts=config.http_allowed_hosts,
+            allowed_origins=config.http_allowed_origins,
         )
     else:
         # Use stdio transport for traditional MCP

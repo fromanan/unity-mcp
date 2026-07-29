@@ -150,12 +150,17 @@ namespace MCPForUnity.Editor.Helpers
             }
 
             string uvxPath = MCPServiceLocator.Paths.GetUvxPath();
-            if (uvxPath == null)
+            bool useHttpTransport = EditorPrefs.GetBool(
+                EditorPrefKeys.UseHttpTransport,
+                true);
+            if (!useHttpTransport && uvxPath == null)
             {
                 return "uv package manager not found. Please install uv first.";
             }
 
-            string updatedToml = CodexConfigHelper.UpsertCodexServerBlock(existingToml, uvxPath);
+            string updatedToml = CodexConfigHelper.UpsertCodexServerBlock(
+                existingToml,
+                uvxPath ?? string.Empty);
 
             EnsureConfigDirectoryExists(configPath);
             WriteAtomicFile(configPath, updatedToml);

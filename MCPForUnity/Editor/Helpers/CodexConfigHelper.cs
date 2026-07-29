@@ -38,6 +38,7 @@ namespace MCPForUnity.Editor.Helpers
                 // HTTP mode: Use url field
                 string httpUrl = HttpEndpointUtility.GetMcpRpcUrl();
                 unityMCP["url"] = new TomlString { Value = httpUrl };
+                AddRemoteHttpAuthentication(unityMCP);
             }
             else
             {
@@ -184,6 +185,7 @@ namespace MCPForUnity.Editor.Helpers
                 // HTTP mode: Use url field
                 string httpUrl = HttpEndpointUtility.GetMcpRpcUrl();
                 unityMCP["url"] = new TomlString { Value = httpUrl };
+                AddRemoteHttpAuthentication(unityMCP);
             }
             else
             {
@@ -218,6 +220,40 @@ namespace MCPForUnity.Editor.Helpers
             }
 
             return unityMCP;
+        }
+
+        private static void AddRemoteHttpAuthentication(TomlTable unityMCP)
+        {
+            if (unityMCP == null || !HttpEndpointUtility.IsRemoteScope())
+            {
+                return;
+            }
+
+            const string environmentVariable = "UNITY_MCP_API_KEY";
+            if (!string.IsNullOrWhiteSpace(
+                Environment.GetEnvironmentVariable(environmentVariable)))
+            {
+                var envHeaders = new TomlTable { IsInline = true };
+                envHeaders[AuthConstants.ApiKeyHeader] = new TomlString
+                {
+                    Value = environmentVariable
+                };
+                unityMCP["env_http_headers"] = envHeaders;
+                return;
+            }
+
+            string apiKey = EditorPrefs.GetString(
+                EditorPrefKeys.ApiKey,
+                string.Empty);
+            if (!string.IsNullOrWhiteSpace(apiKey))
+            {
+                var headers = new TomlTable { IsInline = true };
+                headers[AuthConstants.ApiKeyHeader] = new TomlString
+                {
+                    Value = apiKey
+                };
+                unityMCP["http_headers"] = headers;
+            }
         }
 
         /// <summary>

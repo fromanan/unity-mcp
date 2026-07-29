@@ -414,13 +414,15 @@ namespace MCPForUnity.Editor.Services
                 }
 
                 _lastLaunchedProcess = System.Diagnostics.Process.Start(startInfo);
+                AttachLaunchLogging(_lastLaunchedProcess, effectiveLog);
                 if (!string.IsNullOrEmpty(pidFilePath))
                 {
                     StoreLocalHttpServerHandshake(pidFilePath, instanceToken);
                     if (!string.IsNullOrEmpty(stateFilePath))
                     {
                         EditorPrefs.SetString(
-                            EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                            EditorPrefKeys.ForCurrentProject(
+                                EditorPrefKeys.LastLocalHttpServerStateFilePath),
                             stateFilePath);
                     }
                 }
@@ -717,6 +719,12 @@ namespace MCPForUnity.Editor.Services
                     // to port-based heuristics when a port override was supplied (managed-stop path).
                     if (!TryReadPidFromPidFile(pidFilePath, out var pidFromFile) || pidFromFile <= 0)
                     {
+                        if (TryStopManagedLaunchHandle(port, quiet))
+                        {
+                            try { DeletePidFile(pidFilePath); } catch { }
+                            ClearLocalServerPidTracking();
+                            return true;
+                        }
                         if (!portOverride.HasValue)
                         {
                             if (!quiet)
@@ -999,6 +1007,41 @@ namespace MCPForUnity.Editor.Services
             return _processTerminator.Terminate(pid, expectedPort);
         }
 
+        private bool TryStopManagedLaunchHandle(int port, bool quiet)
+        {
+            try
+            {
+                var process = _lastLaunchedProcess;
+                if (process == null || process.HasExited)
+                {
+                    return false;
+                }
+
+                int pid = process.Id;
+                if (pid <= 1 || pid == GetCurrentProcessIdSafe())
+                {
+                    return false;
+                }
+
+                if (!TerminateProcess(pid, port))
+                {
+                    return false;
+                }
+
+                _lastLaunchedProcess = null;
+                if (!quiet)
+                {
+                    McpLog.Info(
+                        $"Stopped managed MCP supervisor tree on port {port} (PID: {pid})");
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private bool TryRequestGracefulShutdown(string instanceToken, int pid, int port)
         {
             if (string.IsNullOrWhiteSpace(instanceToken) || pid <= 1 || port <= 0)
@@ -1134,6 +1177,66 @@ namespace MCPForUnity.Editor.Services
         private System.Diagnostics.ProcessStartInfo CreateHeadlessProcessStartInfo(string command, string logFilePath)
         {
             return _terminalLauncher.CreateHeadlessProcessStartInfo(command, logFilePath);
+        }
+
+        private void AttachLaunchLogging(
+            System.Diagnostics.Process process,
+            string logFilePath)
+        {
+            if (process == null)
+            {
+                throw new InvalidOperationException("Managed server process did not start.");
+            }
+
+            bool captureOutput = process.StartInfo?.RedirectStandardOutput == true;
+            bool captureError = process.StartInfo?.RedirectStandardError == true;
+            bool closeInput = process.StartInfo?.RedirectStandardInput == true;
+            if (!captureOutput && !captureError)
+            {
+                // Custom launchers used by integrations may own their own logging.
+                // Never touch StandardOutput/Error unless the corresponding stream
+                // was explicitly redirected before Process.Start().
+                if (closeInput)
+                {
+                    try { process.StandardInput.Close(); } catch { }
+                }
+                return;
+            }
+
+            var writer = new StreamWriter(new FileStream(
+                logFilePath,
+                FileMode.Append,
+                FileAccess.Write,
+                FileShare.ReadWrite))
+            {
+                AutoFlush = true
+            };
+            var logLock = new object();
+
+            System.Diagnostics.DataReceivedEventHandler writeLine = (_, args) =>
+            {
+                if (args.Data == null) return;
+                lock (logLock)
+                {
+                    try { writer.WriteLine(args.Data); } catch { }
+                }
+            };
+            if (captureOutput) process.OutputDataReceived += writeLine;
+            if (captureError) process.ErrorDataReceived += writeLine;
+            process.EnableRaisingEvents = true;
+            process.Exited += (_, __) =>
+            {
+                lock (logLock)
+                {
+                    try { writer.Dispose(); } catch { }
+                }
+            };
+            if (closeInput)
+            {
+                try { process.StandardInput.Close(); } catch { }
+            }
+            if (captureOutput) process.BeginOutputReadLine();
+            if (captureError) process.BeginErrorReadLine();
         }
 
         public string GetLocalHttpServerLaunchLogPath()

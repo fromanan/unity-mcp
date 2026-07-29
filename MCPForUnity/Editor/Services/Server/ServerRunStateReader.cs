@@ -15,7 +15,8 @@ namespace MCPForUnity.Editor.Services.Server
             try
             {
                 string path = EditorPrefs.GetString(
-                    EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                    EditorPrefKeys.ForCurrentProject(
+                        EditorPrefKeys.LastLocalHttpServerStateFilePath),
                     string.Empty);
                 if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
                 {
@@ -59,7 +60,8 @@ namespace MCPForUnity.Editor.Services.Server
                 return;
             }
             string token = EditorPrefs.GetString(
-                EditorPrefKeys.LastLocalHttpServerInstanceToken,
+                EditorPrefKeys.ForCurrentProject(
+                    EditorPrefKeys.LastLocalHttpServerInstanceToken),
                 string.Empty);
             if (string.IsNullOrWhiteSpace(token))
             {

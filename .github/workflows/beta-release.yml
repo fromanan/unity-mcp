@@ -173,7 +173,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
-          version: "latest"
+          version: "0.11.26"
           enable-cache: true
           cache-dependency-glob: "Server/uv.lock"
 
@@ -182,41 +182,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RAW_VERSION=$(grep -oP '(?<=version = ")[^"]+' Server/pyproject.toml)
-          echo "Raw version: $RAW_VERSION"
-
-          # Check if already a beta/prerelease version
-          if [[ "$RAW_VERSION" =~ (a|b|rc|\.dev|\.post)[0-9]+$ ]]; then
-            IS_PRERELEASE=true
-            # Strip the prerelease suffix to get base version
-            BASE_VERSION=$(echo "$RAW_VERSION" | sed -E 's/(a|b|rc|\.dev|\.post)[0-9]+$//')
+          UNITY_VERSION=$(jq -r '.version' MCPForUnity/package.json)
+          if [[ "$UNITY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-(alpha|beta|preview)\.([0-9]+)$ ]]; then
+            BASE_VERSION="${BASH_REMATCH[1]}"
+            KIND="${BASH_REMATCH[2]}"
+            NUMBER="${BASH_REMATCH[3]}"
+            [[ "$KIND" == "alpha" ]] && PREFIX="a" || PREFIX="b"
+            BETA_VERSION="${BASE_VERSION}${PREFIX}${NUMBER}"
+          elif [[ "$UNITY_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-rc\.([0-9]+)$ ]]; then
+            BETA_VERSION="${BASH_REMATCH[1]}rc${BASH_REMATCH[2]}"
           else
-            IS_PRERELEASE=false
-            BASE_VERSION="$RAW_VERSION"
-          fi
-
-          # Validate we have a proper X.Y.Z format
-          if ! [[ "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Could not parse version '$RAW_VERSION' -> '$BASE_VERSION'" >&2
+            echo "Error: Unity package version is not a supported prerelease: $UNITY_VERSION" >&2
             exit 1
           fi
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
-
-          # Only bump patch if coming from stable; keep same base if already prerelease
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            # Already on a beta series - keep the same base version
-            NEXT_PATCH="$PATCH"
-            echo "Already prerelease, keeping base: $BASE_VERSION"
-          else
-            # Stable version - bump patch to ensure beta is "newer"
-            NEXT_PATCH=$((PATCH + 1))
-            echo "Stable version, bumping patch: $PATCH -> $NEXT_PATCH"
-          fi
-
-          BETA_NUMBER="$(date +%Y%m%d%H%M%S)"
-          BETA_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}b${BETA_NUMBER}"
-          echo "Base version: $BASE_VERSION"
+          echo "Unity package version: $UNITY_VERSION"
           echo "Beta version: $BETA_VERSION"
           echo "beta_version=$BETA_VERSION" >> "$GITHUB_OUTPUT"
 
@@ -239,3 +218,4 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: Server/dist/
+          skip-existing: true

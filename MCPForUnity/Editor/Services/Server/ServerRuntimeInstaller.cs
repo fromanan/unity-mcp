@@ -29,7 +29,10 @@ namespace MCPForUnity.Editor.Services.Server
             }
             try
             {
-                var result = EnsureInstalledCoreAsync(null, false).GetAwaiter().GetResult();
+                var result = EnsureInstalledCoreAsync(
+                    null,
+                    false,
+                    CancellationToken.None).GetAwaiter().GetResult();
                 runtime = result.Runtime;
                 error = result.Error;
                 return result.Success;
@@ -41,12 +44,16 @@ namespace MCPForUnity.Editor.Services.Server
         }
 
         public async Task<ServerRuntimeInstallResult> EnsureInstalledAsync(
-            IProgress<ServerStartProgress> progress = null)
+            IProgress<ServerStartProgress> progress = null,
+            CancellationToken cancellationToken = default)
         {
-            await InstallGate.WaitAsync();
+            await InstallGate.WaitAsync(cancellationToken);
             try
             {
-                return await EnsureInstalledCoreAsync(progress, true);
+                return await EnsureInstalledCoreAsync(
+                    progress,
+                    true,
+                    cancellationToken);
             }
             finally
             {
@@ -56,7 +63,8 @@ namespace MCPForUnity.Editor.Services.Server
 
         private async Task<ServerRuntimeInstallResult> EnsureInstalledCoreAsync(
             IProgress<ServerStartProgress> progress,
-            bool runCommandsAsynchronously)
+            bool runCommandsAsynchronously,
+            CancellationToken cancellationToken)
         {
             progress?.Report(new ServerStartProgress(0.05f, "Preparing server runtime…"));
             try
@@ -103,7 +111,8 @@ namespace MCPForUnity.Editor.Services.Server
                         projectRoot,
                         InstallTimeoutMs,
                         pathPrepend,
-                        runCommandsAsynchronously);
+                        runCommandsAsynchronously,
+                        cancellationToken);
                     if (!venvResult.Success)
                     {
                         return ServerRuntimeInstallResult.Failed(
@@ -128,7 +137,8 @@ namespace MCPForUnity.Editor.Services.Server
                         projectRoot,
                         InstallTimeoutMs,
                         pathPrepend,
-                        runCommandsAsynchronously);
+                        runCommandsAsynchronously,
+                        cancellationToken);
                     if (!installResult.Success)
                     {
                         return ServerRuntimeInstallResult.Failed(
@@ -159,7 +169,8 @@ namespace MCPForUnity.Editor.Services.Server
                         projectRoot,
                         pathPrepend,
                         platform,
-                        runCommandsAsynchronously);
+                        runCommandsAsynchronously,
+                        cancellationToken);
                     if (!probeResult.Success)
                     {
                         return ServerRuntimeInstallResult.Failed(probeResult.Error);
@@ -358,7 +369,8 @@ namespace MCPForUnity.Editor.Services.Server
             string workingDirectory,
             string pathPrepend,
             RuntimePlatform platform,
-            bool runCommandsAsynchronously)
+            bool runCommandsAsynchronously,
+            CancellationToken cancellationToken)
         {
             CommandResult pythonResult = await RunCommandAsync(
                 pythonPath,
@@ -366,7 +378,8 @@ namespace MCPForUnity.Editor.Services.Server
                 workingDirectory,
                 15000,
                 pathPrepend,
-                runCommandsAsynchronously);
+                runCommandsAsynchronously,
+                cancellationToken);
             if (!pythonResult.Success)
             {
                 return ProbeResult.Failed(BuildCommandError(
@@ -384,7 +397,8 @@ namespace MCPForUnity.Editor.Services.Server
                 workingDirectory,
                 30000,
                 pathPrepend,
-                runCommandsAsynchronously);
+                runCommandsAsynchronously,
+                cancellationToken);
             if (!serverResult.Success)
             {
                 return ProbeResult.Failed(BuildCommandError(
@@ -393,22 +407,20 @@ namespace MCPForUnity.Editor.Services.Server
                     serverResult.Stderr));
             }
 
-            if (platform == RuntimePlatform.WindowsEditor)
+            CommandResult supervisorResult = await RunCommandAsync(
+                runtime.SupervisorExecutable,
+                "--help",
+                workingDirectory,
+                15000,
+                pathPrepend,
+                runCommandsAsynchronously,
+                cancellationToken);
+            if (!supervisorResult.Success)
             {
-                CommandResult supervisorResult = await RunCommandAsync(
-                    runtime.SupervisorExecutable,
-                    "--help",
-                    workingDirectory,
-                    15000,
-                    pathPrepend,
-                    runCommandsAsynchronously);
-                if (!supervisorResult.Success)
-                {
-                    return ProbeResult.Failed(BuildCommandError(
-                        "validate the installed Windows supervisor entry point",
-                        supervisorResult.Stdout,
-                        supervisorResult.Stderr));
-                }
+                return ProbeResult.Failed(BuildCommandError(
+                    "validate the installed supervisor entry point",
+                    supervisorResult.Stdout,
+                    supervisorResult.Stderr));
             }
 
             return ProbeResult.Succeeded(pythonVersion);
@@ -420,7 +432,8 @@ namespace MCPForUnity.Editor.Services.Server
             string workingDirectory,
             int timeoutMs,
             string pathPrepend,
-            bool runAsynchronously)
+            bool runAsynchronously,
+            CancellationToken cancellationToken)
         {
             if (!runAsynchronously)
             {
@@ -429,7 +442,8 @@ namespace MCPForUnity.Editor.Services.Server
                     args,
                     workingDirectory,
                     timeoutMs,
-                    pathPrepend));
+                    pathPrepend,
+                    cancellationToken));
             }
 
             return Task.Run(() => RunCommand(
@@ -437,7 +451,9 @@ namespace MCPForUnity.Editor.Services.Server
                 args,
                 workingDirectory,
                 timeoutMs,
-                pathPrepend));
+                pathPrepend,
+                cancellationToken),
+                cancellationToken);
         }
 
         private static CommandResult RunCommand(
@@ -445,7 +461,8 @@ namespace MCPForUnity.Editor.Services.Server
             string args,
             string workingDirectory,
             int timeoutMs,
-            string pathPrepend)
+            string pathPrepend,
+            CancellationToken cancellationToken)
         {
             bool success = ExecPath.TryRun(
                 file,
@@ -454,7 +471,8 @@ namespace MCPForUnity.Editor.Services.Server
                 out string stdout,
                 out string stderr,
                 timeoutMs,
-                pathPrepend);
+                pathPrepend,
+                cancellationToken);
             return new CommandResult(success, stdout, stderr);
         }
 

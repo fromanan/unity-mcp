@@ -45,19 +45,19 @@ namespace MCPForUnityTests.Editor.Services.Server
 
         private void ClearTestEditorPrefs()
         {
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPid); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPort); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStartedUtc); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidArgsHash); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerPidFilePath); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerStateFilePath); } catch { }
-            try { EditorPrefs.DeleteKey(EditorPrefKeys.LastLocalHttpServerInstanceToken); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerPid)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerPort)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerStartedUtc)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerPidArgsHash)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerPidFilePath)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerStateFilePath)); } catch { }
+            try { EditorPrefs.DeleteKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerInstanceToken)); } catch { }
         }
 
         private void SaveTrackingEditorPrefs()
         {
             _savedTrackingStrings.Clear();
-            foreach (string key in new[]
+            foreach (string rawKey in new[]
             {
                 EditorPrefKeys.LastLocalHttpServerStartedUtc,
                 EditorPrefKeys.LastLocalHttpServerPidArgsHash,
@@ -66,18 +66,20 @@ namespace MCPForUnityTests.Editor.Services.Server
                 EditorPrefKeys.LastLocalHttpServerInstanceToken
             })
             {
+                string key = ProjectKey(rawKey);
                 bool exists = EditorPrefs.HasKey(key);
                 _savedTrackingStrings[key] =
                     (exists, exists ? EditorPrefs.GetString(key, string.Empty) : string.Empty);
             }
 
             _savedTrackingInts.Clear();
-            foreach (string key in new[]
+            foreach (string rawKey in new[]
             {
                 EditorPrefKeys.LastLocalHttpServerPid,
                 EditorPrefKeys.LastLocalHttpServerPort
             })
             {
+                string key = ProjectKey(rawKey);
                 bool exists = EditorPrefs.HasKey(key);
                 _savedTrackingInts[key] =
                     (exists, exists ? EditorPrefs.GetInt(key, 0) : 0);
@@ -408,7 +410,7 @@ namespace MCPForUnityTests.Editor.Services.Server
             _manager.StoreTracking(12345, 8080, "somehash");
             _manager.StoreHandshake("/path.pid", "token");
             EditorPrefs.SetString(
-                EditorPrefKeys.LastLocalHttpServerStateFilePath,
+                ProjectKey(EditorPrefKeys.LastLocalHttpServerStateFilePath),
                 "/state.json");
 
             // Act
@@ -420,7 +422,7 @@ namespace MCPForUnityTests.Editor.Services.Server
             Assert.IsFalse(hasTracking);
             Assert.IsFalse(hasHandshake);
             Assert.IsFalse(
-                EditorPrefs.HasKey(EditorPrefKeys.LastLocalHttpServerStateFilePath));
+                EditorPrefs.HasKey(ProjectKey(EditorPrefKeys.LastLocalHttpServerStateFilePath)));
         }
 
         [Test]
@@ -560,5 +562,10 @@ namespace MCPForUnityTests.Editor.Services.Server
         }
 
         #endregion
+
+        private static string ProjectKey(string key)
+        {
+            return EditorPrefKeys.ForCurrentProject(key);
+        }
     }
 }

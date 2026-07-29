@@ -145,7 +145,9 @@ namespace MCPForUnity.Editor.Resources.Scene
             // Pagination parameters
             int pageSize = ParamCoercion.CoerceInt(@params["pageSize"] ?? @params["page_size"], 25);
             int cursor = ParamCoercion.CoerceInt(@params["cursor"], 0);
-            bool includeProperties = ParamCoercion.CoerceBool(@params["includeProperties"] ?? @params["include_properties"], true);
+            bool includeProperties = ParamCoercion.CoerceBool(
+                @params["includeProperties"] ?? @params["include_properties"],
+                false);
 
             pageSize = Mathf.Clamp(pageSize, 1, 100);
 

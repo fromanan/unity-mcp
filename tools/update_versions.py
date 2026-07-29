@@ -42,6 +42,27 @@ ROOT_README = REPO_ROOT / "README.md"
 ZH_README = REPO_ROOT / "docs" / "i18n" / "README-zh.md"
 
 
+def to_pep440(version: str) -> str:
+    """Convert the Unity package's SemVer prerelease to a PEP 440 version."""
+    match = re.fullmatch(
+        r"(\d+\.\d+\.\d+)(?:-(alpha|beta|rc|preview)\.?(\d+)?)?",
+        version,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        raise ValueError(f"Unsupported package version: {version}")
+    base, kind, number = match.groups()
+    if not kind:
+        return base
+    prefix = {
+        "alpha": "a",
+        "beta": "b",
+        "preview": "b",
+        "rc": "rc",
+    }[kind.lower()]
+    return f"{base}{prefix}{number or '0'}"
+
+
 def load_package_version() -> str:
     """Load version from package.json."""
     if not PACKAGE_JSON.exists():
@@ -66,11 +87,11 @@ def update_package_json(new_version: str, dry_run: bool = False) -> bool:
     current_version = package_data.get("version", "unknown")
 
     if current_version == new_version:
-        print(f"✓ {PACKAGE_JSON.relative_to(REPO_ROOT)} already at v{new_version}")
+        print(f"OK {PACKAGE_JSON.relative_to(REPO_ROOT)} already at v{new_version}")
         return False
 
     print(
-        f"Updating {PACKAGE_JSON.relative_to(REPO_ROOT)}: {current_version} → {new_version}")
+        f"Updating {PACKAGE_JSON.relative_to(REPO_ROOT)}: {current_version} -> {new_version}")
 
     if not dry_run:
         package_data["version"] = new_version
@@ -92,11 +113,11 @@ def update_manifest_json(new_version: str, dry_run: bool = False) -> bool:
     current_version = manifest.get("version", "unknown")
 
     if current_version == new_version:
-        print(f"✓ {MANIFEST_JSON.relative_to(REPO_ROOT)} already at v{new_version}")
+        print(f"OK {MANIFEST_JSON.relative_to(REPO_ROOT)} already at v{new_version}")
         return False
 
     print(
-        f"Updating {MANIFEST_JSON.relative_to(REPO_ROOT)}: {current_version} → {new_version}")
+        f"Updating {MANIFEST_JSON.relative_to(REPO_ROOT)}: {current_version} -> {new_version}")
 
     if not dry_run:
         manifest["version"] = new_version
@@ -124,18 +145,19 @@ def update_pyproject_toml(new_version: str, dry_run: bool = False) -> bool:
         return False
 
     current_version = version_match.group(1)
+    python_version = to_pep440(new_version)
 
-    if current_version == new_version:
-        print(f"✓ {PYPROJECT_TOML.relative_to(REPO_ROOT)} already at v{new_version}")
+    if current_version == python_version:
+        print(f"OK {PYPROJECT_TOML.relative_to(REPO_ROOT)} already at v{python_version}")
         return False
 
     print(
-        f"Updating {PYPROJECT_TOML.relative_to(REPO_ROOT)}: {current_version} → {new_version}")
+        f"Updating {PYPROJECT_TOML.relative_to(REPO_ROOT)}: {current_version} -> {python_version}")
 
     if not dry_run:
         # Replace only the first occurrence (the version field)
         content = re.sub(
-            r'^version = ".*"', f'version = "{new_version}"', content, count=1, flags=re.MULTILINE)
+            r'^version = ".*"', f'version = "{python_version}"', content, count=1, flags=re.MULTILINE)
         PYPROJECT_TOML.write_text(content, encoding="utf-8")
 
     return True
@@ -155,7 +177,7 @@ def update_server_readme(new_version: str, dry_run: bool = False) -> bool:
 
     if not re.search(pattern, content):
         print(
-            f"✓ {SERVER_README.relative_to(REPO_ROOT)} has no version references to update")
+            f"OK {SERVER_README.relative_to(REPO_ROOT)} has no version references to update")
         return False
 
     print(
@@ -182,7 +204,7 @@ def update_root_readme(new_version: str, dry_run: bool = False) -> bool:
 
     if not re.search(pattern, content):
         print(
-            f"✓ {ROOT_README.relative_to(REPO_ROOT)} has no version references to update")
+            f"OK {ROOT_README.relative_to(REPO_ROOT)} has no version references to update")
         return False
 
     print(
@@ -209,7 +231,7 @@ def update_zh_readme(new_version: str, dry_run: bool = False) -> bool:
 
     if not re.search(pattern, content):
         print(
-            f"✓ {ZH_README.relative_to(REPO_ROOT)} has no version references to update")
+            f"OK {ZH_README.relative_to(REPO_ROOT)} has no version references to update")
         return False
 
     print(f"Updating version references in {ZH_README.relative_to(REPO_ROOT)}")

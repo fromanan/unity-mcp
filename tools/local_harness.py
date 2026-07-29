@@ -69,7 +69,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
@@ -230,6 +230,11 @@ def editor_relpath(platform: str | None = None) -> str:
     return "Editor/Unity"  # linux + everything else
 
 
+def _join_for_platform(platform: str, root: str, *parts: str) -> str:
+    path_type = PureWindowsPath if platform.startswith("win") else PurePosixPath
+    return str(path_type(root).joinpath(*parts))
+
+
 def hub_roots(platform: str | None = None, environ: dict[str, str] | None = None) -> list[str]:
     """Per-OS Hub Editor install roots (the directory that holds <version>/ dirs).
 
@@ -246,12 +251,13 @@ def hub_roots(platform: str | None = None, environ: dict[str, str] | None = None
         for var in ("ProgramFiles", "ProgramFiles(x86)"):
             base = env.get(var)
             if base:
-                roots.append(str(Path(base) / "Unity" / "Hub" / "Editor"))
+                roots.append(_join_for_platform(
+                    plat, base, "Unity", "Hub", "Editor"))
         if not roots:
             roots.append(r"C:\Program Files\Unity\Hub\Editor")
         return roots
     # linux + everything else
-    return [str(Path(home) / "Unity" / "Hub" / "Editor")]
+    return [_join_for_platform(plat, home, "Unity", "Hub", "Editor")]
 
 
 def read_secondary_install_path(platform: str | None = None,
@@ -269,13 +275,17 @@ def read_secondary_install_path(platform: str | None = None,
     env = environ if environ is not None else os.environ
     home = env.get("HOME") or env.get("USERPROFILE") or str(Path.home())
     if plat == "darwin":
-        cfg = Path(home) / "Library" / "Application Support" / "UnityHub" / "secondaryInstallPath.json"
+        cfg = _join_for_platform(
+            plat, home, "Library", "Application Support", "UnityHub",
+            "secondaryInstallPath.json")
     elif plat.startswith("win"):
         appdata = env.get("APPDATA") or str(Path(home) / "AppData" / "Roaming")
-        cfg = Path(appdata) / "UnityHub" / "secondaryInstallPath.json"
+        cfg = _join_for_platform(
+            plat, appdata, "UnityHub", "secondaryInstallPath.json")
     else:
         xdg = env.get("XDG_CONFIG_HOME") or str(Path(home) / ".config")
-        cfg = Path(xdg) / "UnityHub" / "secondaryInstallPath.json"
+        cfg = _join_for_platform(
+            plat, xdg, "UnityHub", "secondaryInstallPath.json")
 
     reader = read_text or (lambda p: Path(p).read_text(encoding="utf-8"))
     try:
@@ -320,11 +330,11 @@ def candidate_editor_paths(version: str,
         out.append(env_editor)
 
     for root in hub_roots(plat, env):
-        out.append(str(Path(root) / version / relpath))
+        out.append(_join_for_platform(plat, root, version, relpath))
 
     sec = read_secondary_install_path(plat, env, read_text)
     if sec:
-        out.append(str(Path(sec) / version / relpath))
+        out.append(_join_for_platform(plat, sec, version, relpath))
 
     return out
 
@@ -392,7 +402,7 @@ def discover_editor(version: str,
             pv = parse_version(name)
             if (pv[0], pv[1]) != (target[0], target[1]):
                 continue
-            binary = str(Path(root) / name / relpath)
+            binary = _join_for_platform(plat, root, name, relpath)
             searched.append(binary)
             if not (_exists(binary) and _is_exec(binary)):
                 continue

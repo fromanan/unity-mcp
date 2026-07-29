@@ -73,14 +73,12 @@ async def test_sync_registers_custom_tools():
     response = _make_unity_response([BUILTIN_TOOL, CUSTOM_TOOL])
 
     mock_service = MagicMock()
-    mock_service.register_global_tools = MagicMock()
+    mock_service.replace_global_tools_for_owner = MagicMock()
 
     with patch(
         "transport.legacy.unity_connection.async_send_command_with_retry",
         new_callable=AsyncMock,
         return_value=response,
-    ), patch(
-        "transport.plugin_hub.PluginHub._sync_server_tool_visibility",
     ), patch(
         "transport.plugin_hub.PluginHub._notify_mcp_tool_list_changed",
         new_callable=AsyncMock,
@@ -94,9 +92,12 @@ async def test_sync_registers_custom_tools():
     assert result["synced"] is True
     assert result["custom_tool_count"] == 1
 
-    # Verify register_global_tools was called with the custom tool
-    mock_service.register_global_tools.assert_called_once()
-    registered = mock_service.register_global_tools.call_args[0][0]
+    # Verify the owner-scoped snapshot was replaced with the current custom tool.
+    mock_service.replace_global_tools_for_owner.assert_called_once()
+    registered = mock_service.replace_global_tools_for_owner.call_args[0][0]
+    assert mock_service.replace_global_tools_for_owner.call_args.kwargs == {
+        "owner_id": "stdio:default"
+    }
     assert len(registered) == 1
     assert registered[0].name == "test_ping"
     assert registered[0].description == "Simple test tool that returns a pong."
@@ -113,8 +114,6 @@ async def test_sync_skips_builtin_tools():
         "transport.legacy.unity_connection.async_send_command_with_retry",
         new_callable=AsyncMock,
         return_value=response,
-    ), patch(
-        "transport.plugin_hub.PluginHub._sync_server_tool_visibility",
     ), patch(
         "transport.plugin_hub.PluginHub._notify_mcp_tool_list_changed",
         new_callable=AsyncMock,
@@ -140,8 +139,6 @@ async def test_sync_skips_when_no_extended_metadata():
         new_callable=AsyncMock,
         return_value=response,
     ), patch(
-        "transport.plugin_hub.PluginHub._sync_server_tool_visibility",
-    ), patch(
         "transport.plugin_hub.PluginHub._notify_mcp_tool_list_changed",
         new_callable=AsyncMock,
     ), patch(
@@ -164,8 +161,6 @@ async def test_sync_handles_custom_tool_service_not_initialized():
         "transport.legacy.unity_connection.async_send_command_with_retry",
         new_callable=AsyncMock,
         return_value=response,
-    ), patch(
-        "transport.plugin_hub.PluginHub._sync_server_tool_visibility",
     ), patch(
         "transport.plugin_hub.PluginHub._notify_mcp_tool_list_changed",
         new_callable=AsyncMock,

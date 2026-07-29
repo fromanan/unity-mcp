@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using MCPForUnity.Editor.Constants;
 using UnityEditor;
 
@@ -12,6 +13,15 @@ namespace MCPForUnity.Editor.Helpers
     internal static class ExecPath
     {
         private const string PrefClaude = EditorPrefKeys.ClaudeCliPathOverride;
+        private static readonly object ActiveProcessesLock = new object();
+        private static readonly System.Collections.Generic.HashSet<Process>
+            ActiveProcesses = new System.Collections.Generic.HashSet<Process>();
+
+        static ExecPath()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += TerminateActiveProcesses;
+            EditorApplication.quitting += TerminateActiveProcesses;
+        }
 
         // Resolve Claude CLI absolute path. Pref → env → common locations → PATH.
         internal static string ResolveClaude()
@@ -173,10 +183,12 @@ namespace MCPForUnity.Editor.Helpers
             out string stdout,
             out string stderr,
             int timeoutMs = 15000,
-            string extraPathPrepend = null)
+            string extraPathPrepend = null,
+            CancellationToken cancellationToken = default)
         {
             stdout = string.Empty;
             stderr = string.Empty;
+            Process startedProcess = null;
             try
             {
                 // Handle PowerShell scripts on Windows by invoking through powershell.exe
@@ -211,13 +223,31 @@ namespace MCPForUnity.Editor.Helpers
                 process.ErrorDataReceived += (_, e) => { if (e.Data != null) se.AppendLine(e.Data); };
 
                 if (!process.Start()) return false;
+                startedProcess = process;
+                TryCreateProcessGroup(process);
+                lock (ActiveProcessesLock)
+                {
+                    ActiveProcesses.Add(process);
+                }
 
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
 
-                if (!process.WaitForExit(timeoutMs))
+                var deadline = Stopwatch.StartNew();
+                while (!process.HasExited
+                    && deadline.ElapsedMilliseconds < timeoutMs
+                    && !cancellationToken.IsCancellationRequested)
                 {
-                    try { process.Kill(); } catch { }
+                    process.WaitForExit(Math.Min(
+                        100,
+                        Math.Max(1, timeoutMs - (int)deadline.ElapsedMilliseconds)));
+                }
+                if (!process.HasExited)
+                {
+                    TerminateProcessTree(process);
+                    stderr = cancellationToken.IsCancellationRequested
+                        ? "Command cancelled."
+                        : $"Command timed out after {timeoutMs} ms.";
                     return false;
                 }
 
@@ -230,9 +260,80 @@ namespace MCPForUnity.Editor.Helpers
             }
             catch
             {
+                if (startedProcess != null)
+                {
+                    TerminateProcessTree(startedProcess);
+                }
                 return false;
             }
+            finally
+            {
+                if (startedProcess != null)
+                {
+                    lock (ActiveProcessesLock)
+                    {
+                        ActiveProcesses.Remove(startedProcess);
+                    }
+                }
+            }
         }
+
+        private static void TerminateActiveProcesses()
+        {
+            Process[] processes;
+            lock (ActiveProcessesLock)
+            {
+                processes = ActiveProcesses.ToArray();
+                ActiveProcesses.Clear();
+            }
+            foreach (var process in processes)
+            {
+                TerminateProcessTree(process);
+            }
+        }
+
+        private static void TerminateProcessTree(Process process)
+        {
+            try
+            {
+                if (process == null || process.HasExited) return;
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    using var taskkill = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "taskkill.exe",
+                        Arguments = $"/PID {process.Id} /T /F",
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    });
+                    taskkill?.WaitForExit(5000);
+                }
+                else
+                {
+                    try { kill(-process.Id, 15); } catch { }
+                    if (!process.WaitForExit(1500))
+                    {
+                        try { kill(-process.Id, 9); } catch { }
+                    }
+                }
+            }
+            catch
+            {
+                try { process?.Kill(); } catch { }
+            }
+        }
+
+        private static void TryCreateProcessGroup(Process process)
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+            try { setpgid(process.Id, process.Id); } catch { }
+        }
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int setpgid(int pid, int pgid);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int kill(int pid, int signal);
 
         /// <summary>
         /// Cross-platform path lookup. Uses 'where' on Windows, 'which' on macOS/Linux.

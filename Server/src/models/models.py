@@ -15,21 +15,24 @@ class MCPResponse(BaseModel):
 
 
 class ToolParameterModel(BaseModel):
-    name: str
-    description: str | None = None
-    type: str = Field(default="string")
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=4096)
+    type: str = Field(default="string", min_length=1, max_length=128)
     required: bool = Field(default=True)
-    default_value: str | None = None
+    default_value: str | None = Field(default=None, max_length=4096)
 
 
 class ToolDefinitionModel(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=16384)
     structured_output: bool | None = True
     requires_polling: bool | None = False
-    poll_action: str | None = "status"
-    max_poll_seconds: int = 0
-    parameters: list[ToolParameterModel] = Field(default_factory=list)
+    poll_action: str | None = Field(default="status", max_length=128)
+    max_poll_seconds: int = Field(default=0, ge=0, le=3600)
+    parameters: list[ToolParameterModel] = Field(
+        default_factory=list,
+        max_length=128,
+    )
 
 
 class UnityInstanceInfo(BaseModel):

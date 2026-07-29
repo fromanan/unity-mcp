@@ -1,5 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Text;
 using MCPForUnity.Editor.Helpers;
 using UnityEngine;
 
@@ -41,40 +44,123 @@ namespace MCPForUnity.Editor.Services.Server
                 Directory.CreateDirectory(logDir);
             }
 
-#if UNITY_EDITOR_WIN
-            // cmd.exe /c "<command> < NUL >> "<log>" 2>&1"
-            // The whole payload after /c is wrapped in one outer pair of quotes; cmd strips the
-            // outermost quotes, so inner quotes around the log path survive for paths with spaces.
-            // stdin is redirected from NUL because the Editor is a console-less GUI process: with
-            // CreateNoWindow and no console handle, uvx.exe would inherit an invalid stdin and die
-            // with "The handle is invalid. (os error 6)" before launching the server.
-            string winRedirect = $"{command} < NUL >> \"{logFilePath}\" 2>&1";
+            List<string> tokens = SplitCommandLine(command);
+            if (tokens.Count == 0)
+            {
+                throw new ArgumentException("Command does not contain an executable", nameof(command));
+            }
+
             return new System.Diagnostics.ProcessStartInfo
             {
-                FileName = "cmd.exe",
-                Arguments = $"/c \"{winRedirect}\"",
+                FileName = tokens[0],
+                Arguments = string.Join(" ", tokens.Skip(1).Select(QuoteProcessArgument)),
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
             };
-#else
-            // macOS/Linux: /bin/bash -c "<command> >> '<log>' 2>&1"
-            // Single-quote the log path so spaces are preserved; the bash payload is wrapped in
-            // double quotes for the .NET argument tokenizer (escape backslashes and double quotes).
-            string singleQuotedLog = "'" + logFilePath.Replace("'", "'\\''") + "'";
-            string bashPayload = $"{command} >> {singleQuotedLog} 2>&1";
-            string escapedPayload = bashPayload
-                .Replace("\\", "\\\\")
-                .Replace("\"", "\\\"");
-            return new System.Diagnostics.ProcessStartInfo
+        }
+
+        internal static List<string> SplitCommandLine(string command)
+        {
+            var result = new List<string>();
+            var current = new StringBuilder();
+            bool quoted = false;
+            int backslashes = 0;
+
+            foreach (char ch in command)
             {
-                FileName = "/bin/bash",
-                Arguments = $"-c \"{escapedPayload}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden
-            };
-#endif
+                if (ch == '\\')
+                {
+                    backslashes++;
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    current.Append('\\', backslashes / 2);
+                    if (backslashes % 2 == 1)
+                    {
+                        current.Append('"');
+                    }
+                    else
+                    {
+                        quoted = !quoted;
+                    }
+                    backslashes = 0;
+                    continue;
+                }
+
+                if (backslashes > 0)
+                {
+                    current.Append('\\', backslashes);
+                    backslashes = 0;
+                }
+
+                if (char.IsWhiteSpace(ch) && !quoted)
+                {
+                    if (current.Length > 0)
+                    {
+                        result.Add(current.ToString());
+                        current.Clear();
+                    }
+                    continue;
+                }
+
+                current.Append(ch);
+            }
+
+            if (backslashes > 0)
+            {
+                current.Append('\\', backslashes);
+            }
+            if (quoted)
+            {
+                throw new ArgumentException("Command contains an unmatched quote", nameof(command));
+            }
+            if (current.Length > 0)
+            {
+                result.Add(current.ToString());
+            }
+            return result;
+        }
+
+        internal static string QuoteProcessArgument(string argument)
+        {
+            if (string.IsNullOrEmpty(argument))
+            {
+                return "\"\"";
+            }
+            if (!argument.Any(ch => char.IsWhiteSpace(ch) || ch == '"'))
+            {
+                return argument;
+            }
+
+            var result = new StringBuilder("\"");
+            int backslashes = 0;
+            foreach (char ch in argument)
+            {
+                if (ch == '\\')
+                {
+                    backslashes++;
+                    continue;
+                }
+                if (ch == '"')
+                {
+                    result.Append('\\', backslashes * 2 + 1);
+                    result.Append('"');
+                    backslashes = 0;
+                    continue;
+                }
+                result.Append('\\', backslashes);
+                backslashes = 0;
+                result.Append(ch);
+            }
+            result.Append('\\', backslashes * 2);
+            result.Append('"');
+            return result.ToString();
         }
 
         /// <inheritdoc/>

@@ -250,8 +250,10 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             }
 
             public Task<ServerRuntimeInstallResult> EnsureInstalledAsync(
-                IProgress<ServerStartProgress> progress = null)
+                IProgress<ServerStartProgress> progress = null,
+                System.Threading.CancellationToken cancellationToken = default)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 EnsureInstalledAsyncCalled = true;
                 progress?.Report(new ServerStartProgress(1f, "Fake runtime ready"));
                 return Task.FromResult(ServerRuntimeInstallResult.Succeeded(_runtime));
@@ -713,7 +715,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         [Test]
-        public void CanStartLocalServer_HttpEnabledZeroBind_WithOptIn_ReturnsTrue()
+        public void CanStartLocalServer_HttpEnabledZeroBind_WithLegacyOptIn_StillReturnsFalse()
         {
             // Arrange
             EditorPrefs.SetBool(EditorPrefKeys.UseHttpTransport, true);
@@ -726,7 +728,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             bool result = _service.CanStartLocalServer();
 
             // Assert
-            Assert.IsTrue(result, "Can start local server on 0.0.0.0 when LAN bind opt-in is enabled");
+            Assert.IsFalse(result, "Unauthenticated local mode must never bind to all interfaces");
         }
 
         #endregion
@@ -788,11 +790,11 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             // Assert
             Assert.IsFalse(allowed);
             Assert.IsNotNull(error);
-            Assert.That(error, Does.Contain("disabled by default").IgnoreCase);
+            Assert.That(error, Does.Contain("unauthenticated").IgnoreCase);
         }
 
         [Test]
-        public void IsHttpLocalUrlAllowedForLaunch_ZeroBind_AllowedWithOptIn()
+        public void IsHttpLocalUrlAllowedForLaunch_ZeroBind_LegacyOptInCannotBypassPolicy()
         {
             // Arrange
             EditorPrefs.SetBool(EditorPrefKeys.AllowLanHttpBind, true);
@@ -801,8 +803,8 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             bool allowed = HttpEndpointUtility.IsHttpLocalUrlAllowedForLaunch("http://0.0.0.0:8080", out string error);
 
             // Assert
-            Assert.IsTrue(allowed);
-            Assert.IsNull(error);
+            Assert.IsFalse(allowed);
+            Assert.That(error, Does.Contain("authenticated HTTP Remote").IgnoreCase);
         }
 
         #endregion

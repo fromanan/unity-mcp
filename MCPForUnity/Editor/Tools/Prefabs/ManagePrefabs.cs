@@ -558,6 +558,18 @@ namespace MCPForUnity.Editor.Tools.Prefabs
             {
                 return new ErrorResponse($"Invalid prefab path '{prefabPath}'. Path traversal sequences are not allowed.");
             }
+            int pageSize = Math.Max(
+                1,
+                Math.Min(
+                    100,
+                    @params["page_size"]?.Value<int?>()
+                    ?? @params["pageSize"]?.Value<int?>()
+                    ?? 50));
+            int pageNumber = Math.Max(
+                1,
+                @params["page_number"]?.Value<int?>()
+                ?? @params["pageNumber"]?.Value<int?>()
+                ?? 1);
 
             // Load prefab contents in background (without opening stage UI)
             GameObject prefabContents = PrefabUtility.LoadPrefabContents(sanitizedPath);
@@ -568,16 +580,27 @@ namespace MCPForUnity.Editor.Tools.Prefabs
 
             try
             {
-                // Build complete hierarchy items (no pagination)
-                var allItems = BuildHierarchyItems(prefabContents.transform, sanitizedPath);
+                long requestedStart = ((long)pageNumber - 1L) * pageSize;
+                int startIndex = requestedStart > int.MaxValue
+                    ? int.MaxValue
+                    : (int)requestedStart;
+                var items = BuildHierarchyPage(
+                    prefabContents.transform,
+                    sanitizedPath,
+                    startIndex,
+                    pageSize,
+                    out int total);
 
                 return new SuccessResponse(
-                    $"Successfully retrieved prefab hierarchy. Found {allItems.Count} objects.",
+                    $"Successfully retrieved prefab hierarchy. Found {total} objects.",
                     new
                     {
                         prefabPath = sanitizedPath,
-                        total = allItems.Count,
-                        items = allItems
+                        total,
+                        pageSize,
+                        pageNumber,
+                        hasMore = startIndex + items.Count < total,
+                        items
                     }
                 );
             }
@@ -1214,10 +1237,26 @@ namespace MCPForUnity.Editor.Tools.Prefabs
         /// <param name="root">The root transform of the prefab.</param>
         /// <param name="mainPrefabPath">Asset path of the main prefab.</param>
         /// <returns>List of hierarchy items with prefab information.</returns>
-        private static List<object> BuildHierarchyItems(Transform root, string mainPrefabPath)
+        private static List<object> BuildHierarchyPage(
+            Transform root,
+            string mainPrefabPath,
+            int startIndex,
+            int pageSize,
+            out int total)
         {
-            var items = new List<object>();
-            BuildHierarchyItemsRecursive(root, root, mainPrefabPath, "", items);
+            var items = new List<object>(pageSize);
+            int index = 0;
+            total = 0;
+            BuildHierarchyItemsRecursive(
+                root,
+                root,
+                mainPrefabPath,
+                "",
+                items,
+                startIndex,
+                pageSize,
+                ref index,
+                ref total);
             return items;
         }
 
@@ -1229,50 +1268,81 @@ namespace MCPForUnity.Editor.Tools.Prefabs
         /// <param name="mainPrefabPath">Asset path of the main prefab.</param>
         /// <param name="parentPath">Parent path for building full hierarchy path.</param>
         /// <param name="items">List to accumulate hierarchy items.</param>
-        private static void BuildHierarchyItemsRecursive(Transform transform, Transform mainPrefabRoot, string mainPrefabPath, string parentPath, List<object> items)
+        private static void BuildHierarchyItemsRecursive(
+            Transform transform,
+            Transform mainPrefabRoot,
+            string mainPrefabPath,
+            string parentPath,
+            List<object> items,
+            int startIndex,
+            int pageSize,
+            ref int index,
+            ref int total)
         {
             if (transform == null) return;
 
             string name = transform.gameObject.name;
             string path = string.IsNullOrEmpty(parentPath) ? name : $"{parentPath}/{name}";
-            int instanceId = transform.gameObject.GetInstanceIDCompat();
-            bool activeSelf = transform.gameObject.activeSelf;
-            int childCount = transform.childCount;
-            var componentTypes = PrefabUtilityHelper.GetComponentTypeNames(transform.gameObject);
-
-            // Prefab information
-            bool isNestedPrefab = PrefabUtility.IsAnyPrefabInstanceRoot(transform.gameObject);
-            bool isPrefabRoot = transform == mainPrefabRoot;
-            int nestingDepth = isPrefabRoot ? 0 : PrefabUtilityHelper.GetPrefabNestingDepth(transform.gameObject, mainPrefabRoot);
-            string parentPrefabPath = isNestedPrefab && !isPrefabRoot
-                ? PrefabUtilityHelper.GetParentPrefabPath(transform.gameObject, mainPrefabRoot)
-                : null;
-            string nestedPrefabPath = isNestedPrefab ? PrefabUtilityHelper.GetNestedPrefabPath(transform.gameObject) : null;
-
-            var item = new
+            total++;
+            if (index >= startIndex && items.Count < pageSize)
             {
-                name = name,
-                instanceId = instanceId,
-                path = path,
-                activeSelf = activeSelf,
-                childCount = childCount,
-                componentTypes = componentTypes,
-                prefab = new
-                {
-                    isRoot = isPrefabRoot,
-                    isNestedRoot = isNestedPrefab,
-                    nestingDepth = nestingDepth,
-                    assetPath = isNestedPrefab ? nestedPrefabPath : mainPrefabPath,
-                    parentPath = parentPrefabPath
-                }
-            };
+                int instanceId = transform.gameObject.GetInstanceIDCompat();
+                bool activeSelf = transform.gameObject.activeSelf;
+                int childCount = transform.childCount;
+                var componentTypes =
+                    PrefabUtilityHelper.GetComponentTypeNames(transform.gameObject);
+                bool isNestedPrefab =
+                    PrefabUtility.IsAnyPrefabInstanceRoot(transform.gameObject);
+                bool isPrefabRoot = transform == mainPrefabRoot;
+                int nestingDepth = isPrefabRoot
+                    ? 0
+                    : PrefabUtilityHelper.GetPrefabNestingDepth(
+                        transform.gameObject,
+                        mainPrefabRoot);
+                string parentPrefabPath = isNestedPrefab && !isPrefabRoot
+                    ? PrefabUtilityHelper.GetParentPrefabPath(
+                        transform.gameObject,
+                        mainPrefabRoot)
+                    : null;
+                string nestedPrefabPath = isNestedPrefab
+                    ? PrefabUtilityHelper.GetNestedPrefabPath(transform.gameObject)
+                    : null;
 
-            items.Add(item);
+                items.Add(new
+                {
+                    name,
+                    instanceId,
+                    path,
+                    activeSelf,
+                    childCount,
+                    componentTypes,
+                    prefab = new
+                    {
+                        isRoot = isPrefabRoot,
+                        isNestedRoot = isNestedPrefab,
+                        nestingDepth,
+                        assetPath = isNestedPrefab
+                            ? nestedPrefabPath
+                            : mainPrefabPath,
+                        parentPath = parentPrefabPath
+                    }
+                });
+            }
+            index++;
 
             // Recursively process children
             foreach (Transform child in transform)
             {
-                BuildHierarchyItemsRecursive(child, mainPrefabRoot, mainPrefabPath, path, items);
+                BuildHierarchyItemsRecursive(
+                    child,
+                    mainPrefabRoot,
+                    mainPrefabPath,
+                    path,
+                    items,
+                    startIndex,
+                    pageSize,
+                    ref index,
+                    ref total);
             }
         }
 

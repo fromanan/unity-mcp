@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
+from hashlib import sha256
 import logging
 import time
 from dataclasses import dataclass
@@ -39,6 +41,7 @@ class ApiKeyService:
         self,
         validation_url: str,
         cache_ttl: float = 300.0,
+        cache_max_entries: int = 1024,
         service_token_header: str | None = None,
         service_token: str | None = None,
     ):
@@ -47,16 +50,20 @@ class ApiKeyService:
         Args:
             validation_url: External URL to validate API keys (POST with {"api_key": "..."})
             cache_ttl: Cache TTL for validated keys in seconds (default: 300)
+            cache_max_entries: Maximum cached validation results (default: 1024)
             service_token_header: Optional header name for service authentication (e.g. "X-Service-Token")
             service_token: Optional token value for service authentication
         """
         self._validation_url = validation_url
         self._cache_ttl = cache_ttl
+        self._cache_max_entries = max(1, cache_max_entries)
         self._service_token_header = service_token_header
         self._service_token = service_token
-        # Cache: api_key -> (valid, user_id, metadata, expires_at)
-        self._cache: dict[str, tuple[bool, str |
-                                     None, dict[str, Any] | None, float]] = {}
+        # Cache keys are SHA-256 digests so raw credentials are never retained.
+        # OrderedDict supplies deterministic LRU eviction.
+        self._cache: OrderedDict[str, tuple[
+            bool, str | None, dict[str, Any] | None, float
+        ]] = OrderedDict()
         self._cache_lock = asyncio.Lock()
         ApiKeyService._instance = self
 
@@ -86,19 +93,19 @@ class ApiKeyService:
         if not api_key:
             return ValidationResult(valid=False, error="API key required")
 
+        cache_key = self._cache_key(api_key)
+        now = time.time()
         # Check cache first
         async with self._cache_lock:
-            cached = self._cache.get(api_key)
+            self._purge_expired_locked(now)
+            cached = self._cache.get(cache_key)
             if cached is not None:
                 valid, user_id, metadata, expires_at = cached
-                if time.time() < expires_at:
-                    if valid:
-                        return ValidationResult(valid=True, user_id=user_id, metadata=metadata)
-                    else:
-                        return ValidationResult(valid=False, error="Invalid API key")
+                self._cache.move_to_end(cache_key)
+                if valid:
+                    return ValidationResult(valid=True, user_id=user_id, metadata=metadata)
                 else:
-                    # Expired, remove from cache
-                    del self._cache[api_key]
+                    return ValidationResult(valid=False, error="Invalid API key")
 
         # Call external validation URL
         result = await self._validate_external(api_key)
@@ -109,12 +116,16 @@ class ApiKeyService:
         if result.cacheable:
             async with self._cache_lock:
                 expires_at = time.time() + self._cache_ttl
-                self._cache[api_key] = (
+                self._purge_expired_locked(time.time())
+                self._cache[cache_key] = (
                     result.valid,
                     result.user_id,
                     result.metadata,
                     expires_at,
                 )
+                self._cache.move_to_end(cache_key)
+                while len(self._cache) > self._cache_max_entries:
+                    self._cache.popitem(last=False)
 
         return result
 
@@ -224,12 +235,24 @@ class ApiKeyService:
     async def invalidate_cache(self, api_key: str) -> None:
         """Remove an API key from the cache."""
         async with self._cache_lock:
-            self._cache.pop(api_key, None)
+            self._cache.pop(self._cache_key(api_key), None)
 
     async def clear_cache(self) -> None:
         """Clear all cached validations."""
         async with self._cache_lock:
             self._cache.clear()
+
+    @staticmethod
+    def _cache_key(api_key: str) -> str:
+        return sha256(api_key.encode("utf-8")).hexdigest()
+
+    def _purge_expired_locked(self, now: float) -> None:
+        expired = [
+            key for key, (_, _, _, expires_at) in self._cache.items()
+            if expires_at <= now
+        ]
+        for key in expired:
+            self._cache.pop(key, None)
 
 
 __all__ = ["ApiKeyService", "ValidationResult"]

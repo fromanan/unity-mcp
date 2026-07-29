@@ -4,6 +4,8 @@ import argparse
 import json
 import logging
 import os
+import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -51,10 +53,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(message)s")
-    if os.name != "nt":
-        logger.error("mcp-for-unity-supervisor is only required on Windows")
-        return 2
-
     args = build_parser().parse_args()
     command = args.command
     if command and command[0] == "--":
@@ -65,6 +63,8 @@ def main() -> int:
     if args.parent_pid <= 1 or args.parent_pid == os.getpid():
         logger.error("Invalid Unity parent PID")
         return 2
+    if os.name != "nt":
+        return _run_posix(args, command)
 
     from process_supervisor.windows_job import (
         WindowsJob,
@@ -165,6 +165,167 @@ def main() -> int:
         raise
     finally:
         close_handle(parent_handle)
+
+
+def _run_posix(args: argparse.Namespace, command: list[str]) -> int:
+    """Supervise a POSIX process group and enforce tree-wide RSS limits."""
+    import psutil
+
+    soft_bytes = max(0, args.soft_memory_limit_mb) * 1024 * 1024
+    hard_bytes = max(0, args.hard_memory_limit_mb) * 1024 * 1024
+    parent = psutil.Process(args.parent_pid)
+    parent_created = parent.create_time()
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    state = LaunchState(
+        schema_version=1,
+        supervisor_pid=os.getpid(),
+        server_pid=process.pid,
+        unity_pid=args.parent_pid,
+        port=args.port,
+        instance_token=args.instance_token,
+        job_name=f"posix-pgid:{process.pid}",
+        soft_memory_limit_bytes=soft_bytes,
+        hard_memory_limit_bytes=hard_bytes,
+        runtime_version=args.runtime_version,
+        launched_at_unix=time.time(),
+    )
+    warned = False
+    requested_signal: int | None = None
+
+    def request_shutdown(signum, _frame) -> None:
+        nonlocal requested_signal
+        requested_signal = signum
+
+    previous_sigterm = signal.signal(signal.SIGTERM, request_shutdown)
+    previous_sigint = signal.signal(signal.SIGINT, request_shutdown)
+
+    def terminate_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def accounting() -> tuple[int, int]:
+        try:
+            root = psutil.Process(process.pid)
+            processes = [root, *root.children(recursive=True)]
+        except psutil.Error:
+            return 0, 0
+        total = 0
+        active = 0
+        for child in processes:
+            try:
+                total += child.memory_info().rss
+                active += 1
+            except psutil.Error:
+                continue
+        return active, total
+
+    try:
+        write_state(args.state_file, state)
+        _log(
+            "server_started",
+            supervisor_pid=os.getpid(),
+            server_pid=process.pid,
+            unity_pid=args.parent_pid,
+            port=args.port,
+            hard_memory_limit_bytes=hard_bytes,
+        )
+        while True:
+            if requested_signal is not None:
+                state.exit_reason = "supervisor_terminated"
+                _log("supervisor_terminated", signal=requested_signal)
+                terminate_group()
+                break
+            try:
+                parent_alive = (
+                    parent.is_running()
+                    and parent.create_time() == parent_created
+                    and parent.status() != psutil.STATUS_ZOMBIE
+                )
+            except psutil.Error:
+                parent_alive = False
+            if not parent_alive:
+                state.exit_reason = "unity_parent_exited"
+                _log("unity_parent_exited", unity_pid=args.parent_pid)
+                terminate_group()
+                break
+
+            exit_code = process.poll()
+            if exit_code is not None:
+                state.server_exit_code = exit_code
+                state.exit_reason = "server_exited"
+                break
+
+            active, current_bytes = accounting()
+            state.active_processes = active
+            state.current_private_bytes = current_bytes
+            state.peak_job_memory_bytes = max(
+                state.peak_job_memory_bytes,
+                current_bytes,
+            )
+            if soft_bytes and current_bytes >= soft_bytes and not warned:
+                warned = True
+                _log(
+                    "soft_memory_limit_exceeded",
+                    current_private_bytes=current_bytes,
+                    soft_memory_limit_bytes=soft_bytes,
+                )
+            if hard_bytes and current_bytes >= hard_bytes:
+                state.exit_reason = "memory_limit_exceeded"
+                _log(
+                    "memory_limit_exceeded",
+                    current_private_bytes=current_bytes,
+                    hard_memory_limit_bytes=hard_bytes,
+                )
+                terminate_group()
+                break
+            write_state(args.state_file, state)
+            time.sleep(5)
+
+        active, current_bytes = accounting()
+        state.active_processes = active
+        state.current_private_bytes = current_bytes
+        state.peak_job_memory_bytes = max(
+            state.peak_job_memory_bytes,
+            current_bytes,
+        )
+        if state.exit_reason == "server_exited":
+            state.exit_reason = classify_server_exit(
+                hard_bytes,
+                state.peak_job_memory_bytes,
+            )
+        write_state(args.state_file, state)
+        return state.server_exit_code or 0
+    except BaseException as exc:
+        state.exit_reason = f"supervisor_error:{type(exc).__name__}"
+        try:
+            write_state(args.state_file, state)
+        except OSError:
+            pass
+        terminate_group()
+        _log("supervisor_error", error=str(exc), error_type=type(exc).__name__)
+        raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
 
 
 if __name__ == "__main__":

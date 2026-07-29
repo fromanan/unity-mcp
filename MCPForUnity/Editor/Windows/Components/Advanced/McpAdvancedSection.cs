@@ -30,7 +30,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private Toggle debugLogsToggle;
         private Toggle logRecordToggle;
         private Toggle devModeForceRefreshToggle;
-        private Toggle allowLanHttpBindToggle;
         private Toggle allowInsecureRemoteHttpToggle;
         private IntegerField serverMemorySoftLimitMb;
         private Toggle serverMemoryHardLimitEnabled;
@@ -83,7 +82,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             debugLogsToggle = Root.Q<Toggle>("debug-logs-toggle");
             logRecordToggle = Root.Q<Toggle>("log-record-toggle");
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
-            allowLanHttpBindToggle = Root.Q<Toggle>("allow-lan-http-bind-toggle");
             allowInsecureRemoteHttpToggle = Root.Q<Toggle>("allow-insecure-remote-http-toggle");
             serverMemorySoftLimitMb = Root.Q<IntegerField>("server-memory-soft-limit-mb");
             serverMemoryHardLimitEnabled = Root.Q<Toggle>("server-memory-hard-limit-enabled");
@@ -136,13 +134,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 if (forceRefreshLabel != null)
                     forceRefreshLabel.tooltip = devModeForceRefreshToggle.tooltip;
             }
-            if (allowLanHttpBindToggle != null)
-            {
-                allowLanHttpBindToggle.tooltip = "Allow HTTP Local to bind on all interfaces (0.0.0.0 / ::). Disabled by default because devices on your LAN may reach MCP tools.";
-                var lanBindLabel = allowLanHttpBindToggle?.parent?.Q<Label>();
-                if (lanBindLabel != null)
-                    lanBindLabel.tooltip = allowLanHttpBindToggle.tooltip;
-            }
             if (allowInsecureRemoteHttpToggle != null)
             {
                 allowInsecureRemoteHttpToggle.tooltip = "Allow HTTP Remote over plaintext http/ws. Disabled by default to require HTTPS/WSS.";
@@ -153,9 +144,9 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             if (serverMemorySoftLimitMb != null)
                 serverMemorySoftLimitMb.tooltip = "Warn when the managed server tree exceeds this amount of private memory.";
             if (serverMemoryHardLimitEnabled != null)
-                serverMemoryHardLimitEnabled.tooltip = "Opt in to a Windows Job Object hard memory ceiling. Exceeding it can terminate memory-intensive requests.";
+                serverMemoryHardLimitEnabled.tooltip = "Enforce a managed process-tree memory ceiling. Exceeding it terminates memory-intensive requests and preserves a run-state reason.";
             if (serverMemoryHardLimitMb != null)
-                serverMemoryHardLimitMb.tooltip = "Windows Job Object committed-memory ceiling. Disabled unless the hard-limit toggle is enabled.";
+                serverMemoryHardLimitMb.tooltip = "Managed process-tree memory ceiling. Disabled only when the hard-limit toggle is cleared.";
             if (serverSessionIdleTimeoutSeconds != null)
                 serverSessionIdleTimeoutSeconds.tooltip = "Expire abandoned MCP HTTP sessions after this many inactive seconds.";
             if (serverMaxSessions != null)
@@ -215,10 +206,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 logRecordToggle.value = McpLogRecord.IsEnabled;
 
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
-            if (allowLanHttpBindToggle != null)
-            {
-                allowLanHttpBindToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.AllowLanHttpBind, false));
-            }
             if (allowInsecureRemoteHttpToggle != null)
             {
                 allowInsecureRemoteHttpToggle.SetValueWithoutNotify(EditorPrefs.GetBool(EditorPrefKeys.AllowInsecureRemoteHttp, false));
@@ -296,15 +283,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 EditorPrefs.SetBool(EditorPrefKeys.DevModeForceServerRefresh, evt.newValue);
                 OnHttpServerCommandUpdateRequested?.Invoke();
             });
-
-            if (allowLanHttpBindToggle != null)
-            {
-                allowLanHttpBindToggle.RegisterValueChangedCallback(evt =>
-                {
-                    EditorPrefs.SetBool(EditorPrefKeys.AllowLanHttpBind, evt.newValue);
-                    OnHttpServerCommandUpdateRequested?.Invoke();
-                });
-            }
 
             if (allowInsecureRemoteHttpToggle != null)
             {
@@ -484,10 +462,6 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
-            if (allowLanHttpBindToggle != null)
-            {
-                allowLanHttpBindToggle.value = EditorPrefs.GetBool(EditorPrefKeys.AllowLanHttpBind, false);
-            }
             if (allowInsecureRemoteHttpToggle != null)
             {
                 allowInsecureRemoteHttpToggle.value = EditorPrefs.GetBool(EditorPrefKeys.AllowInsecureRemoteHttp, false);

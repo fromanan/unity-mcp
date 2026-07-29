@@ -124,12 +124,18 @@ def run_http_server(
     port: int,
     session_idle_timeout: float,
     max_sessions: int,
+    remote_hosted: bool = False,
+    allowed_hosts: tuple[str, ...] = (),
+    allowed_origins: tuple[str, ...] = (),
 ) -> None:
     app = create_bounded_streamable_http_app(
         mcp,
         streamable_http_path="/mcp",
         session_idle_timeout=session_idle_timeout,
         max_sessions=max_sessions,
+        host_origin_protection=True if remote_hosted else "auto",
+        allowed_hosts=list(allowed_hosts) if remote_hosted else None,
+        allowed_origins=list(allowed_origins) if remote_hosted else None,
     )
     uvicorn_config = uvicorn.Config(
         app=app,

@@ -234,14 +234,35 @@ namespace MCPForUnity.Editor.Helpers
                 return "mcpforunityserver";
             }
 
-            // Package.json uses semver prerelease tags (e.g., 9.4.5-beta.1) that are not valid
-            // PEP 440 pins for uvx. Use the beta prerelease range instead of a pinned prerelease.
-            if (IsSemVerPreRelease(version))
+            string pythonVersion = ConvertSemVerToPep440(version);
+            if (string.IsNullOrWhiteSpace(pythonVersion))
             {
-                return "mcpforunityserver>=0.0.0a0";
+                return "mcpforunityserver";
             }
 
-            return $"mcpforunityserver=={version}";
+            return $"mcpforunityserver=={pythonVersion}";
+        }
+
+        internal static string ConvertSemVerToPep440(string version)
+        {
+            if (string.IsNullOrWhiteSpace(version)) return null;
+            var match = System.Text.RegularExpressions.Regex.Match(
+                version.Trim(),
+                @"^(?<base>\d+\.\d+\.\d+)(?:-(?<kind>alpha|beta|rc|preview)\.?(?<number>\d+)?)?$",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!match.Success) return null;
+            string baseVersion = match.Groups["base"].Value;
+            if (!match.Groups["kind"].Success) return baseVersion;
+            string kind = match.Groups["kind"].Value.ToLowerInvariant();
+            string prefix = kind == "alpha"
+                ? "a"
+                : kind == "beta" || kind == "preview"
+                    ? "b"
+                    : "rc";
+            string number = match.Groups["number"].Success
+                ? match.Groups["number"].Value
+                : "0";
+            return baseVersion + prefix + number;
         }
 
         /// <summary>

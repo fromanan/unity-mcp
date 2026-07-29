@@ -188,15 +188,9 @@ namespace MCPForUnityTests.Editor.Services.Server
         {
             var startInfo = _launcher.CreateHeadlessProcessStartInfo("echo hello", LogPath());
 
-            // Must NOT route through Terminal.app / start / a terminal emulator.
-#if UNITY_EDITOR_WIN
-            Assert.AreEqual("cmd.exe", startInfo.FileName, "Windows headless should run via cmd.exe");
-            StringAssert.DoesNotContain("start ", startInfo.Arguments, "Windows headless must not use 'start' (new window)");
-#else
-            Assert.AreEqual("/bin/bash", startInfo.FileName, "macOS/Linux headless should run via /bin/bash");
-            StringAssert.DoesNotContain("open", startInfo.Arguments, "macOS headless must not use 'open -a Terminal'");
-            StringAssert.DoesNotContain("Terminal", startInfo.Arguments, "macOS headless must not open Terminal.app");
-#endif
+            Assert.AreEqual("echo", startInfo.FileName,
+                "Headless launch should execute the requested binary directly");
+            Assert.AreEqual("hello", startInfo.Arguments);
         }
 
         [Test]
@@ -206,10 +200,10 @@ namespace MCPForUnityTests.Editor.Services.Server
 
             var startInfo = _launcher.CreateHeadlessProcessStartInfo("echo hello", logPath);
 
-            // The redirect to the log file is part of the shell payload.
-            StringAssert.Contains(logPath, startInfo.Arguments, "Arguments should reference the log file path");
-            StringAssert.Contains("2>&1", startInfo.Arguments, "stderr should be redirected to stdout (and the log)");
-            StringAssert.Contains(">>", startInfo.Arguments, "output should be appended to the log via >>");
+            Assert.IsTrue(startInfo.RedirectStandardOutput);
+            Assert.IsTrue(startInfo.RedirectStandardError);
+            StringAssert.DoesNotContain(logPath, startInfo.Arguments,
+                "The log path must not be interpolated into a shell command");
         }
 
 #if UNITY_EDITOR_WIN
@@ -221,7 +215,8 @@ namespace MCPForUnityTests.Editor.Services.Server
             // "The handle is invalid. (os error 6)". stdin must come from NUL instead.
             var startInfo = _launcher.CreateHeadlessProcessStartInfo("uvx run-server", LogPath());
 
-            StringAssert.Contains("< NUL", startInfo.Arguments, "stdin should be redirected from NUL");
+            Assert.IsTrue(startInfo.RedirectStandardInput,
+                "stdin should use a managed redirected pipe rather than an inherited GUI handle");
         }
 #endif
 
@@ -233,22 +228,20 @@ namespace MCPForUnityTests.Editor.Services.Server
 
             var startInfo = _launcher.CreateHeadlessProcessStartInfo("uvx run-server", logPath);
 
-            StringAssert.Contains(logPath, startInfo.Arguments, "Arguments should contain the full spaced log path");
-#if UNITY_EDITOR_WIN
-            StringAssert.Contains($"\"{logPath}\"", startInfo.Arguments, "Windows should double-quote a spaced log path");
-#else
-            StringAssert.Contains($"'{logPath}'", startInfo.Arguments, "macOS/Linux should single-quote a spaced log path");
-#endif
+            Assert.IsTrue(System.IO.Directory.Exists(System.IO.Path.GetDirectoryName(logPath)));
+            StringAssert.DoesNotContain(logPath, startInfo.Arguments,
+                "A log path must never become executable command text");
         }
 
         [Test]
         public void CreateHeadlessProcessStartInfo_CommandWithSpaces_Preserved()
         {
-            string command = "/path with spaces/uvx --no-cache run mcp-for-unity";
+            string command = "\"/path with spaces/uvx\" --no-cache run mcp-for-unity";
 
             var startInfo = _launcher.CreateHeadlessProcessStartInfo(command, LogPath());
 
-            StringAssert.Contains(command, startInfo.Arguments, "The command (incl. spaces) should be preserved in Arguments");
+            Assert.AreEqual("/path with spaces/uvx", startInfo.FileName);
+            Assert.AreEqual("--no-cache run mcp-for-unity", startInfo.Arguments);
         }
 
         [Test]

@@ -116,6 +116,7 @@ namespace MCPForUnity.Editor.Tools.Profiler
 
             var p = new ToolParams(@params);
             int pageSize = p.GetInt("page_size") ?? 50;
+            pageSize = Math.Max(1, Math.Min(100, pageSize));
             int cursor = p.GetInt("cursor") ?? 0;
 
             int totalEvents = GetEventCount();

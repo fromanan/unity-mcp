@@ -28,8 +28,13 @@ on:
 
 jobs:
   test:
-    name: Run Python Tests
-    runs-on: ubuntu-latest
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12", "3.14"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -37,43 +42,39 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
         with:
-          version: "latest"
+          version: "0.11.26"
 
       - name: Set up Python
-        run: uv python install 3.10
+        run: uv python install ${{ matrix.python }}
 
       - name: Install dependencies
-        run: |
-          cd Server
-          uv sync
-          uv pip install -e ".[dev]"
+        run: uv sync --project Server --python ${{ matrix.python }} --extra dev
 
-      - name: Run tests with coverage
-        run: |
-          cd Server
-          uv run pytest tests/ -v --tb=short --cov --cov-report=xml --cov-report=html --cov-report=term
-
-      - name: Run local harness unit tests (hermetic, no Unity)
-        run: |
-          cd Server
-          uv run python -m pytest "$GITHUB_WORKSPACE/tools/tests/" -v --tb=short
+      - name: Run repository Python tests
+        run: >-
+          uv run --project Server python -m pytest
+          -v --tb=short
+          --cov=Server/src
+          --cov-report=xml:Server/coverage.xml
+          --cov-report=html:Server/htmlcov
+          --cov-report=term
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4
-        if: always()
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
         with:
           files: ./Server/coverage.xml
           flags: python
-          name: python-coverage
+          name: python-coverage-${{ matrix.python }}-${{ matrix.os }}
           fail_ci_if_error: false
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: pytest-results
+          name: pytest-results-${{ matrix.python }}-${{ matrix.os }}
           path: |
             Server/.pytest_cache/
             Server/tests/

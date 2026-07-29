@@ -53,10 +53,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: astral-sh/setup-uv@v4
+      - uses: astral-sh/setup-uv@v7
         if: steps.detect.outputs.unity_ok == 'true'
         with:
-          python-version: "3.11"
+          version: "0.11.26"
 
       - name: Install MCP server
         if: steps.detect.outputs.unity_ok == 'true'

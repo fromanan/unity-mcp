@@ -52,11 +52,6 @@
             </ui:VisualElement>
 
             <ui:VisualElement class="setting-row">
-                <ui:Label text="Allow LAN Bind (HTTP Local):" class="setting-label" />
-                <ui:Toggle name="allow-lan-http-bind-toggle" class="setting-toggle" />
-            </ui:VisualElement>
-
-            <ui:VisualElement class="setting-row">
                 <ui:Label text="Allow Insecure Remote HTTP:" class="setting-label" />
                 <ui:Toggle name="allow-insecure-remote-http-toggle" class="setting-toggle" />
             </ui:VisualElement>

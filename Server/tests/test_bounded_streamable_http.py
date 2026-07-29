@@ -24,12 +24,20 @@ HEADERS = {
 }
 
 
-def _app(*, timeout: float = 30, maximum: int = 1):
+def _app(
+    *,
+    timeout: float = 30,
+    maximum: int = 1,
+    host_origin_protection: bool | str = "auto",
+    allowed_hosts: list[str] | None = None,
+):
     return create_bounded_streamable_http_app(
         FastMCP("bounded-test"),
         streamable_http_path="/mcp",
         session_idle_timeout=timeout,
         max_sessions=maximum,
+        host_origin_protection=host_origin_protection,
+        allowed_hosts=allowed_hosts,
     )
 
 
@@ -79,3 +87,17 @@ def test_idle_session_expires_and_old_id_returns_404():
         snapshot = app.state.session_manager.snapshot()
         assert snapshot["active"] == 0
         assert snapshot["expired_or_closed"] == 1
+
+
+def test_strict_host_origin_protection_rejects_unknown_host():
+    app = _app(
+        host_origin_protection=True,
+        allowed_hosts=["mcp.example.com"],
+    )
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/mcp",
+            headers={**HEADERS, "Host": "attacker.example"},
+            json=INITIALIZE,
+        )
+        assert rejected.status_code == 421

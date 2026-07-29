@@ -135,9 +135,7 @@ class PluginHub(WebSocketEndpoint):
 
     _registry: PluginRegistry | None = None
     _mcp: FastMCP | None = None
-    # Index into mcp._transforms where Unity's server-level overrides start.
-    # Transforms before this index are startup defaults; at and after are Unity syncs.
-    _unity_transform_start: int | None = None
+    _stdio_transform_start: int | None = None
     _connections: dict[str, WebSocket] = {}
     # command_id -> {"future": Future, "session_id": str}
     _pending: dict[str, dict[str, Any]] = {}
@@ -167,6 +165,43 @@ class PluginHub(WebSocketEndpoint):
     @classmethod
     def is_configured(cls) -> bool:
         return cls._registry is not None and cls._lock is not None
+
+    @classmethod
+    async def shutdown(cls) -> None:
+        """Release all loop-bound state so a later lifespan starts cleanly."""
+        lock = cls._lock
+        if lock is None:
+            cls._registry = None
+            cls._mcp = None
+            cls._loop = None
+            return
+        async with lock:
+            connections = list(cls._connections.values())
+            ping_tasks = list(cls._ping_tasks.values())
+            pending = list(cls._pending.values())
+            cls._connections.clear()
+            cls._ping_tasks.clear()
+            cls._last_pong.clear()
+            cls._pending.clear()
+        for task in ping_tasks:
+            if not task.done():
+                task.cancel()
+        for entry in pending:
+            future = entry.get("future")
+            if future and not future.done():
+                future.set_exception(
+                    PluginDisconnectedError("Plugin hub is shutting down")
+                )
+        for websocket in connections:
+            try:
+                await websocket.close(code=1001)
+            except Exception:
+                pass
+        cls._registry = None
+        cls._mcp = None
+        cls._loop = None
+        cls._lock = None
+        cls._stdio_transform_start = None
 
     async def on_connect(self, websocket: WebSocket) -> None:
         # Validate API key in remote-hosted mode (fail closed)
@@ -276,6 +311,13 @@ class PluginHub(WebSocketEndpoint):
                         )
                 if cls._registry:
                     await cls._registry.unregister(session_id)
+                try:
+                    from services.custom_tool_service import CustomToolService
+                    CustomToolService.get_instance().unregister_global_tools_for_owner(
+                        session_id
+                    )
+                except RuntimeError:
+                    pass
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
 
@@ -495,6 +537,14 @@ class PluginHub(WebSocketEndpoint):
             cls._ping_tasks[session_id] = ping_task
 
         # Close evicted WebSocket outside the lock to avoid blocking
+        if evicted_session_id:
+            try:
+                from services.custom_tool_service import CustomToolService
+                CustomToolService.get_instance().unregister_global_tools_for_owner(
+                    evicted_session_id
+                )
+            except RuntimeError:
+                pass
         if evicted_ws is not None:
             try:
                 await evicted_ws.close(code=1001)
@@ -530,19 +580,16 @@ class PluginHub(WebSocketEndpoint):
         logger.info(
             f"Registered {len(payload.tools)} tools for session {session_id}")
 
-        # Sync server-level FastMCP visibility so new MCP client sessions
-        # (e.g. new Claude Code conversations) see the correct tool set.
-        self._sync_server_tool_visibility(payload.tools)
-
-        # Notify any already-connected MCP clients (e.g. CC over stdio) that
-        # the tool list has changed so they re-fetch.
-        await cls._notify_mcp_tool_list_changed()
-
         try:
             from services.custom_tool_service import CustomToolService
 
             service = CustomToolService.get_instance()
-            service.register_global_tools(payload.tools)
+            # A registration message is a full snapshot for this owner. Remove
+            # definitions omitted from the new snapshot before adding it.
+            service.replace_global_tools_for_owner(
+                payload.tools,
+                owner_id=session_id,
+            )
         except RuntimeError as exc:
             logger.debug(
                 "Skipping global custom tool registration: CustomToolService not initialized yet (%s)",
@@ -555,75 +602,51 @@ class PluginHub(WebSocketEndpoint):
                 exc_info=exc,
             )
 
+        # Notify only after the server-level snapshot is replaced, otherwise a
+        # fast client can re-fetch the stale list.
+        await cls._notify_mcp_tool_list_changed()
+
     @classmethod
     def _sync_server_tool_visibility(cls, registered_tools: list) -> None:
-        """Sync FastMCP server-level tool group visibility to match Unity's state.
-
-        When Unity sends ``register_tools``, some groups may have been toggled
-        on/off via the Unity Editor GUI.  We mirror that state at the FastMCP
-        server level so that **new** MCP client sessions (e.g. a fresh Claude
-        Code conversation) see the correct tool set without requiring
-        ``manage_tools`` activation.
-
-        The startup ``register_all_tools()`` disables non-default groups via
-        ``mcp.disable(tags=...)``.  Here we append ``mcp.enable(tags=...)``
-        transforms for groups that Unity has enabled, effectively overriding
-        the startup defaults.  FastMCP processes transforms in order so later
-        ``enable`` calls override earlier ``disable`` calls.
-        """
+        """Apply Unity tool toggles only to a single-project stdio server."""
+        if (config.transport_mode or "stdio").lower() == "http":
+            return
         mcp = cls._mcp
         if mcp is None:
             return
-
         try:
             from services.registry import get_group_tool_names, TOOL_GROUPS
 
             registered_names: set[str] = set()
             for tool in registered_tools:
-                name = getattr(tool, "name", None) if not isinstance(tool, dict) else tool.get("name")
+                name = (
+                    tool.get("name")
+                    if isinstance(tool, dict)
+                    else getattr(tool, "name", None)
+                )
                 if isinstance(name, str) and name:
                     registered_names.add(name)
 
-            group_tools = get_group_tool_names()
-
-            # Reset Unity overrides: trim transforms back to where Unity started,
-            # then re-apply based on current registered tools.
-            if cls._unity_transform_start is not None:
-                mcp._transforms = mcp._transforms[:cls._unity_transform_start]
+            if cls._stdio_transform_start is None:
+                cls._stdio_transform_start = len(mcp._transforms)
             else:
-                # First time: record where startup transforms end.
-                cls._unity_transform_start = len(mcp._transforms)
+                mcp._transforms = mcp._transforms[
+                    :cls._stdio_transform_start
+                ]
 
-            enabled_groups: list[str] = []
-            disabled_groups: list[str] = []
-
-            for group_name in sorted(TOOL_GROUPS.keys()):
-                tool_names = group_tools.get(group_name, [])
-                has_any_registered = any(n in registered_names for n in tool_names)
-
-                if has_any_registered:
-                    # Override the startup disable with an enable.
-                    tag = f"group:{group_name}"
+            group_tools = get_group_tool_names()
+            for group_name in sorted(TOOL_GROUPS):
+                tag = f"group:{group_name}"
+                if any(
+                    name in registered_names
+                    for name in group_tools.get(group_name, [])
+                ):
                     mcp.enable(tags={tag}, components={"tool"})
-                    enabled_groups.append(group_name)
                 else:
-                    # Group not present in Unity's registered tools — disable it.
-                    tag = f"group:{group_name}"
                     mcp.disable(tags={tag}, components={"tool"})
-                    disabled_groups.append(group_name)
-
-            if enabled_groups or disabled_groups:
-                logger.info(
-                    "Server-level tool visibility synced from Unity: "
-                    "enabled=[%s], disabled=[%s], total_transforms=%d, unity_start=%d",
-                    ", ".join(enabled_groups),
-                    ", ".join(disabled_groups),
-                    len(mcp._transforms),
-                    cls._unity_transform_start or 0,
-                )
         except Exception:
             logger.debug(
-                "Failed to sync server-level tool visibility",
+                "Failed to sync stdio tool visibility",
                 exc_info=True,
             )
 
@@ -808,6 +831,13 @@ class PluginHub(WebSocketEndpoint):
                     session_id,
                     exc_info=True,
                 )
+        try:
+            from services.custom_tool_service import CustomToolService
+            CustomToolService.get_instance().unregister_global_tools_for_owner(
+                session_id
+            )
+        except RuntimeError:
+            pass
 
         logger.debug("Evicted plugin session %s (%s)", session_id, reason)
 
@@ -1070,7 +1100,11 @@ class PluginHub(WebSocketEndpoint):
     # Blocking helpers for synchronous tool code
     # ------------------------------------------------------------------
     @classmethod
-    def _run_coroutine_sync(cls, coro: "asyncio.Future[Any]") -> Any:
+    def _run_coroutine_sync(
+        cls,
+        coro: "asyncio.Future[Any]",
+        timeout_seconds: float = 3610.0,
+    ) -> Any:
         if cls._loop is None:
             raise RuntimeError("PluginHub event loop not configured")
         loop = cls._loop
@@ -1085,7 +1119,13 @@ class PluginHub(WebSocketEndpoint):
                         "Cannot wait synchronously for PluginHub coroutine from within the event loop"
                     )
         future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result()
+        try:
+            return future.result(timeout=max(1.0, timeout_seconds))
+        except TimeoutError:
+            future.cancel()
+            raise TimeoutError(
+                "Timed out waiting for the PluginHub event loop"
+            )
 
     @classmethod
     def send_command_blocking(
@@ -1100,7 +1140,10 @@ class PluginHub(WebSocketEndpoint):
 
     @classmethod
     def list_sessions_sync(cls) -> SessionList:
-        return cls._run_coroutine_sync(cls.get_sessions())
+        return cls._run_coroutine_sync(
+            cls.get_sessions(),
+            timeout_seconds=35.0,
+        )
 
 
 def send_command_to_plugin(

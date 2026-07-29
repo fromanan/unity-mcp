@@ -312,25 +312,30 @@ class WindowsJob:
         )
 
     def _process_ids(self) -> list[int]:
-        capacity = 64
         element = ctypes.sizeof(ctypes.c_size_t)
-        buffer = ctypes.create_string_buffer(8 + capacity * element)
-        _check_bool(
-            kernel32.QueryInformationJobObject(
+        capacity = 64
+        while capacity <= 16384:
+            buffer = ctypes.create_string_buffer(8 + capacity * element)
+            if kernel32.QueryInformationJobObject(
                 self.handle,
                 JOB_OBJECT_BASIC_PROCESS_ID_LIST_CLASS,
                 buffer,
                 ctypes.sizeof(buffer),
                 None,
-            ),
-            "QueryInformationJobObject(ProcessIdList)",
-        )
-        assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
-        listed = ctypes.c_uint32.from_buffer(buffer, 4).value
-        count = min(assigned, listed, capacity)
-        array_type = ctypes.c_size_t * count
-        values = array_type.from_buffer(buffer, 8)
-        return [int(value) for value in values]
+            ):
+                assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
+                listed = ctypes.c_uint32.from_buffer(buffer, 4).value
+                count = min(assigned, listed, capacity)
+                array_type = ctypes.c_size_t * count
+                values = array_type.from_buffer(buffer, 8)
+                return [int(value) for value in values]
+            if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA
+                _check_bool(
+                    False,
+                    "QueryInformationJobObject(ProcessIdList)",
+                )
+            capacity *= 2
+        raise OSError("Windows Job contains more than 16384 processes")
 
     @staticmethod
     def _private_bytes(pid: int) -> int:

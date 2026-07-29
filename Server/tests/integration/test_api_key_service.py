@@ -141,6 +141,28 @@ class TestBasicValidation:
 
 class TestCaching:
     @pytest.mark.asyncio
+    async def test_cache_uses_digests_and_evicts_lru_entries(self):
+        svc = _make_service(cache_ttl=300.0)
+        svc._cache_max_entries = 2
+        mock_resp = _mock_response(200, {"valid": True, "user_id": "u1"})
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            instance.post = AsyncMock(return_value=mock_resp)
+            MockClient.return_value = instance
+
+            await svc.validate("raw-key-one")
+            await svc.validate("raw-key-two")
+            await svc.validate("raw-key-three")
+
+        assert len(svc._cache) == 2
+        assert "raw-key-one" not in svc._cache
+        assert svc._cache_key("raw-key-one") not in svc._cache
+        assert svc._cache_key("raw-key-three") in svc._cache
+
+    @pytest.mark.asyncio
     async def test_cache_hit_valid_key(self):
         svc = _make_service(cache_ttl=300.0)
         mock_resp = _mock_response(200, {"valid": True, "user_id": "u1"})
@@ -214,7 +236,7 @@ class TestCaching:
 
             # Manually expire the cache entry by manipulating the stored tuple
             async with svc._cache_lock:
-                key = "test-expiry-key-12345"
+                key = svc._cache_key("test-expiry-key-12345")
                 valid, user_id, metadata, _expires = svc._cache[key]
                 svc._cache[key] = (valid, user_id, metadata, time.time() - 1)
 

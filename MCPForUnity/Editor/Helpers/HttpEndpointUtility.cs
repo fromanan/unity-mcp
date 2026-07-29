@@ -210,7 +210,8 @@ namespace MCPForUnity.Editor.Helpers
 
         /// <summary>
         /// Returns true when the URL host is acceptable for HTTP Local launch.
-        /// Loopback is always allowed. Bind-all interfaces requires explicit opt-in.
+        /// Loopback is always allowed. Bind-all interfaces are forbidden because
+        /// local mode does not provide authentication.
         /// </summary>
         public static bool IsHttpLocalUrlAllowedForLaunch(string url, out string error)
         {
@@ -235,13 +236,8 @@ namespace MCPForUnity.Editor.Helpers
 
             if (IsBindAllInterfacesHost(host))
             {
-                if (AllowLanHttpBind())
-                {
-                    return true;
-                }
-
-                error = "Binding to all interfaces (0.0.0.0/::) is disabled by default. " +
-                        "Enable \"Allow LAN bind for HTTP Local\" in Advanced Settings to opt in.";
+                error = "HTTP Local cannot bind to all interfaces because local mode is " +
+                        "unauthenticated. Use authenticated HTTP Remote for LAN or hosted access.";
                 return false;
             }
 
@@ -301,9 +297,7 @@ namespace MCPForUnity.Editor.Helpers
         /// </summary>
         public static string GetHttpLocalHostRequirementText()
         {
-            return AllowLanHttpBind()
-                ? "localhost/127.0.0.1/::1/0.0.0.0/::"
-                : "localhost/127.0.0.1/::1";
+            return "localhost/127.0.0.1/::1";
         }
 
         /// <summary>

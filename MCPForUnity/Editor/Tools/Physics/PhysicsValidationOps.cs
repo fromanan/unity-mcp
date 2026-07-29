@@ -24,6 +24,7 @@ namespace MCPForUnity.Editor.Tools.Physics
             string targetStr = p.Get("target");
             string searchMethod = p.Get("search_method");
             int pageSize = p.GetInt("page_size") ?? p.GetInt("pageSize") ?? 50;
+            pageSize = Math.Max(1, Math.Min(100, pageSize));
             int cursor = p.GetInt("cursor") ?? 0;
 
             var warnings = new List<string>();

@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace MCPForUnity.Editor.Services.Server
@@ -7,7 +8,8 @@ namespace MCPForUnity.Editor.Services.Server
     {
         bool EnsureInstalled(out InstalledServerRuntime runtime, out string error);
         Task<ServerRuntimeInstallResult> EnsureInstalledAsync(
-            IProgress<ServerStartProgress> progress = null);
+            IProgress<ServerStartProgress> progress = null,
+            CancellationToken cancellationToken = default);
         bool TryGetInstalled(out InstalledServerRuntime runtime);
     }
 }

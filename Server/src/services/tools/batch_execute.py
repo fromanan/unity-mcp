@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import time
+from collections import OrderedDict
 from typing import Annotated, Any
 
 from fastmcp import Context
@@ -20,18 +22,29 @@ DEFAULT_MAX_COMMANDS_PER_BATCH = 25
 # Hard ceiling matching the C# AbsoluteMaxCommandsPerBatch.
 ABSOLUTE_MAX_COMMANDS_PER_BATCH = 100
 
-# Module-level cache for the Unity-configured limit (populated from editor state).
-_cached_max_commands: int | None = None
+# Cache per Unity instance so one project's setting never contaminates another.
+_CACHE_TTL_SECONDS = 5.0
+_MAX_CACHED_INSTANCES = 64
+_cached_max_commands: OrderedDict[str, tuple[int, float]] = OrderedDict()
 
 
-async def _get_max_commands_from_editor_state(ctx: Context) -> int:
+async def _get_max_commands_from_editor_state(
+    ctx: Context,
+    unity_instance: str | None,
+) -> int:
     """
     Attempt to read the configured batch limit from the Unity editor state.
     Falls back to DEFAULT_MAX_COMMANDS_PER_BATCH if unavailable.
     """
-    global _cached_max_commands
-    if _cached_max_commands is not None:
-        return _cached_max_commands
+    cache_key = unity_instance or "__default__"
+    now = time.monotonic()
+    for key, (_, expires_at) in list(_cached_max_commands.items()):
+        if expires_at <= now:
+            _cached_max_commands.pop(key, None)
+    cached = _cached_max_commands.get(cache_key)
+    if cached is not None and cached[1] > now:
+        _cached_max_commands.move_to_end(cache_key)
+        return cached[0]
 
     try:
         from services.resources.editor_state import get_editor_state
@@ -45,7 +58,13 @@ async def _get_max_commands_from_editor_state(ctx: Context) -> int:
             if isinstance(settings, dict):
                 limit = settings.get("batch_execute_max_commands")
                 if isinstance(limit, int) and 1 <= limit <= ABSOLUTE_MAX_COMMANDS_PER_BATCH:
-                    _cached_max_commands = limit
+                    _cached_max_commands[cache_key] = (
+                        limit,
+                        now + _CACHE_TTL_SECONDS,
+                    )
+                    _cached_max_commands.move_to_end(cache_key)
+                    while len(_cached_max_commands) > _MAX_CACHED_INSTANCES:
+                        _cached_max_commands.popitem(last=False)
                     return limit
     except Exception as exc:
         logger.debug("Could not read batch limit from editor state: %s", exc)
@@ -53,10 +72,12 @@ async def _get_max_commands_from_editor_state(ctx: Context) -> int:
     return DEFAULT_MAX_COMMANDS_PER_BATCH
 
 
-def invalidate_cached_max_commands() -> None:
+def invalidate_cached_max_commands(unity_instance: str | None = None) -> None:
     """Reset the cached limit so the next call re-reads from editor state."""
-    global _cached_max_commands
-    _cached_max_commands = None
+    if unity_instance is None:
+        _cached_max_commands.clear()
+    else:
+        _cached_max_commands.pop(unity_instance, None)
 
 
 @mcp_for_unity_tool(
@@ -91,7 +112,10 @@ async def batch_execute(
         raise ValueError(
             "'commands' must be a non-empty list of command specifications")
 
-    max_commands = await _get_max_commands_from_editor_state(ctx)
+    max_commands = await _get_max_commands_from_editor_state(
+        ctx,
+        unity_instance,
+    )
     if len(commands) > max_commands:
         raise ValueError(
             f"batch_execute supports up to {max_commands} commands (configured in Unity); received {len(commands)}"

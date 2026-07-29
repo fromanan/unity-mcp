@@ -28,8 +28,17 @@ The lifecycle hardening phases are implemented in this fork:
   steady state;
 - Windows runtimes use uv-managed Python so Microsoft Store redirectors cannot
   escape the Job Object;
-- the Windows supervisor contains descendants, samples job memory, applies an
-  opt-in hard ceiling, watches the Unity PID, and persists atomic launch state;
+- Windows uses a Job Object, while macOS/Linux uses a supervised POSIX process
+  group with recursive RSS accounting and signal-driven tree shutdown;
+- the hard ceiling is enabled by default at 768 MiB (and remains configurable
+  or disableable), with a 512 MiB warning threshold;
+- local HTTP defaults to a five-minute idle timeout and 16 concurrent sessions;
+- hosted HTTP requires API-key validation plus explicit Host/Origin policy,
+  and the legacy tool-registration route is unavailable remotely;
+- API-key and custom-tool registries are hashed, bounded, owner-scoped, and
+  cleaned up on session exit;
+- launch ownership is project-scoped, so one Unity project cannot stop or
+  inherit another project's managed server;
 - normal shutdown is graceful and verified, with forced tree termination only
   as fallback;
 - Advanced Settings exposes session and memory limits plus live/last-run
@@ -40,6 +49,19 @@ compatibility adapter should eventually be removed after FastMCP exposes the
 MCP SDK idle-timeout/session-lifecycle controls directly. Long-duration memory
 plateau calibration, 25-cycle editor shutdown testing, and Unity domain-reload
 acceptance remain release-validation gates rather than missing implementation.
+
+## Implementation Validation (2026-07-29)
+
+- Python server and tooling suite: 1,472 passed, 5 platform-skipped.
+- Unity 2021.3.45f2 native EditMode suite: 1,119 passed, 0 failed, 76 ignored.
+- Generated Unity solution: 0 compile errors; seven existing Unity assembly
+  reference-version warnings.
+- Python source distribution and wheel build successfully as version
+  `10.1.1b2`; the wheel contains the `mcp-for-unity`,
+  `mcp-for-unity-supervisor`, and `unity-mcp` console entry points.
+- The version updater is idempotent, the `uv` lock is current, all GitHub
+  workflow YAML files parse, and the website production dependency audit
+  reports zero vulnerabilities.
 
 ## Current Evidence
 
@@ -141,8 +163,8 @@ than keeping the current `uv` resolver/runtime process alive.
    an actionable error.
 6. HTTP sessions have both explicit client cleanup and a server-side idle
    bound.
-7. A hard memory cap is opt-in until representative workloads establish a safe
-   ceiling.
+7. The default hard memory cap is a configurable circuit breaker, not a
+   substitute for bounded sessions and owner-scoped cleanup.
 8. Memory-limit termination produces a recognizable exit reason rather than
    looking like an unexplained crash.
 
@@ -204,7 +226,8 @@ test.
 - Split “install command” from “steady-state launch command.”
 - On Windows, build a direct command for
   `mcp-for-unity-supervisor.exe`.
-- On macOS/Linux, launch the installed `mcp-for-unity` entry point directly.
+- On macOS/Linux, launch the installed supervisor, which creates a dedicated
+  server process group and watches the Unity PID.
 - Preserve the current developer source override, but install that source into
   the project-local runtime instead of running it through a permanent `uvx`
   parent.
@@ -374,8 +397,8 @@ disconnect, or fail to implement cleanup.
 
 Modify `Server/src/core/config.py`:
 
-- `http_session_idle_timeout_seconds`, default 1,800;
-- `http_max_sessions`, initially default 64;
+- `http_session_idle_timeout_seconds`, default 300;
+- `http_max_sessions`, default 16;
 - `memory_profile_enabled`, default false;
 - validation and environment-variable mappings for all three.
 
@@ -418,10 +441,10 @@ expiration remains mandatory even after the client is fixed.
 
 - Always enable Job Object containment on Windows.
 - Default soft warning: 512 MiB committed memory for the server job.
-- Default hard cap: disabled.
-- Suggested initial opt-in hard cap for test workstations: 768 MiB.
-- Recalibrate from representative profiling before enabling a hard cap by
-  default.
+- Default hard cap: 768 MiB.
+- The operator may disable or raise it for unusually large controlled
+  workloads.
+- Recalibrate from representative profiling before changing the default.
 
 A hard Job Object cap makes allocations fail. It is a circuit breaker, not a
 garbage collector and not the primary leak fix.

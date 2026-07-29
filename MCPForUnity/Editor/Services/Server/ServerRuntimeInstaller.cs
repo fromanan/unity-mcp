@@ -55,12 +55,7 @@ namespace MCPForUnity.Editor.Services.Server
                         string stderr;
                         string projectRoot = GetProjectRoot();
                         string pathPrepend = GetPlatformSpecificPathPrepend();
-                        string venvArgs = Application.platform == RuntimePlatform.WindowsEditor
-                            // Microsoft Store Python launchers can break descendants out of a
-                            // Windows Job Object. A uv-managed interpreter remains in the job,
-                            // so its memory is included in accounting and hard limits.
-                            ? $"venv --managed-python --python 3.12 {Quote(staging)}"
-                            : $"venv {Quote(staging)}";
+                        string venvArgs = BuildVenvArguments(staging, Application.platform);
                         if (!ExecPath.TryRun(
                             uvPath,
                             venvArgs,
@@ -112,22 +107,6 @@ namespace MCPForUnity.Editor.Services.Server
                             return false;
                         }
 
-                        var manifest = new JObject
-                        {
-                            ["schemaVersion"] = 1,
-                            ["packageVersion"] = version,
-                            ["source"] = source,
-                            ["installedUtc"] = DateTime.UtcNow.ToString("O"),
-                            ["pythonVersion"] = pythonVersion,
-                            ["usesUvManagedPython"] =
-                                Application.platform == RuntimePlatform.WindowsEditor,
-                            ["serverExecutable"] = stagedRuntime.ServerExecutable,
-                            ["supervisorExecutable"] = stagedRuntime.SupervisorExecutable
-                        };
-                        File.WriteAllText(
-                            Path.Combine(staging, "runtime.json"),
-                            manifest.ToString());
-
                         if (Directory.Exists(target))
                         {
                             EnsureChildOfRuntimeRoot(target);
@@ -140,6 +119,14 @@ namespace MCPForUnity.Editor.Services.Server
                             error = "Installed server runtime failed final validation.";
                             return false;
                         }
+
+                        var manifest = BuildRuntimeManifest(
+                            runtime,
+                            version,
+                            source,
+                            pythonVersion,
+                            Application.platform == RuntimePlatform.WindowsEditor);
+                        File.WriteAllText(runtime.ManifestPath, manifest.ToString());
                         return true;
                     }
                     finally
@@ -249,6 +236,42 @@ namespace MCPForUnity.Editor.Services.Server
         private static string GetPlatformSpecificPathPrepend()
         {
             return new ServerCommandBuilder().GetPlatformSpecificPathPrepend();
+        }
+
+        internal static string BuildVenvArguments(string target, RuntimePlatform platform)
+        {
+            // Entry-point launchers and Unix shebangs normally retain absolute paths to the
+            // environment where they were created. The installer validates in a staging
+            // directory and then moves the environment, so it must always be relocatable.
+            if (platform == RuntimePlatform.WindowsEditor)
+            {
+                // Microsoft Store Python launchers can break descendants out of a Windows
+                // Job Object. A uv-managed interpreter remains in the job, so its memory is
+                // included in accounting and hard limits.
+                return $"venv --managed-python --python 3.12 --relocatable {Quote(target)}";
+            }
+
+            return $"venv --relocatable {Quote(target)}";
+        }
+
+        internal static JObject BuildRuntimeManifest(
+            InstalledServerRuntime runtime,
+            string version,
+            string source,
+            string pythonVersion,
+            bool usesUvManagedPython)
+        {
+            return new JObject
+            {
+                ["schemaVersion"] = 1,
+                ["packageVersion"] = version,
+                ["source"] = source,
+                ["installedUtc"] = DateTime.UtcNow.ToString("O"),
+                ["pythonVersion"] = pythonVersion,
+                ["usesUvManagedPython"] = usesUvManagedPython,
+                ["serverExecutable"] = runtime.ServerExecutable,
+                ["supervisorExecutable"] = runtime.SupervisorExecutable
+            };
         }
 
         private static bool TryProbeRuntime(

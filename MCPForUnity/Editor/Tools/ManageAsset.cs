@@ -26,6 +26,10 @@ namespace MCPForUnity.Editor.Tools
     [McpForUnityTool("manage_asset", AutoRegister = false)]
     public static class ManageAsset
     {
+        private const int DefaultSearchPageSize = 50;
+        private const int MaxSearchPageSize = 100;
+        private const int MaxPreviewSearchPageSize = 10;
+
         // --- Main Handler ---
 
         // Define the list of valid actions
@@ -627,13 +631,29 @@ namespace MCPForUnity.Editor.Tools
 
         private static object SearchAssets(JObject @params)
         {
-            string searchPattern = @params["searchPattern"]?.ToString();
-            string filterType = @params["filterType"]?.ToString();
+            string searchPattern = (@params["searchPattern"] ?? @params["search_pattern"])
+                ?.ToString();
+            string filterType = (@params["filterType"] ?? @params["filter_type"])?.ToString();
             string pathScope = @params["path"]?.ToString(); // Use path as folder scope
-            string filterDateAfterStr = @params["filterDateAfter"]?.ToString();
-            int pageSize = @params["pageSize"]?.ToObject<int?>() ?? 50; // Default page size
-            int pageNumber = @params["pageNumber"]?.ToObject<int?>() ?? 1; // Default page number (1-based)
-            bool generatePreview = @params["generatePreview"]?.ToObject<bool>() ?? false;
+            string filterDateAfterStr = (
+                @params["filterDateAfter"] ?? @params["filter_date_after"]
+            )?.ToString();
+            bool generatePreview = ParamCoercion.CoerceBool(
+                @params["generatePreview"] ?? @params["generate_preview"],
+                false
+            );
+            int requestedPageSize = ParamCoercion.CoerceInt(
+                @params["pageSize"] ?? @params["page_size"],
+                DefaultSearchPageSize
+            );
+            int maxPageSize = generatePreview ? MaxPreviewSearchPageSize : MaxSearchPageSize;
+            int pageSize = Mathf.Clamp(requestedPageSize, 1, maxPageSize);
+            int requestedPageNumber = ParamCoercion.CoerceInt(
+                @params["pageNumber"] ?? @params["page_number"],
+                1
+            );
+            int pageNumber = Math.Max(requestedPageNumber, 1);
+            long startIndex = ((long)pageNumber - 1L) * pageSize;
 
             List<string> searchFilters = new List<string>();
             if (!string.IsNullOrEmpty(searchPattern))
@@ -647,12 +667,9 @@ namespace MCPForUnity.Editor.Tools
                 folderScope = new string[] { AssetPathUtility.SanitizeAssetPath(pathScope) };
                 if (!AssetDatabase.IsValidFolder(folderScope[0]))
                 {
-                    // Maybe the user provided a file path instead of a folder?
-                    // We could search in the containing folder, or return an error.
-                    McpLog.Warn(
-                        $"Search path '{folderScope[0]}' is not a valid folder. Searching entire project."
+                    return new ErrorResponse(
+                        $"Search path '{folderScope[0]}' is not a valid folder. Refusing to broaden the search to the entire project."
                     );
-                    folderScope = null; // Search everywhere if path isn't a folder
                 }
             }
 
@@ -684,7 +701,7 @@ namespace MCPForUnity.Editor.Tools
                     string.Join(" ", searchFilters),
                     folderScope
                 );
-                List<object> results = new List<object>();
+                List<string> pagePaths = new(pageSize);
                 int totalFound = 0;
 
                 foreach (string guid in guids)
@@ -705,13 +722,21 @@ namespace MCPForUnity.Editor.Tools
                         }
                     }
 
-                    totalFound++; // Count matching assets before pagination
-                    results.Add(GetAssetData(assetPath, generatePreview));
+                    if (totalFound >= startIndex && pagePaths.Count < pageSize)
+                    {
+                        pagePaths.Add(assetPath);
+                    }
+
+                    totalFound++;
                 }
 
-                // Apply pagination
-                int startIndex = (pageNumber - 1) * pageSize;
-                var pagedResults = results.Skip(startIndex).Take(pageSize).ToList();
+                List<object> pagedResults = new(pagePaths.Count);
+                foreach (string assetPath in pagePaths)
+                {
+                    pagedResults.Add(
+                        GetAssetData(assetPath, generatePreview, loadAsset: generatePreview)
+                    );
+                }
 
                 return new SuccessResponse(
                     $"Found {totalFound} asset(s). Returning page {pageNumber} ({pagedResults.Count} assets).",
@@ -720,6 +745,7 @@ namespace MCPForUnity.Editor.Tools
                         totalAssets = totalFound,
                         pageSize = pageSize,
                         pageNumber = pageNumber,
+                        hasNextPage = startIndex + pagedResults.Count < totalFound,
                         assets = pagedResults,
                     }
                 );
@@ -1031,14 +1057,29 @@ namespace MCPForUnity.Editor.Tools
         /// <summary>
         /// Creates a serializable representation of an asset.
         /// </summary>
-        private static object GetAssetData(string path, bool generatePreview = false)
+        /// <param name="path">Project-relative asset path.</param>
+        /// <param name="generatePreview">Whether to generate and encode an asset preview.</param>
+        /// <param name="loadAsset">
+        /// Whether to load the Unity object to include its instance ID. Search results disable this
+        /// unless previews are requested so pagination remains memory-bounded.
+        /// </param>
+        private static object GetAssetData(
+            string path,
+            bool generatePreview = false,
+            bool loadAsset = true
+        )
         {
             if (string.IsNullOrEmpty(path) || !AssetExists(path))
                 return null;
 
             string guid = AssetDatabase.AssetPathToGUID(path);
             Type assetType = AssetDatabase.GetMainAssetTypeAtPath(path);
-            UnityEngine.Object asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+            UnityEngine.Object asset = null;
+            if (loadAsset || generatePreview)
+            {
+                asset = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(path);
+            }
+
             string previewBase64 = null;
             int previewWidth = 0;
             int previewHeight = 0;

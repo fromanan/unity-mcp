@@ -18,6 +18,9 @@ namespace MCPForUnity.Editor.Services.Server
     {
         private static readonly SemaphoreSlim InstallGate = new SemaphoreSlim(1, 1);
         private const int InstallTimeoutMs = 180000;
+        private const int FinalizationMoveAttempts = 15;
+        private const int FinalizationInitialRetryDelayMs = 100;
+        private const int FinalizationMaximumRetryDelayMs = 1000;
 
         public bool EnsureInstalled(out InstalledServerRuntime runtime, out string error)
         {
@@ -184,7 +187,10 @@ namespace MCPForUnity.Editor.Services.Server
                         EnsureChildOfRuntimeRoot(target);
                         Directory.Delete(target, true);
                     }
-                    Directory.Move(staging, target);
+                    await MoveDirectoryWithRetryAsync(
+                        staging,
+                        target,
+                        cancellationToken);
 
                     if (!TryCreateRuntime(
                         target,
@@ -361,6 +367,94 @@ namespace MCPForUnity.Editor.Services.Server
                 ["serverExecutable"] = runtime.ServerExecutable,
                 ["supervisorExecutable"] = runtime.SupervisorExecutable
             };
+        }
+
+        private static Task MoveDirectoryWithRetryAsync(
+            string source,
+            string target,
+            CancellationToken cancellationToken)
+        {
+            return MoveDirectoryWithRetryAsync(
+                source,
+                target,
+                cancellationToken,
+                FinalizationMoveAttempts,
+                FinalizationInitialRetryDelayMs,
+                FinalizationMaximumRetryDelayMs,
+                Directory.Move,
+                (delayMs, token) => Task.Delay(delayMs, token));
+        }
+
+        internal static async Task MoveDirectoryWithRetryAsync(
+            string source,
+            string target,
+            CancellationToken cancellationToken,
+            int maximumAttempts,
+            int initialRetryDelayMs,
+            int maximumRetryDelayMs,
+            Action<string, string> moveDirectory,
+            Func<int, CancellationToken, Task> delayAsync)
+        {
+            if (maximumAttempts < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maximumAttempts));
+            }
+            if (initialRetryDelayMs < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(initialRetryDelayMs));
+            }
+            if (maximumRetryDelayMs < initialRetryDelayMs)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maximumRetryDelayMs));
+            }
+            if (moveDirectory == null)
+            {
+                throw new ArgumentNullException(nameof(moveDirectory));
+            }
+            if (delayAsync == null)
+            {
+                throw new ArgumentNullException(nameof(delayAsync));
+            }
+
+            int retryDelayMs = initialRetryDelayMs;
+            for (int attempt = 1; attempt <= maximumAttempts; attempt++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    moveDirectory(source, target);
+                    return;
+                }
+                catch (UnauthorizedAccessException ex)
+                {
+                    if (attempt == maximumAttempts)
+                    {
+                        throw BuildFinalizationException(source, target, maximumAttempts, ex);
+                    }
+                }
+                catch (IOException ex)
+                {
+                    if (attempt == maximumAttempts)
+                    {
+                        throw BuildFinalizationException(source, target, maximumAttempts, ex);
+                    }
+                }
+
+                await delayAsync(retryDelayMs, cancellationToken);
+                retryDelayMs = Math.Min(retryDelayMs * 2, maximumRetryDelayMs);
+            }
+        }
+
+        private static IOException BuildFinalizationException(
+            string source,
+            string target,
+            int attempts,
+            Exception innerException)
+        {
+            return new IOException(
+                $"Could not finalize the MCP server runtime after {attempts} attempts " +
+                $"by moving '{source}' to '{target}'. {innerException.Message}",
+                innerException);
         }
 
         private static async Task<ProbeResult> ProbeRuntimeAsync(

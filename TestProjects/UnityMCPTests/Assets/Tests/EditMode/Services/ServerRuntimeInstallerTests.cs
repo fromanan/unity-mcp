@@ -1,3 +1,7 @@
+using System;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 using MCPForUnity.Editor.Services.Server;
 using NUnit.Framework;
 using UnityEngine;
@@ -34,7 +38,7 @@ namespace MCPForUnityTests.Editor.Services
         [Test]
         public void BuildRuntimeManifest_UsesFinalRuntimeExecutablePaths()
         {
-            var runtime = new InstalledServerRuntime(
+            InstalledServerRuntime runtime = new InstalledServerRuntime(
                 @"C:\project\Library\MCPForUnity\ServerRuntime\final",
                 @"C:\project\Library\MCPForUnity\ServerRuntime\final\Scripts\mcp-for-unity.exe",
                 @"C:\project\Library\MCPForUnity\ServerRuntime\final\Scripts\mcp-for-unity-supervisor.exe",
@@ -42,7 +46,7 @@ namespace MCPForUnityTests.Editor.Services
                 "10.1.1-beta.2",
                 @"C:\source\Server");
 
-            var manifest = ServerRuntimeInstaller.BuildRuntimeManifest(
+            Newtonsoft.Json.Linq.JObject manifest = ServerRuntimeInstaller.BuildRuntimeManifest(
                 runtime,
                 runtime.Version,
                 runtime.Source,
@@ -54,6 +58,62 @@ namespace MCPForUnityTests.Editor.Services
                 runtime.SupervisorExecutable,
                 manifest["supervisorExecutable"]?.ToString());
             StringAssert.DoesNotContain(".staging-", manifest.ToString());
+        }
+
+        [Test]
+        public async Task MoveDirectoryWithRetryAsync_RetriesTransientAccessDenial()
+        {
+            int attempts = 0;
+            int delays = 0;
+
+            await ServerRuntimeInstaller.MoveDirectoryWithRetryAsync(
+                "staging",
+                "target",
+                CancellationToken.None,
+                4,
+                1,
+                4,
+                (_, _) =>
+                {
+                    attempts++;
+                    if (attempts < 3)
+                    {
+                        throw new UnauthorizedAccessException("runtime is still in use");
+                    }
+                },
+                (_, _) =>
+                {
+                    delays++;
+                    return Task.CompletedTask;
+                });
+
+            Assert.AreEqual(3, attempts);
+            Assert.AreEqual(2, delays);
+        }
+
+        [Test]
+        public void MoveDirectoryWithRetryAsync_ReportsBoundedFailure()
+        {
+            int attempts = 0;
+
+            IOException exception = Assert.ThrowsAsync<IOException>(async () =>
+                await ServerRuntimeInstaller.MoveDirectoryWithRetryAsync(
+                    "staging",
+                    "target",
+                    CancellationToken.None,
+                    3,
+                    1,
+                    4,
+                    (_, _) =>
+                    {
+                        attempts++;
+                        throw new UnauthorizedAccessException("runtime is still in use");
+                    },
+                    (_, _) => Task.CompletedTask));
+
+            Assert.AreEqual(3, attempts);
+            StringAssert.Contains("after 3 attempts", exception.Message);
+            Assert.IsInstanceOf<UnauthorizedAccessException>(exception.InnerException);
         }
 
         [TestCase(-1f, 0f)]

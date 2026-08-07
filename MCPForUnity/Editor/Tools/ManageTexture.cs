@@ -1112,7 +1112,8 @@ namespace MCPForUnity.Editor.Tools
 
         private static string GetAbsolutePath(string assetPath)
         {
-            return Path.Combine(Directory.GetCurrentDirectory(), assetPath);
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            return Path.GetFullPath(Path.Combine(projectRoot, assetPath));
         }
 
         private static string ResolveImagePath(string imagePath)
@@ -1120,7 +1121,8 @@ namespace MCPForUnity.Editor.Tools
             if (Path.IsPathRooted(imagePath))
                 return imagePath;
 
-            return Path.Combine(Directory.GetCurrentDirectory(), imagePath);
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            return Path.GetFullPath(Path.Combine(projectRoot, imagePath));
         }
     }
 }

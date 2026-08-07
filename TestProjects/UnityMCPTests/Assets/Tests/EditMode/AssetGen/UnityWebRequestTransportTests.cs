@@ -35,5 +35,18 @@ namespace MCPForUnityTests.Editor.AssetGen
 
             Assert.IsFalse(UnityWebRequestTransport.CarriesAuth(spec));
         }
+
+        [Test]
+        public void EffectiveResponseLimit_IsBoundedEvenWhenCallerRequestsMore()
+        {
+            var spec = new HttpRequestSpec
+            {
+                MaxResponseBytes = long.MaxValue
+            };
+
+            Assert.AreEqual(
+                UnityWebRequestTransport.MaximumSupportedResponseBytes,
+                UnityWebRequestTransport.EffectiveResponseLimit(spec));
+        }
     }
 }

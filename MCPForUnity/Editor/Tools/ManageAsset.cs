@@ -30,6 +30,12 @@ namespace MCPForUnity.Editor.Tools
         private const int MaxSearchPageSize = 100;
         private const int MaxPreviewSearchPageSize = 10;
 
+        private static string GetProjectAbsolutePath(string projectRelativePath)
+        {
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            return Path.GetFullPath(Path.Combine(projectRoot, projectRelativePath));
+        }
+
         // --- Main Handler ---
 
         // Define the list of valid actions
@@ -182,9 +188,9 @@ namespace MCPForUnity.Editor.Tools
             string directory = Path.GetDirectoryName(fullPath);
 
             // Ensure directory exists
-            if (!Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), directory)))
+            if (!Directory.Exists(GetProjectAbsolutePath(directory)))
             {
-                Directory.CreateDirectory(Path.Combine(Directory.GetCurrentDirectory(), directory));
+                Directory.CreateDirectory(GetProjectAbsolutePath(directory));
                 AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); // Make sure Unity knows about the new folder
             }
 
@@ -260,7 +266,7 @@ namespace MCPForUnity.Editor.Tools
 
                 if (
                     newAsset == null
-                    && !Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), fullPath))
+                    && !Directory.Exists(GetProjectAbsolutePath(fullPath))
                 ) // Check if it wasn't a folder and asset wasn't created
                 {
                     return new ErrorResponse(
@@ -714,7 +720,7 @@ namespace MCPForUnity.Editor.Tools
                     if (filterDateAfter.HasValue)
                     {
                         DateTime lastWriteTime = File.GetLastWriteTimeUtc(
-                            Path.Combine(Directory.GetCurrentDirectory(), assetPath)
+                            GetProjectAbsolutePath(assetPath)
                         );
                         if (lastWriteTime <= filterDateAfter.Value)
                         {
@@ -870,13 +876,13 @@ namespace MCPForUnity.Editor.Tools
             }
             // AssetPathToGUID might not work for newly created folders not yet refreshed.
             // Check directory explicitly for folders.
-            if (Directory.Exists(Path.Combine(Directory.GetCurrentDirectory(), sanitizedPath)))
+            if (Directory.Exists(GetProjectAbsolutePath(sanitizedPath)))
             {
                 // Check if it's considered a *valid* folder by Unity
                 return AssetDatabase.IsValidFolder(sanitizedPath);
             }
             // Check file existence for non-folder assets.
-            if (File.Exists(Path.Combine(Directory.GetCurrentDirectory(), sanitizedPath)))
+            if (File.Exists(GetProjectAbsolutePath(sanitizedPath)))
             {
                 return true; // Assume if file exists, it's an asset or will be imported
             }
@@ -892,7 +898,7 @@ namespace MCPForUnity.Editor.Tools
         {
             if (string.IsNullOrEmpty(directoryPath))
                 return;
-            string fullDirPath = Path.Combine(Directory.GetCurrentDirectory(), directoryPath);
+            string fullDirPath = GetProjectAbsolutePath(directoryPath);
             if (!Directory.Exists(fullDirPath))
             {
                 Directory.CreateDirectory(fullDirPath);
@@ -1148,7 +1154,7 @@ namespace MCPForUnity.Editor.Tools
                 isFolder = AssetDatabase.IsValidFolder(path),
                 instanceID = asset?.GetInstanceIDCompat() ?? 0,
                 lastWriteTimeUtc = File.GetLastWriteTimeUtc(
-                        Path.Combine(Directory.GetCurrentDirectory(), path)
+                        GetProjectAbsolutePath(path)
                     )
                     .ToString("o"), // ISO 8601
                 // --- Preview Data ---

@@ -1,4 +1,6 @@
 using System;
+using System.IO;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine.Networking;
@@ -13,15 +15,52 @@ namespace MCPForUnity.Editor.Services.AssetGen.Http
     /// </summary>
     public sealed class UnityWebRequestTransport : IHttpTransport
     {
+        internal const long MaximumSupportedResponseBytes = 512L * 1024L * 1024L;
+
+        private sealed class BoundedDownloadHandler : DownloadHandlerScript
+        {
+            private readonly MemoryStream _buffer = new MemoryStream();
+            private readonly long _maximumBytes;
+
+            internal bool ExceededLimit { get; private set; }
+
+            internal BoundedDownloadHandler(long maximumBytes)
+                : base(new byte[64 * 1024])
+            {
+                _maximumBytes = maximumBytes;
+            }
+
+            protected override bool ReceiveData(byte[] data, int dataLength)
+            {
+                if (data == null || dataLength <= 0) return true;
+                if (_buffer.Length + dataLength > _maximumBytes)
+                {
+                    ExceededLimit = true;
+                    return false;
+                }
+
+                _buffer.Write(data, 0, dataLength);
+                return true;
+            }
+
+            internal byte[] GetBytes() => ExceededLimit ? null : _buffer.ToArray();
+            internal void DisposeBuffer() => _buffer.Dispose();
+        }
+
         public Task<HttpResult> SendAsync(HttpRequestSpec spec, CancellationToken ct)
         {
             if (spec == null) throw new ArgumentNullException(nameof(spec));
 
+            long responseLimit = EffectiveResponseLimit(spec);
+
             var tcs = new TaskCompletionSource<HttpResult>();
+
+            var downloadHandler = new BoundedDownloadHandler(responseLimit);
 
             var request = new UnityWebRequest(spec.Url, spec.Method ?? UnityWebRequest.kHttpVerbGET)
             {
-                downloadHandler = new DownloadHandlerBuffer()
+                downloadHandler = downloadHandler,
+                redirectLimit = 0
             };
             if (spec.Body != null)
             {
@@ -38,11 +77,6 @@ namespace MCPForUnity.Editor.Services.AssetGen.Http
                     request.SetRequestHeader(kv.Key, kv.Value);
                 }
             }
-            // UnityWebRequest re-sends the Authorization header to a 3xx target by default. Never
-            // follow a redirect on an auth-bearing request — the key must not leak to the redirect
-            // host. No-auth downloads may still follow.
-            if (CarriesAuth(spec)) request.redirectLimit = 0;
-
             CancellationTokenRegistration ctReg = default;
             if (ct.CanBeCanceled)
             {
@@ -58,12 +92,16 @@ namespace MCPForUnity.Editor.Services.AssetGen.Http
             {
                 try
                 {
+                    byte[] body = downloadHandler.GetBytes();
                     var result = new HttpResult
                     {
                         Status = (int)request.responseCode,
-                        Body = request.downloadHandler?.data,
-                        Text = request.downloadHandler?.text,
-                        IsSuccess = request.result == UnityWebRequest.Result.Success
+                        Body = body,
+                        Text = body == null || !spec.DecodeResponseText
+                            ? null
+                            : Encoding.UTF8.GetString(body),
+                        IsSuccess = !downloadHandler.ExceededLimit
+                            && request.result == UnityWebRequest.Result.Success
                     };
                     tcs.TrySetResult(result);
                 }
@@ -75,10 +113,18 @@ namespace MCPForUnity.Editor.Services.AssetGen.Http
                 {
                     ctReg.Dispose();
                     request.Dispose();
+                    downloadHandler.DisposeBuffer();
                 }
             };
 
             return tcs.Task;
+        }
+
+        internal static long EffectiveResponseLimit(HttpRequestSpec spec)
+        {
+            long requested = spec?.MaxResponseBytes ?? 0;
+            if (requested <= 0) return 16L * 1024L * 1024L;
+            return Math.Min(requested, MaximumSupportedResponseBytes);
         }
 
         /// <summary>True iff the request carries an Authorization header (case-insensitive key).</summary>

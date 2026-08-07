@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
@@ -104,15 +105,50 @@ namespace MCPForUnity.Editor.Helpers
         {
             public readonly List<PropertyInfo> SerializableProperties;
             public readonly List<FieldInfo> SerializableFields;
+            public readonly List<string> OmittedPropertyNames;
 
-            public CachedMetadata(List<PropertyInfo> properties, List<FieldInfo> fields)
+            public CachedMetadata(List<PropertyInfo> properties, List<FieldInfo> fields, List<string> omittedPropertyNames)
             {
                 SerializableProperties = properties;
                 SerializableFields = fields;
+                OmittedPropertyNames = omittedPropertyNames;
             }
         }
         // Key becomes Tuple<Type, bool>
         private static readonly Dictionary<Tuple<Type, bool>, CachedMetadata> _metadataCache = new Dictionary<Tuple<Type, bool>, CachedMetadata>();
+        private const int MaxComponentValueNodes = 4096;
+        private const int MaxCollectionItems = 128;
+        private const int MaxObjectFields = 64;
+        private const int MaxSerializationDepth = 6;
+        private const int MaxStringCharacters = 8192;
+
+        private sealed class SerializationBudget
+        {
+            public int RemainingNodes { get; private set; }
+            public bool Truncated { get; private set; }
+
+            public SerializationBudget(int maxNodes)
+            {
+                RemainingNodes = maxNodes;
+            }
+
+            public bool TryConsume()
+            {
+                if (RemainingNodes <= 0)
+                {
+                    Truncated = true;
+                    return false;
+                }
+
+                RemainingNodes--;
+                return true;
+            }
+
+            public void MarkTruncated()
+            {
+                Truncated = true;
+            }
+        }
         // --- End Metadata Caching ---
 
         /// <summary>
@@ -172,6 +208,11 @@ namespace MCPForUnity.Editor.Helpers
             if (fullName != null && _crashingTypeNames.Contains(fullName))
                 return true;
 
+            // Unity 6.3 TransformHandles are native handles whose enumerable properties throw
+            // when the handle is not initialized or its backing object has been destroyed.
+            if (fullName == "UnityEngine.TransformHandle")
+                return true;
+
             if (type.IsGenericType)
             {
                 string genericFullName = type.GetGenericTypeDefinition()?.FullName;
@@ -196,6 +237,39 @@ namespace MCPForUnity.Editor.Helpers
             }
 
             return false;
+        }
+
+        private static bool IsPotentiallyUnboundedProperty(Type componentType, PropertyInfo property)
+        {
+            if (property == null || property.PropertyType == typeof(string)) return false;
+
+            string propertyName = property.Name;
+            if (typeof(Renderer).IsAssignableFrom(componentType)
+                && (propertyName == "material" || propertyName == "materials"))
+            {
+                return false;
+            }
+
+            if (typeof(MeshFilter).IsAssignableFrom(componentType) && propertyName == "mesh")
+            {
+                return false;
+            }
+
+            Type propertyType = property.PropertyType;
+            return propertyType.IsArray || typeof(IEnumerable).IsAssignableFrom(propertyType);
+        }
+
+        private static bool IsUnavailableNavMeshAgentProperty(Component component, string propertyName)
+        {
+            if (!(component is UnityEngine.AI.NavMeshAgent navMeshAgent))
+                return false;
+
+            bool requiresActiveAgent = propertyName == nameof(UnityEngine.AI.NavMeshAgent.remainingDistance)
+                || propertyName == nameof(UnityEngine.AI.NavMeshAgent.isStopped);
+            if (!requiresActiveAgent)
+                return false;
+
+            return !navMeshAgent.isActiveAndEnabled || !navMeshAgent.isOnNavMesh;
         }
 
         /// <summary>
@@ -237,6 +311,7 @@ namespace MCPForUnity.Editor.Helpers
 
             if (c == null) return null;
             Type componentType = c.GetType();
+            var serializationBudget = new SerializationBudget(MaxComponentValueNodes);
 
             // --- Special handling for Transform to avoid reflection crashes and problematic properties --- 
             if (componentType == typeof(Transform))
@@ -311,7 +386,7 @@ namespace MCPForUnity.Editor.Helpers
                         var value = prop.Value();
                         if (value != null)
                         {
-                            AddSerializableValue(cameraProperties, prop.Key, value.GetType(), value);
+                            AddSerializableValue(cameraProperties, prop.Key, value.GetType(), value, serializationBudget);
                         }
                     }
                     catch (Exception)
@@ -408,6 +483,7 @@ namespace MCPForUnity.Editor.Helpers
             {
                 var propertiesToCache = new List<PropertyInfo>();
                 var fieldsToCache = new List<FieldInfo>();
+                var omittedPropertyNames = new List<string>();
 
                 // Traverse the hierarchy from the component type up to MonoBehaviour
                 Type currentType = componentType;
@@ -421,7 +497,12 @@ namespace MCPForUnity.Editor.Helpers
                         if (!propInfo.CanRead || propInfo.GetIndexParameters().Length > 0 || propInfo.Name == "transform") continue;
                         // Skip properties whose return type would crash when accessed via reflection
                         // (e.g. Fusion IL-weaved types, Span<>, ReadOnlySpan<>, pointers)
-                        if (IsUnsafeType(propInfo.PropertyType)) continue;
+                        if (IsUnsafeType(propInfo.PropertyType) || IsPotentiallyUnboundedProperty(componentType, propInfo))
+                        {
+                            if (omittedPropertyNames.Count < MaxObjectFields)
+                                omittedPropertyNames.Add(propInfo.Name);
+                            continue;
+                        }
                         // Add if not already added (handles overrides - keep the most derived version)
                         if (!propertiesToCache.Any(p => p.Name == propInfo.Name))
                         {
@@ -468,7 +549,7 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 // --- End Hierarchy Traversal ---
 
-                cachedData = new CachedMetadata(propertiesToCache, fieldsToCache);
+                cachedData = new CachedMetadata(propertiesToCache, fieldsToCache, omittedPropertyNames);
                 _metadataCache[cacheKey] = cachedData; // Add to cache with combined key
             }
             // --- End Get Cached or Generate Metadata ---
@@ -536,6 +617,11 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 // --- End Skip Collider Properties ---
 
+                if (IsUnavailableNavMeshAgentProperty(c, propName))
+                {
+                    skipProperty = true;
+                }
+
                 // Skip if flagged
                 if (skipProperty)
                 {
@@ -548,11 +634,11 @@ namespace MCPForUnity.Editor.Helpers
                     // McpLog.Info($"[GetComponentData] Accessing: {componentType.Name}.{propName}");
                     // --- End detailed logging ---
 
-                    // --- Special handling for material/mesh properties in edit mode ---
+                    // --- Special handling for material/mesh properties ---
                     object value;
-                    if (!Application.isPlaying && (propName == "material" || propName == "materials" || propName == "mesh"))
+                    if (propName == "material" || propName == "materials" || propName == "mesh")
                     {
-                        // In edit mode, use sharedMaterial/sharedMesh to avoid instantiation warnings
+                        // Inspection must never instantiate per-renderer materials or duplicate a mesh.
                         if ((propName == "material" || propName == "materials") && c is Renderer renderer)
                         {
                             if (propName == "material")
@@ -577,7 +663,7 @@ namespace MCPForUnity.Editor.Helpers
                     // --- End special handling ---
 
                     Type propType = propInfo.PropertyType;
-                    AddSerializableValue(serializablePropertiesOutput, propName, propType, value);
+                    AddSerializableValue(serializablePropertiesOutput, propName, propType, value, serializationBudget);
                 }
                 catch (Exception)
                 {
@@ -600,7 +686,7 @@ namespace MCPForUnity.Editor.Helpers
                     object value = fieldInfo.GetValue(c);
                     string fieldName = fieldInfo.Name;
                     Type fieldType = fieldInfo.FieldType;
-                    AddSerializableValue(serializablePropertiesOutput, fieldName, fieldType, value);
+                    AddSerializableValue(serializablePropertiesOutput, fieldName, fieldType, value, serializationBudget);
                 }
                 catch (Exception)
                 {
@@ -614,11 +700,28 @@ namespace MCPForUnity.Editor.Helpers
                 data["properties"] = serializablePropertiesOutput;
             }
 
+            if (serializationBudget.Truncated || cachedData.OmittedPropertyNames.Count > 0)
+            {
+                data["serialization"] = new Dictionary<string, object>
+                {
+                    { "truncated", serializationBudget.Truncated },
+                    { "maxNodes", MaxComponentValueNodes },
+                    { "maxCollectionItems", MaxCollectionItems },
+                    { "maxDepth", MaxSerializationDepth },
+                    { "omittedProperties", cachedData.OmittedPropertyNames }
+                };
+            }
+
             return data;
         }
 
         // Helper function to decide how to serialize different types
-        private static void AddSerializableValue(Dictionary<string, object> dict, string name, Type type, object value)
+        private static void AddSerializableValue(
+            Dictionary<string, object> dict,
+            string name,
+            Type type,
+            object value,
+            SerializationBudget budget)
         {
             // Simplified: Directly use CreateTokenFromValue which uses the serializer
             if (value == null)
@@ -629,14 +732,7 @@ namespace MCPForUnity.Editor.Helpers
 
             try
             {
-                // Use the helper that employs our custom serializer settings
-                JToken token = CreateTokenFromValue(value, type);
-                if (token != null) // Check if serialization succeeded in the helper
-                {
-                    // Convert JToken back to a basic object structure for the dictionary
-                    dict[name] = ConvertJTokenToPlainObject(token);
-                }
-                // If token is null, it means serialization failed and a warning was logged.
+                dict[name] = ConvertValueToBoundedObject(value, type, budget, 0);
             }
             catch (Exception e)
             {
@@ -645,26 +741,204 @@ namespace MCPForUnity.Editor.Helpers
             }
         }
 
-        // Helper to convert JToken back to basic object structure
-        private static object ConvertJTokenToPlainObject(JToken token)
+        public static object SerializeValue(object value)
         {
-            if (token == null) return null;
+            if (value == null) return null;
+            if (value is GameObject gameObject) return GetGameObjectData(gameObject);
+            if (value is Component component) return GetComponentData(component, includeNonPublicSerializedFields: false);
+
+            var budget = new SerializationBudget(MaxComponentValueNodes);
+            object serialized = ConvertValueToBoundedObject(value, value.GetType(), budget, 0);
+            if (!budget.Truncated) return serialized;
+
+            return new Dictionary<string, object>
+            {
+                { "value", serialized },
+                { "serialization", new Dictionary<string, object>
+                    {
+                        { "truncated", true },
+                        { "maxNodes", MaxComponentValueNodes },
+                        { "maxCollectionItems", MaxCollectionItems },
+                        { "maxDepth", MaxSerializationDepth }
+                    }
+                }
+            };
+        }
+
+        private static object ConvertValueToBoundedObject(
+            object value,
+            Type declaredType,
+            SerializationBudget budget,
+            int depth)
+        {
+            if (value == null) return null;
+            if (!budget.TryConsume()) return TruncationMarker("node_budget");
+            if (depth > MaxSerializationDepth)
+            {
+                budget.MarkTruncated();
+                return TruncationMarker("max_depth");
+            }
+
+            Type runtimeType = value.GetType();
+            if (IsUnsafeType(declaredType) || IsUnsafeType(runtimeType))
+            {
+                budget.MarkTruncated();
+                return TruncationMarker("unsafe_type", runtimeType.FullName);
+            }
+
+            if (value is string text)
+            {
+                if (text.Length <= MaxStringCharacters) return text;
+                budget.MarkTruncated();
+                return text.Substring(0, MaxStringCharacters) + "...[truncated]";
+            }
+
+            if (runtimeType.IsPrimitive || runtimeType.IsEnum || value is decimal)
+                return value;
+            if (value is DateTime || value is DateTimeOffset || value is Guid || value is TimeSpan || value is Uri)
+                return value.ToString();
+            if (value is UnityEngine.Object unityObject)
+                return SerializeAssetReference(unityObject);
+
+            if (value is Vector2 || value is Vector3 || value is Vector4 || value is Quaternion
+                || value is Color || value is Rect || value is Bounds || value is Matrix4x4)
+            {
+                JToken token = CreateTokenFromValue(value, runtimeType);
+                return ConvertJTokenToBoundedObject(token, budget, depth + 1);
+            }
+
+            if (value is JToken jToken)
+                return ConvertJTokenToBoundedObject(jToken, budget, depth + 1);
+
+            if (value is IDictionary dictionary)
+            {
+                var result = new Dictionary<string, object>();
+                int count = 0;
+                foreach (DictionaryEntry entry in dictionary)
+                {
+                    if (count++ >= MaxCollectionItems || budget.RemainingNodes <= 0)
+                    {
+                        budget.MarkTruncated();
+                        result["_truncated"] = true;
+                        break;
+                    }
+
+                    string key = entry.Key?.ToString() ?? "null";
+                    result[key] = ConvertValueToBoundedObject(
+                        entry.Value,
+                        entry.Value?.GetType(),
+                        budget,
+                        depth + 1);
+                }
+                return result;
+            }
+
+            if (value is IEnumerable enumerable)
+            {
+                var result = new List<object>();
+                int count = 0;
+                try
+                {
+                    foreach (object item in enumerable)
+                    {
+                        if (count++ >= MaxCollectionItems || budget.RemainingNodes <= 0)
+                        {
+                            budget.MarkTruncated();
+                            result.Add(TruncationMarker("max_collection_items"));
+                            break;
+                        }
+
+                        result.Add(ConvertValueToBoundedObject(
+                            item,
+                            item?.GetType(),
+                            budget,
+                            depth + 1));
+                    }
+                }
+                catch (Exception e)
+                {
+                    budget.MarkTruncated();
+                    result.Add(TruncationMarker("enumeration_failed", e.GetType().Name));
+                }
+                return result;
+            }
+
+            var objectResult = new Dictionary<string, object>
+            {
+                { "_type", runtimeType.FullName }
+            };
+            FieldInfo[] fields = runtimeType.GetFields(BindingFlags.Public | BindingFlags.Instance);
+            int fieldCount = 0;
+            foreach (FieldInfo field in fields)
+            {
+                if (fieldCount++ >= MaxObjectFields || budget.RemainingNodes <= 0)
+                {
+                    budget.MarkTruncated();
+                    objectResult["_truncated"] = true;
+                    break;
+                }
+                if (IsUnsafeType(field.FieldType)) continue;
+
+                try
+                {
+                    object fieldValue = field.GetValue(value);
+                    objectResult[field.Name] = ConvertValueToBoundedObject(
+                        fieldValue,
+                        field.FieldType,
+                        budget,
+                        depth + 1);
+                }
+                catch (Exception e)
+                {
+                    objectResult[field.Name] = new Dictionary<string, object>
+                    {
+                        { "_error", e.GetType().Name }
+                    };
+                }
+            }
+            return objectResult;
+        }
+
+        private static object ConvertJTokenToBoundedObject(JToken token, SerializationBudget budget, int depth)
+        {
+            if (token == null || token.Type == JTokenType.Null || token.Type == JTokenType.Undefined)
+                return null;
+            if (!budget.TryConsume()) return TruncationMarker("node_budget");
+            if (depth > MaxSerializationDepth)
+            {
+                budget.MarkTruncated();
+                return TruncationMarker("max_depth");
+            }
 
             switch (token.Type)
             {
                 case JTokenType.Object:
                     var objDict = new Dictionary<string, object>();
+                    int propertyCount = 0;
                     foreach (var prop in ((JObject)token).Properties())
                     {
-                        objDict[prop.Name] = ConvertJTokenToPlainObject(prop.Value);
+                        if (propertyCount++ >= MaxObjectFields || budget.RemainingNodes <= 0)
+                        {
+                            budget.MarkTruncated();
+                            objDict["_truncated"] = true;
+                            break;
+                        }
+                        objDict[prop.Name] = ConvertJTokenToBoundedObject(prop.Value, budget, depth + 1);
                     }
                     return objDict;
 
                 case JTokenType.Array:
                     var list = new List<object>();
+                    int itemCount = 0;
                     foreach (var item in (JArray)token)
                     {
-                        list.Add(ConvertJTokenToPlainObject(item));
+                        if (itemCount++ >= MaxCollectionItems || budget.RemainingNodes <= 0)
+                        {
+                            budget.MarkTruncated();
+                            list.Add(TruncationMarker("max_collection_items"));
+                            break;
+                        }
+                        list.Add(ConvertJTokenToBoundedObject(item, budget, depth + 1));
                     }
                     return list;
 
@@ -673,7 +947,10 @@ namespace MCPForUnity.Editor.Helpers
                 case JTokenType.Float:
                     return token.ToObject<double>(); // Use double for safety
                 case JTokenType.String:
-                    return token.ToObject<string>();
+                    string tokenText = token.ToObject<string>();
+                    if (tokenText == null || tokenText.Length <= MaxStringCharacters) return tokenText;
+                    budget.MarkTruncated();
+                    return tokenText.Substring(0, MaxStringCharacters) + "...[truncated]";
                 case JTokenType.Boolean:
                     return token.ToObject<bool>();
                 case JTokenType.Date:
@@ -685,7 +962,10 @@ namespace MCPForUnity.Editor.Helpers
                 case JTokenType.TimeSpan:
                     return token.ToObject<TimeSpan>();
                 case JTokenType.Bytes:
-                    return token.ToObject<byte[]>();
+                    byte[] bytes = token.ToObject<byte[]>();
+                    if (bytes == null || bytes.Length <= MaxCollectionItems) return bytes;
+                    budget.MarkTruncated();
+                    return bytes.Take(MaxCollectionItems).ToArray();
                 case JTokenType.Null:
                     return null;
                 case JTokenType.Undefined:
@@ -702,6 +982,17 @@ namespace MCPForUnity.Editor.Helpers
             }
         }
 
+        private static Dictionary<string, object> TruncationMarker(string reason, string detail = null)
+        {
+            var marker = new Dictionary<string, object>
+            {
+                { "_truncated", true },
+                { "reason", reason }
+            };
+            if (!string.IsNullOrEmpty(detail)) marker["detail"] = detail;
+            return marker;
+        }
+
         // --- Define custom JsonSerializerSettings for OUTPUT ---
         private static readonly JsonSerializerSettings _outputSerializerSettings = new JsonSerializerSettings
         {
@@ -709,6 +1000,7 @@ namespace MCPForUnity.Editor.Helpers
             {
                 new Vector3Converter(),
                 new Vector2Converter(),
+                new Vector4Converter(),
                 new QuaternionConverter(),
                 new ColorConverter(),
                 new RectConverter(),

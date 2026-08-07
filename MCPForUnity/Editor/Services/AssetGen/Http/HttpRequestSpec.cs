@@ -14,5 +14,7 @@ namespace MCPForUnity.Editor.Services.AssetGen.Http
         public Dictionary<string, string> Headers = new Dictionary<string, string>();
         public byte[] Body;
         public string ContentType;
+        public long MaxResponseBytes = 16L * 1024L * 1024L;
+        public bool DecodeResponseText = true;
     }
 }

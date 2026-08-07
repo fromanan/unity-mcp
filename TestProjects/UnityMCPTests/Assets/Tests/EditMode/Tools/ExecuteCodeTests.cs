@@ -2,6 +2,7 @@ using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using MCPForUnity.Editor.Tools;
 using static MCPForUnityTests.Editor.TestUtilities;
+using UnityEngine;
 
 namespace MCPForUnityTests.Editor.Tools
 {
@@ -43,6 +44,25 @@ namespace MCPForUnityTests.Editor.Tools
             var data = result["data"] as JObject;
             if (data != null)
                 Assert.IsNull(data["result"], "Expected no 'result' key when code returns null");
+        }
+
+        [Test]
+        public void Execute_ReturnGameObject_UsesStableUnityReferenceSerialization()
+        {
+            var gameObject = new GameObject("ExecuteCodeSerializationTarget");
+            try
+            {
+                var result = Execute(
+                    "return UnityEngine.GameObject.Find(\"ExecuteCodeSerializationTarget\");");
+
+                Assert.IsTrue(result.Value<bool>("success"), result.ToString());
+                Assert.AreEqual(gameObject.GetInstanceID(), result["data"]["result"]["instanceID"].Value<int>());
+                Assert.AreEqual("ExecuteCodeSerializationTarget", result["data"]["result"]["name"].Value<string>());
+            }
+            finally
+            {
+                Object.DestroyImmediate(gameObject);
+            }
         }
 
         [Test]

@@ -229,9 +229,9 @@ namespace MCPForUnity.Runtime.Helpers
 #if UNITY_EDITOR
                 // In play mode, inline ScreenCapture reads a backbuffer before UITK has
                 // composited; route through WaitForEndOfFrame instead.
-                tex = Application.isPlaying
-                    ? CaptureCompositedAfterFrame(result.SuperSize)
-                    : ScreenCapture.CaptureScreenshotAsTexture(result.SuperSize);
+                // MCP commands already run inside Unity's player loop, so pumping another frame
+                // with EditorApplication.Step would recursively enter the PlayerLoop.
+                tex = ScreenCapture.CaptureScreenshotAsTexture(result.SuperSize);
 #else
                 tex = ScreenCapture.CaptureScreenshotAsTexture(result.SuperSize);
 #endif

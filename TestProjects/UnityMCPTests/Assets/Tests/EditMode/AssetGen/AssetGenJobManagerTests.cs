@@ -37,6 +37,9 @@ namespace MCPForUnityTests.Editor.AssetGen
             AssetGenJobManager.PollIntervalSeconds = 0;
             // Stub import: mark the asset path without touching AssetDatabase.
             AssetGenJobManager.ImportOverrideForTests = (job, path) => { job.AssetPath = path; return job; };
+            AssetGenJobManager.DownloadUrlValidatorOverrideForTests = url =>
+                Uri.TryCreate(url, UriKind.Absolute, out Uri uri)
+                && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
         }
 
         [TearDown]
@@ -262,7 +265,19 @@ namespace MCPForUnityTests.Editor.AssetGen
             Pump(job.JobId);
 
             Assert.AreEqual(AssetGenJobState.Failed, job.State);
-            StringAssert.Contains("http", job.Error.ToLowerInvariant());
+            StringAssert.Contains("unsafe", job.Error.ToLowerInvariant());
+        }
+
+        [Test]
+        public void DownloadUrlPolicy_RejectsLocalAndPrivateDestinations()
+        {
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("http://localhost/file.glb"));
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("https://127.0.0.1/file.glb"));
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("https://10.20.30.40/file.glb"));
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("https://[::1]/file.glb"));
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("https://[::ffff:10.20.30.40]/file.glb"));
+            Assert.IsFalse(AssetGenJobManager.IsAllowedDownloadUrl("http://2130706433/file.glb"));
+            Assert.IsTrue(AssetGenJobManager.IsAllowedDownloadUrl("https://8.8.8.8/file.glb"));
         }
 
         [Test]
@@ -286,6 +301,27 @@ namespace MCPForUnityTests.Editor.AssetGen
                 AssetGenJob job = AssetGenJobManager.StartModelGeneration(Req());
                 Assert.AreEqual(AssetGenJobState.Failed, job.State);
                 StringAssert.Contains("No API key", job.Error);
+            }
+            finally
+            {
+                MCPForUnity.Editor.Security.SecureKeyStore.ResetForTests();
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        [Test]
+        public void TerminalJobHistory_IsBounded()
+        {
+            Environment.SetEnvironmentVariable(EnvVar, null);
+            string dir = Path.Combine(Path.GetTempPath(), "mcp_jobmgr_retention_" + Guid.NewGuid().ToString("N"));
+            MCPForUnity.Editor.Security.SecureKeyStore.OverrideForTests(
+                new MCPForUnity.Editor.Security.EncryptedFileKeyStore(dir));
+            try
+            {
+                for (int i = 0; i < 105; i++)
+                    Assert.AreEqual(AssetGenJobState.Failed, AssetGenJobManager.StartModelGeneration(Req()).State);
+
+                Assert.AreEqual(100, AssetGenJobManager.RecentJobs(200).Count);
             }
             finally
             {

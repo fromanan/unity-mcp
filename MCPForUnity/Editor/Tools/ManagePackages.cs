@@ -24,6 +24,74 @@ namespace MCPForUnity.Editor.Tools
         // Pending list/search requests keyed by job ID
         private static readonly Dictionary<string, ListRequest> PendingListRequests = new();
         private static readonly Dictionary<string, SearchRequest> PendingSearchRequests = new();
+        private static readonly Dictionary<string, double> ReadRequestStartedAt = new();
+        private const int MaxPendingReadRequests = 64;
+        private const double CompletedReadRequestRetentionSeconds = 60.0;
+        private const double MaximumReadRequestLifetimeSeconds = 300.0;
+        private static bool ReadRequestCleanupHooked;
+        private static double NextReadRequestCleanupAt;
+
+        static ManagePackages()
+        {
+            AssemblyReloadEvents.beforeAssemblyReload += ClearReadRequests;
+            EditorApplication.quitting += ClearReadRequests;
+        }
+
+        private static bool EnsureReadRequestCapacity()
+        {
+            PruneReadRequests();
+            return PendingListRequests.Count + PendingSearchRequests.Count < MaxPendingReadRequests;
+        }
+
+        private static void TrackReadRequest(string jobId)
+        {
+            ReadRequestStartedAt[jobId] = EditorApplication.timeSinceStartup;
+            if (ReadRequestCleanupHooked) return;
+            EditorApplication.update += PruneReadRequests;
+            ReadRequestCleanupHooked = true;
+        }
+
+        private static void PruneReadRequests()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (now < NextReadRequestCleanupAt) return;
+            NextReadRequestCleanupAt = now + 1.0;
+            foreach (string jobId in ReadRequestStartedAt.Keys.ToArray())
+            {
+                double age = now - ReadRequestStartedAt[jobId];
+                bool completed = PendingListRequests.TryGetValue(jobId, out ListRequest listRequest)
+                    ? listRequest.IsCompleted
+                    : PendingSearchRequests.TryGetValue(jobId, out SearchRequest searchRequest)
+                        && searchRequest.IsCompleted;
+
+                if (age > MaximumReadRequestLifetimeSeconds
+                    || (completed && age > CompletedReadRequestRetentionSeconds))
+                {
+                    RemoveReadRequest(jobId);
+                }
+            }
+
+            if (ReadRequestStartedAt.Count != 0 || !ReadRequestCleanupHooked) return;
+            EditorApplication.update -= PruneReadRequests;
+            ReadRequestCleanupHooked = false;
+        }
+
+        private static void RemoveReadRequest(string jobId)
+        {
+            PendingListRequests.Remove(jobId);
+            PendingSearchRequests.Remove(jobId);
+            ReadRequestStartedAt.Remove(jobId);
+        }
+
+        private static void ClearReadRequests()
+        {
+            PendingListRequests.Clear();
+            PendingSearchRequests.Clear();
+            ReadRequestStartedAt.Clear();
+            if (!ReadRequestCleanupHooked) return;
+            EditorApplication.update -= PruneReadRequests;
+            ReadRequestCleanupHooked = false;
+        }
 
         public static object HandleCommand(JObject @params)
         {
@@ -235,11 +303,15 @@ namespace MCPForUnity.Editor.Tools
         // === list_packages ===
         private static object ListPackages(ToolParams p)
         {
+            if (!EnsureReadRequestCapacity())
+                return new ErrorResponse("Too many package list/search requests are already pending. Poll an existing job before starting another request.");
+
             try
             {
                 var request = Client.List();
                 string jobId = Guid.NewGuid().ToString("N");
                 PendingListRequests[jobId] = request;
+                TrackReadRequest(jobId);
 
                 // Try immediate completion for fast responses
                 if (request.IsCompleted)
@@ -268,7 +340,7 @@ namespace MCPForUnity.Editor.Tools
                 );
             }
 
-            PendingListRequests.Remove(jobId);
+            RemoveReadRequest(jobId);
 
             if (request.Status == StatusCode.Failure)
                 return new ErrorResponse($"Failed to list packages: {request.Error?.message ?? "Unknown error"}");
@@ -296,11 +368,15 @@ namespace MCPForUnity.Editor.Tools
             if (!queryResult.IsSuccess)
                 return new ErrorResponse(queryResult.ErrorMessage);
 
+            if (!EnsureReadRequestCapacity())
+                return new ErrorResponse("Too many package list/search requests are already pending. Poll an existing job before starting another request.");
+
             try
             {
                 var request = Client.Search(queryResult.Value);
                 string jobId = Guid.NewGuid().ToString("N");
                 PendingSearchRequests[jobId] = request;
+                TrackReadRequest(jobId);
 
                 if (request.IsCompleted)
                     return CheckSearchRequest(jobId, request);
@@ -328,7 +404,7 @@ namespace MCPForUnity.Editor.Tools
                 );
             }
 
-            PendingSearchRequests.Remove(jobId);
+            RemoveReadRequest(jobId);
 
             if (request.Status == StatusCode.Failure)
                 return new ErrorResponse($"Package search failed: {request.Error?.message ?? "Unknown error"}");

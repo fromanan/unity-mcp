@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Reflection;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityEditor;
@@ -60,6 +61,68 @@ namespace MCPForUnityTests.Editor.Tools
             }));
             Assert.IsTrue(result.Value<bool>("success"));
             Assert.AreEqual("pong", result.Value<string>("message"));
+        }
+
+        [Test]
+        public void RenderUI_RestoresExistingPanelTargetAfterDeferredCapture()
+        {
+            MethodInfo cleanup = typeof(ManageUI).GetMethod(
+                "CleanupRenderCaptures",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo process = typeof(ManageUI).GetMethod(
+                "ProcessPendingEditCaptures",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.NotNull(cleanup);
+            Assert.NotNull(process);
+
+            cleanup.Invoke(null, null);
+            var go = new GameObject($"ManageUITest_{Guid.NewGuid():N}");
+            var panelSettings = ScriptableObject.CreateInstance<PanelSettings>();
+            var originalTarget = new RenderTexture(16, 16, 0)
+            {
+                hideFlags = HideFlags.HideAndDontSave
+            };
+
+            try
+            {
+                panelSettings.targetTexture = originalTarget;
+                var document = go.AddComponent<UIDocument>();
+                document.panelSettings = panelSettings;
+
+                if (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Null)
+                    LogAssert.Expect(LogType.Error, "RenderTexture.Create failed");
+
+                object response = ManageUI.HandleCommand(new JObject
+                {
+                    ["action"] = "render_ui",
+                    ["target"] = go.name,
+                    ["width"] = 16,
+                    ["height"] = 16,
+                    ["output_folder"] = TempRoot
+                });
+
+                Assert.NotNull(response);
+                if (SystemInfo.graphicsDeviceType == UnityEngine.Rendering.GraphicsDeviceType.Null)
+                {
+                    Assert.AreSame(originalTarget, panelSettings.targetTexture);
+                    return;
+                }
+
+                Assert.AreNotSame(originalTarget, panelSettings.targetTexture);
+
+                process.Invoke(null, null);
+                process.Invoke(null, null);
+
+                Assert.AreSame(originalTarget, panelSettings.targetTexture);
+            }
+            finally
+            {
+                cleanup.Invoke(null, null);
+                UnityEngine.Object.DestroyImmediate(go);
+                originalTarget.Release();
+                UnityEngine.Object.DestroyImmediate(originalTarget);
+                UnityEngine.Object.DestroyImmediate(panelSettings);
+            }
         }
 
         // ---- Create file ----

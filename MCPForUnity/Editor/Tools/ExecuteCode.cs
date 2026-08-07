@@ -447,13 +447,9 @@ namespace MCPForUnity.Editor.Tools
         {
             if (result == null) return null;
 
-            var type = result.GetType();
-            if (type.IsPrimitive || result is string || result is decimal)
-                return result;
-
             try
             {
-                return JToken.FromObject(result);
+                return GameObjectSerializer.SerializeValue(result);
             }
             catch
             {

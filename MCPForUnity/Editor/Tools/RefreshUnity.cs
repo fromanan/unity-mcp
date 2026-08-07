@@ -149,7 +149,7 @@ namespace MCPForUnity.Editor.Tools
                     if (!EditorStateCache.GetActualIsCompiling()
                         && !EditorApplication.isUpdating
                         && !TestRunStatus.IsRunning
-                        && !EditorApplication.isPlayingOrWillChangePlaymode)
+                        && !EditorStateCache.IsPlayModeTransitioning())
                     {
                         EditorApplication.update -= Tick;
                         tcs.TrySetResult(true);

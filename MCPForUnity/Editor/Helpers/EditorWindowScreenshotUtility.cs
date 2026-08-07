@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
-using System.Threading;
 using MCPForUnity.Runtime.Helpers;
 using UnityEditor;
 using UnityEngine;
@@ -16,9 +15,6 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     internal static class EditorWindowScreenshotUtility
     {
-        // Keep capture synchronous so callers can immediately return the screenshot payload.
-        // The short sleep gives Unity a chance to flush repaint work before GrabPixels reads the viewport.
-        private const int RepaintSettlingDelayMs = 75;
         private static readonly HashSet<string> WindowsReservedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "CON", "PRN", "AUX", "NUL",
@@ -132,7 +128,6 @@ namespace MCPForUnity.Editor.Helpers
                 SceneView.RepaintAll();
                 UnityEditorInternal.InternalEditorUtility.RepaintAllViews();
                 EditorApplication.QueuePlayerLoopUpdate();
-                Thread.Sleep(RepaintSettlingDelayMs);
             }
             catch (Exception ex)
             {

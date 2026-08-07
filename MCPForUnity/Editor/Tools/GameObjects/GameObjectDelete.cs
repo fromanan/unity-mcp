@@ -20,19 +20,19 @@ namespace MCPForUnity.Editor.Tools.GameObjects
             }
 
             List<object> deletedObjects = new List<object>();
+            int undoGroup = Undo.GetCurrentGroup();
+            Undo.SetCurrentGroupName(targets.Count == 1 ? "Delete GameObject" : "Delete GameObjects");
             foreach (var targetGo in targets)
             {
                 if (targetGo != null)
                 {
                     string goName = targetGo.name;
                     int goId = targetGo.GetInstanceIDCompat();
-                    // Note: Undo.DestroyObjectImmediate doesn't work reliably in test context,
-                    // so we use Object.DestroyImmediate. This means delete isn't undoable.
-                    // TODO: Investigate Undo.DestroyObjectImmediate behavior in Unity 2022+
-                    Object.DestroyImmediate(targetGo);
+                    Undo.DestroyObjectImmediate(targetGo);
                     deletedObjects.Add(new { name = goName, instanceID = goId });
                 }
             }
+            Undo.CollapseUndoOperations(undoGroup);
 
             if (deletedObjects.Count > 0)
             {

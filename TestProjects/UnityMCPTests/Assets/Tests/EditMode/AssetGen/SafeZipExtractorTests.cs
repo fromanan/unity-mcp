@@ -110,5 +110,39 @@ namespace MCPForUnityTests.Editor.AssetGen
             string escaped = Path.GetFullPath(Path.Combine(_work, "evil.txt"));
             Assert.IsFalse(File.Exists(escaped), "traversal target must not be written");
         }
+
+        [Test]
+        public void OversizedEntry_ThrowsBeforeWriting()
+        {
+            string zip = MakeZip("large.obj", new string('x', 64));
+            string dest = Path.Combine(_work, "out");
+
+            Assert.Throws<IOException>(() => SafeZipExtractor.ExtractTo(
+                zip,
+                dest,
+                maxEntryUncompressedBytes: 32));
+            Assert.IsFalse(File.Exists(Path.Combine(dest, "large.obj")));
+        }
+
+        [Test]
+        public void TooManyEntries_ThrowsBeforeWriting()
+        {
+            string zip = MakeMultiZip(("one.obj", "1"), ("two.obj", "2"));
+            string dest = Path.Combine(_work, "out");
+
+            Assert.Throws<IOException>(() => SafeZipExtractor.ExtractTo(zip, dest, maxEntries: 1));
+            Assert.IsFalse(File.Exists(Path.Combine(dest, "one.obj")));
+        }
+
+        [Test]
+        public void ExtremeCompressionRatio_IsRejected()
+        {
+            string zip = MakeZip("compressed.obj", new string('a', 4096));
+
+            Assert.Throws<IOException>(() => SafeZipExtractor.ExtractTo(
+                zip,
+                Path.Combine(_work, "out"),
+                maxCompressionRatio: 2.0));
+        }
     }
 }

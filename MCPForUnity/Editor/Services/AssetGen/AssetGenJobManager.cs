@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
@@ -34,6 +36,7 @@ namespace MCPForUnity.Editor.Services.AssetGen
         public string AssetPath;
         public string AssetGuid;
         public string Error;
+        public long CreatedAtUnixMs;
     }
 
     /// <summary>
@@ -50,14 +53,18 @@ namespace MCPForUnity.Editor.Services.AssetGen
     {
         private const string JobKeyPrefix = "MCPForUnity.AssetGen.Job.";
         private const string JobIndexKey = "MCPForUnity.AssetGen.JobIndex";
+        private const int MaxRetainedJobs = 100;
+        private const long MaxAssetDownloadBytes = 256L * 1024L * 1024L;
 
         // Test seams (overridable; defaults are the production implementations).
         internal static IHttpTransport TransportOverrideForTests;
         internal static Func<AssetGenJob, string, AssetGenJob> ImportOverrideForTests;
+        internal static Func<string, bool> DownloadUrlValidatorOverrideForTests;
         internal static double PollIntervalSeconds = 3.0;
         internal static double TimeoutSeconds = 600.0;
 
         private static readonly Dictionary<string, AssetGenJob> Jobs = new();
+        private static readonly List<string> JobOrder = new();
         private static readonly Dictionary<string, Runner> Runners = new();
         private static readonly List<string> _tickIds = new();
         private static bool _ticking;
@@ -74,6 +81,8 @@ namespace MCPForUnity.Editor.Services.AssetGen
                     if (string.IsNullOrEmpty(json)) continue;
                     var job = JsonConvert.DeserializeObject<AssetGenJob>(json);
                     if (job == null) continue;
+                    if (job.CreatedAtUnixMs <= 0)
+                        job.CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     if (!IsTerminal(job.State))
                     {
                         job.State = AssetGenJobState.Failed;
@@ -81,7 +90,9 @@ namespace MCPForUnity.Editor.Services.AssetGen
                         Persist(job);
                     }
                     Jobs[id] = job;
+                    if (!JobOrder.Contains(id)) JobOrder.Add(id);
                 }
+                PruneRetainedJobs();
             }
             catch { /* recovery is best-effort */ }
         }
@@ -203,11 +214,10 @@ namespace MCPForUnity.Editor.Services.AssetGen
         /// <summary>Most-recent-first snapshot of known jobs (for the GUI readout). Never contains keys.</summary>
         public static IReadOnlyList<AssetGenJob> RecentJobs(int max = 20)
         {
-            var all = new List<AssetGenJob>(Jobs.Values);
-            int start = Math.Max(0, all.Count - max);
-            var slice = all.GetRange(start, all.Count - start);
-            slice.Reverse();
-            return slice;
+            var result = new List<AssetGenJob>();
+            for (int i = JobOrder.Count - 1; i >= 0 && result.Count < max; i--)
+                if (Jobs.TryGetValue(JobOrder[i], out AssetGenJob job)) result.Add(job);
+            return result;
         }
 
         public static bool Cancel(string jobId)
@@ -230,7 +240,7 @@ namespace MCPForUnity.Editor.Services.AssetGen
 
         // ---------- runner ----------
 
-        private enum RunnerPhase { Submit, AwaitSubmit, Poll, AwaitPoll, Download, AwaitDownload, Import }
+        private enum RunnerPhase { Submit, AwaitSubmit, Poll, AwaitPoll, ValidateDownload, AwaitDownloadValidation, Download, AwaitDownload, Import }
 
         private sealed class Runner
         {
@@ -255,6 +265,7 @@ namespace MCPForUnity.Editor.Services.AssetGen
             public Task<string> SubmitTask;
             public Task<ProviderPollResult> PollTask;
             public Task<HttpResult> DownloadTask;
+            public Task<bool> DownloadValidationTask;
             public bool Canceled;
         }
 
@@ -367,7 +378,7 @@ namespace MCPForUnity.Editor.Services.AssetGen
                             else if (!string.IsNullOrEmpty(pr.DownloadUrl))
                             {
                                 r.DownloadUrl = pr.DownloadUrl;
-                                r.Phase = RunnerPhase.Download;
+                                r.Phase = RunnerPhase.ValidateDownload;
                             }
                             else
                             {
@@ -385,17 +396,46 @@ namespace MCPForUnity.Editor.Services.AssetGen
                         }
                         break;
 
-                    case RunnerPhase.Download:
-                        // The download URL comes from an untrusted provider response. Only fetch
-                        // http(s) — refuse file://, ftp://, etc. so a malicious response can't read
-                        // a local file into the project or hit an internal host.
-                        if (!IsAllowedDownloadUrl(r.DownloadUrl))
+                    case RunnerPhase.ValidateDownload:
+                        if (DownloadUrlValidatorOverrideForTests != null)
                         {
-                            Fail(r, "Refusing to fetch a non-http(s) download URL returned by the provider.");
+                            r.DownloadValidationTask = Task.FromResult(
+                                DownloadUrlValidatorOverrideForTests(r.DownloadUrl));
+                        }
+                        else
+                        {
+                            r.DownloadValidationTask = Task.Run(
+                                () => IsAllowedDownloadUrl(r.DownloadUrl),
+                                r.Cts.Token);
+                        }
+                        r.Phase = RunnerPhase.AwaitDownloadValidation;
+                        break;
+
+                    case RunnerPhase.AwaitDownloadValidation:
+                        if (!r.DownloadValidationTask.IsCompleted) break;
+                        if (Faulted(r.DownloadValidationTask, out string validationError))
+                        {
+                            Fail(r, validationError);
                             break;
                         }
+                        if (!r.DownloadValidationTask.Result)
+                        {
+                            Fail(r, "Refusing to fetch an unsafe or non-public download URL returned by the provider.");
+                            break;
+                        }
+                        r.Phase = RunnerPhase.Download;
+                        break;
+
+                    case RunnerPhase.Download:
                         r.DownloadTask = r.Transport.SendAsync(
-                            new HttpRequestSpec { Method = "GET", Url = r.DownloadUrl }, r.Cts.Token);
+                            new HttpRequestSpec
+                            {
+                                Method = "GET",
+                                Url = r.DownloadUrl,
+                                MaxResponseBytes = MaxAssetDownloadBytes,
+                                DecodeResponseText = false
+                            },
+                            r.Cts.Token);
                         r.Phase = RunnerPhase.AwaitDownload;
                         break;
 
@@ -542,6 +582,7 @@ namespace MCPForUnity.Editor.Services.AssetGen
                 Action = action,
                 State = AssetGenJobState.Queued,
                 Progress = 0f,
+                CreatedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             };
         }
 
@@ -550,12 +591,36 @@ namespace MCPForUnity.Editor.Services.AssetGen
             try
             {
                 SessionState.SetString(JobKeyPrefix + job.JobId, JsonConvert.SerializeObject(job));
-                string index = SessionState.GetString(JobIndexKey, string.Empty);
-                var ids = new HashSet<string>(index.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries));
-                if (ids.Add(job.JobId))
-                    SessionState.SetString(JobIndexKey, string.Join(",", ids));
+                if (!JobOrder.Contains(job.JobId)) JobOrder.Add(job.JobId);
+                SessionState.SetString(JobIndexKey, string.Join(",", JobOrder));
+                if (IsTerminal(job.State)) PruneRetainedJobs();
             }
             catch { /* persistence is best-effort */ }
+        }
+
+        private static void PruneRetainedJobs()
+        {
+            while (Jobs.Count > MaxRetainedJobs)
+            {
+                string removeId = null;
+                foreach (string candidate in JobOrder)
+                {
+                    if (Jobs.TryGetValue(candidate, out AssetGenJob candidateJob)
+                        && IsTerminal(candidateJob.State)
+                        && !Runners.ContainsKey(candidate))
+                    {
+                        removeId = candidate;
+                        break;
+                    }
+                }
+
+                if (removeId == null) break;
+                Jobs.Remove(removeId);
+                JobOrder.Remove(removeId);
+                SessionState.EraseString(JobKeyPrefix + removeId);
+            }
+
+            SessionState.SetString(JobIndexKey, string.Join(",", JobOrder));
         }
 
         private static bool Faulted(Task t, out string error)
@@ -574,10 +639,94 @@ namespace MCPForUnity.Editor.Services.AssetGen
         private static bool IsTerminal(AssetGenJobState s)
             => s == AssetGenJobState.Done || s == AssetGenJobState.Failed || s == AssetGenJobState.Canceled;
 
-        /// <summary>Only http(s) download URLs are allowed; provider responses are untrusted.</summary>
-        private static bool IsAllowedDownloadUrl(string url)
-            => Uri.TryCreate(url, UriKind.Absolute, out Uri u)
-               && (u.Scheme == Uri.UriSchemeHttps || u.Scheme == Uri.UriSchemeHttp);
+        /// <summary>
+        /// Provider result URLs are untrusted. Resolve hostnames before download and reject any
+        /// destination that is local, private, link-local, multicast, or otherwise non-public.
+        /// Redirects are disabled by the transport, so this decision applies to the actual target.
+        /// </summary>
+        internal static bool IsAllowedDownloadUrl(string url)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri)
+                || (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp)
+                || string.IsNullOrEmpty(uri.Host)
+                || !string.IsNullOrEmpty(uri.UserInfo))
+            {
+                return false;
+            }
+
+            string host = uri.IdnHost.TrimEnd('.');
+            if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+                || host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase)
+                || host.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (IPAddress.TryParse(host, out IPAddress literal))
+                return IsPublicAddress(literal);
+
+            try
+            {
+                IPAddress[] addresses = Dns.GetHostAddresses(host);
+                if (addresses == null || addresses.Length == 0) return false;
+                foreach (IPAddress address in addresses)
+                    if (!IsPublicAddress(address)) return false;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool IsPublicAddress(IPAddress address)
+        {
+            if (address == null
+                || IPAddress.IsLoopback(address)
+                || address.Equals(IPAddress.Any)
+                || address.Equals(IPAddress.None)
+                || address.Equals(IPAddress.IPv6Any)
+                || address.Equals(IPAddress.IPv6None))
+            {
+                return false;
+            }
+
+            if (address.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                if (address.IsIPv4MappedToIPv6) return IsPublicAddress(address.MapToIPv4());
+                byte[] bytes = address.GetAddressBytes();
+                bool ipv4Compatible = true;
+                for (int i = 0; i < 12; i++)
+                    ipv4Compatible &= bytes[i] == 0;
+                if (ipv4Compatible)
+                {
+                    return IsPublicAddress(new IPAddress(new[]
+                    {
+                        bytes[12], bytes[13], bytes[14], bytes[15]
+                    }));
+                }
+                return !address.IsIPv6LinkLocal
+                    && !address.IsIPv6SiteLocal
+                    && !address.IsIPv6Multicast
+                    && (bytes[0] & 0xfe) != 0xfc
+                    && !(bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8);
+            }
+
+            if (address.AddressFamily != AddressFamily.InterNetwork) return false;
+            byte[] b = address.GetAddressBytes();
+            return b[0] != 0
+                && b[0] != 10
+                && b[0] != 127
+                && !(b[0] == 100 && b[1] >= 64 && b[1] <= 127)
+                && !(b[0] == 169 && b[1] == 254)
+                && !(b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+                && !(b[0] == 192 && b[1] == 168)
+                && !(b[0] == 192 && b[1] == 0 && (b[2] == 0 || b[2] == 2))
+                && !(b[0] == 198 && (b[1] == 18 || b[1] == 19))
+                && !(b[0] == 198 && b[1] == 51 && b[2] == 100)
+                && !(b[0] == 203 && b[1] == 0 && b[2] == 113)
+                && b[0] < 224;
+        }
 
         private static double Now() => EditorApplication.timeSinceStartup;
 
@@ -593,8 +742,10 @@ namespace MCPForUnity.Editor.Services.AssetGen
                 SessionState.EraseString(JobKeyPrefix + id);
             SessionState.EraseString(JobIndexKey);
             Jobs.Clear();
+            JobOrder.Clear();
             TransportOverrideForTests = null;
             ImportOverrideForTests = null;
+            DownloadUrlValidatorOverrideForTests = null;
             PollIntervalSeconds = 3.0;
             TimeoutSeconds = 600.0;
         }

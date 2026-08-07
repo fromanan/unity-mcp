@@ -26,6 +26,7 @@ namespace MCPForUnity.Editor.Services
         private static long? _lastCompileFinishedUnixMs;
 
         private static bool _domainReloadPending;
+        private static bool _playModeTransitionPending;
         private static long? _domainReloadBeforeUnixMs;
         private static long? _domainReloadAfterUnixMs;
 
@@ -257,7 +258,12 @@ namespace MCPForUnity.Editor.Services
                 _cached = BuildSnapshot("init");
 
                 EditorApplication.update += OnUpdate;
-                EditorApplication.playModeStateChanged += _ => ForceUpdate("playmode");
+                EditorApplication.playModeStateChanged += change =>
+                {
+                    _playModeTransitionPending = change == PlayModeStateChange.ExitingEditMode
+                        || change == PlayModeStateChange.ExitingPlayMode;
+                    ForceUpdate("playmode");
+                };
 
                 // Tracks whether an assembly compilation is actually running, for
                 // GetActualIsCompiling. Statics reset on domain reload and this
@@ -299,6 +305,10 @@ namespace MCPForUnity.Editor.Services
                 return;
             }
 
+            // Advance the throttle even when state is unchanged. Otherwise, once a stable editor
+            // crosses the interval, these probes run on every editor update until a state changes.
+            _lastUpdateTimeSinceStartup = now;
+
             // Fast state-change detection BEFORE building snapshot.
             // This avoids the expensive BuildSnapshot() call entirely when nothing changed.
             // These checks are much cheaper than building a full JSON snapshot.
@@ -328,7 +338,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "asset_import";
             }
-            else if (EditorApplication.isPlayingOrWillChangePlaymode)
+            else if (IsPlayModeTransitioning())
             {
                 activityPhase = "playmode_transition";
             }
@@ -360,7 +370,6 @@ namespace MCPForUnity.Editor.Services
             _lastTrackedTestsRunning = testsRunning;
             _lastTrackedActivityPhase = activityPhase;
 
-            _lastUpdateTimeSinceStartup = now;
             ForceUpdate("tick");
         }
 
@@ -414,7 +423,7 @@ namespace MCPForUnity.Editor.Services
             {
                 activityPhase = "asset_import";
             }
-            else if (EditorApplication.isPlayingOrWillChangePlaymode)
+            else if (IsPlayModeTransitioning())
             {
                 activityPhase = "playmode_transition";
             }
@@ -439,7 +448,7 @@ namespace MCPForUnity.Editor.Services
                     {
                         IsPlaying = EditorApplication.isPlaying,
                         IsPaused = EditorApplication.isPaused,
-                        IsChanging = EditorApplication.isPlayingOrWillChangePlaymode
+                        IsChanging = IsPlayModeTransitioning()
                     },
                     ActiveScene = new EditorStateActiveScene
                     {
@@ -522,17 +531,19 @@ namespace MCPForUnity.Editor.Services
                 // which prevents unnecessary _cached rebuilds, not from caching the clone.
                 var clone = (JObject)_cached.DeepClone();
 
-                // When Unity is backgrounded, OnUpdate is throttled and the
-                // cached timestamp grows stale even though the data is current.
-                // Re-stamp only in that case so the server-side staleness check
-                // still fires for genuinely unresponsive editors when focused.
-                if (!InternalEditorUtility.isApplicationActive)
-                {
-                    clone["observed_at_unix_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                }
+                // Serving this resource is itself a live response from the Unity main thread.
+                // Keep the state payload cached, but stamp the response time so a stable editor
+                // cannot be misclassified as unresponsive merely because no state changed.
+                clone["observed_at_unix_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
                 return clone;
             }
+        }
+
+        internal static bool IsPlayModeTransitioning()
+        {
+            return _playModeTransitionPending
+                || (EditorApplication.isPlayingOrWillChangePlaymode && !EditorApplication.isPlaying);
         }
 
         // Set/cleared by the CompilationPipeline.compilationStarted/Finished events
@@ -564,5 +575,4 @@ namespace MCPForUnity.Editor.Services
         }
     }
 }
-
 

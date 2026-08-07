@@ -18,10 +18,21 @@ namespace MCPForUnity.Editor.Services.AssetGen.Import
     /// </summary>
     public static class SafeZipExtractor
     {
-        public static void ExtractTo(string zipPath, string destDir, ISet<string> allowedExtensions = null)
+        public static void ExtractTo(
+            string zipPath,
+            string destDir,
+            ISet<string> allowedExtensions = null,
+            int maxEntries = 2048,
+            long maxEntryUncompressedBytes = 512L * 1024L * 1024L,
+            long maxTotalUncompressedBytes = 1024L * 1024L * 1024L,
+            double maxCompressionRatio = 200.0)
         {
             if (string.IsNullOrEmpty(zipPath)) throw new ArgumentException("zipPath required", nameof(zipPath));
             if (string.IsNullOrEmpty(destDir)) throw new ArgumentException("destDir required", nameof(destDir));
+            if (maxEntries <= 0) throw new ArgumentOutOfRangeException(nameof(maxEntries));
+            if (maxEntryUncompressedBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxEntryUncompressedBytes));
+            if (maxTotalUncompressedBytes <= 0) throw new ArgumentOutOfRangeException(nameof(maxTotalUncompressedBytes));
+            if (maxCompressionRatio <= 0) throw new ArgumentOutOfRangeException(nameof(maxCompressionRatio));
 
             Directory.CreateDirectory(destDir);
             string destFull = Path.GetFullPath(destDir);
@@ -32,6 +43,26 @@ namespace MCPForUnity.Editor.Services.AssetGen.Import
             using (FileStream fs = File.OpenRead(zipPath))
             using (var archive = new ZipArchive(fs, ZipArchiveMode.Read))
             {
+                if (archive.Entries.Count > maxEntries)
+                    throw new IOException($"Zip contains {archive.Entries.Count} entries; limit is {maxEntries}.");
+
+                long declaredTotal = 0;
+                foreach (ZipArchiveEntry entry in archive.Entries)
+                {
+                    if (entry.Length > maxEntryUncompressedBytes)
+                        throw new IOException($"Zip entry exceeds the uncompressed size limit: {entry.FullName}");
+                    declaredTotal = checked(declaredTotal + entry.Length);
+                    if (declaredTotal > maxTotalUncompressedBytes)
+                        throw new IOException("Zip exceeds the total uncompressed size limit.");
+                    if (entry.Length > 0
+                        && (entry.CompressedLength <= 0
+                            || entry.Length / (double)entry.CompressedLength > maxCompressionRatio))
+                    {
+                        throw new IOException($"Zip entry exceeds the compression-ratio limit: {entry.FullName}");
+                    }
+                }
+
+                long totalWritten = 0;
                 foreach (ZipArchiveEntry entry in archive.Entries)
                 {
                     string name = entry.FullName;
@@ -65,7 +96,29 @@ namespace MCPForUnity.Editor.Services.AssetGen.Import
                     using (Stream src = entry.Open())
                     using (FileStream dst = File.Create(target))
                     {
-                        src.CopyTo(dst);
+                        var buffer = new byte[81920];
+                        long entryWritten = 0;
+                        int read;
+                        try
+                        {
+                            while ((read = src.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                entryWritten += read;
+                                totalWritten += read;
+                                if (entryWritten > maxEntryUncompressedBytes
+                                    || totalWritten > maxTotalUncompressedBytes)
+                                {
+                                    throw new IOException("Zip expanded beyond the configured extraction limit.");
+                                }
+                                dst.Write(buffer, 0, read);
+                            }
+                        }
+                        catch
+                        {
+                            dst.Close();
+                            try { File.Delete(target); } catch { }
+                            throw;
+                        }
                     }
                 }
             }

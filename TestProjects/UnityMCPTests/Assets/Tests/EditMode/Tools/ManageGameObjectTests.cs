@@ -413,6 +413,84 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void GetComponentData_SkipsNativeTransformHandle()
+        {
+            BoxCollider boxCollider = testGameObject.AddComponent<BoxCollider>();
+            List<string> transformHandleWarnings = new();
+            Application.LogCallback logCallback = (condition, stackTrace, type) =>
+            {
+                if (type == LogType.Warning && condition.Contains("TransformHandle"))
+                {
+                    transformHandleWarnings.Add(condition);
+                }
+            };
+
+            object result;
+            Application.logMessageReceived += logCallback;
+            try
+            {
+                result = MCPForUnity.Editor.Helpers.GameObjectSerializer.GetComponentData(boxCollider);
+            }
+            finally
+            {
+                Application.logMessageReceived -= logCallback;
+            }
+
+            Dictionary<string, object> data = result as Dictionary<string, object>;
+            Assert.IsNotNull(data, "GetComponentData should return dictionary data.");
+            Assert.IsTrue(data.TryGetValue("properties", out object propertiesValue),
+                "GetComponentData should include reflected component properties.");
+            Dictionary<string, object> properties = propertiesValue as Dictionary<string, object>;
+            Assert.IsNotNull(properties, "Reflected component properties should be dictionary data.");
+            Assert.IsFalse(properties.ContainsKey("transformHandle"),
+                "Native TransformHandle values should not be included in serialized component data.");
+            Assert.IsEmpty(transformHandleWarnings,
+                "Serializing component data should not emit TransformHandle warnings.");
+        }
+
+        [Test]
+        public void GetComponentData_SkipsUnavailableNavMeshAgentStateProperties()
+        {
+            UnityEngine.AI.NavMeshAgent navMeshAgent = testGameObject.AddComponent<UnityEngine.AI.NavMeshAgent>();
+            Assert.IsTrue(navMeshAgent.isActiveAndEnabled);
+            Assert.IsFalse(navMeshAgent.isOnNavMesh);
+
+            List<string> navMeshAgentErrors = new();
+            Application.LogCallback logCallback = (condition, stackTrace, type) =>
+            {
+                if (type == LogType.Error
+                    && (condition.Contains("GetRemainingDistance") || condition.Contains("IsStopped")))
+                {
+                    navMeshAgentErrors.Add(condition);
+                }
+            };
+
+            object result;
+            Application.logMessageReceived += logCallback;
+            try
+            {
+                result = MCPForUnity.Editor.Helpers.GameObjectSerializer.GetComponentData(navMeshAgent);
+            }
+            finally
+            {
+                Application.logMessageReceived -= logCallback;
+            }
+
+            Dictionary<string, object> data = result as Dictionary<string, object>;
+            Assert.IsNotNull(data, "GetComponentData should return dictionary data.");
+            Assert.IsTrue(data.TryGetValue("properties", out object propertiesValue),
+                "GetComponentData should include safe NavMeshAgent properties.");
+            Dictionary<string, object> properties = propertiesValue as Dictionary<string, object>;
+            Assert.IsNotNull(properties, "Reflected NavMeshAgent properties should be dictionary data.");
+            Assert.IsFalse(properties.ContainsKey("remainingDistance"),
+                "remainingDistance should be omitted until the agent is on a NavMesh.");
+            Assert.IsFalse(properties.ContainsKey("isStopped"),
+                "isStopped should be omitted until the agent is on a NavMesh.");
+            Assert.IsEmpty(navMeshAgentErrors,
+                "Serializing an off-NavMesh agent should not emit active-agent errors.");
+        }
+
+        [Test]
         public void GetComponentData_DoesNotInstantiateMeshesInEditMode()
         {
             // Arrange - Create a GameObject with MeshFilter component
@@ -566,6 +644,30 @@ namespace MCPForUnityTests.Editor.Tools
             UnityEngine.Object.DestroyImmediate(testObject);
         }
 
+        [Test]
+        public void GetComponentData_BoundsLargeSerializedCollections()
+        {
+            var component = testGameObject.AddComponent<BoundedSerializationTestComponent>();
+            component.Values = Enumerable.Range(0, 300).ToArray();
+
+            var data = MCPForUnity.Editor.Helpers.GameObjectSerializer.GetComponentData(component)
+                as Dictionary<string, object>;
+
+            Assert.IsNotNull(data);
+            Assert.IsTrue(data.TryGetValue("properties", out object propertiesValue));
+            var properties = propertiesValue as Dictionary<string, object>;
+            Assert.IsNotNull(properties);
+            var values = properties["Values"] as List<object>;
+            Assert.IsNotNull(values);
+            Assert.AreEqual(129, values.Count,
+                "The bounded payload should contain 128 values and one truncation marker.");
+
+            Assert.IsTrue(data.TryGetValue("serialization", out object serializationValue));
+            var serialization = serializationValue as Dictionary<string, object>;
+            Assert.IsNotNull(serialization);
+            Assert.AreEqual(true, serialization["truncated"]);
+        }
+
         #region Prefab Asset Handling Tests
 
         [Test]
@@ -641,5 +743,10 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         #endregion
+    }
+
+    public sealed class BoundedSerializationTestComponent : MonoBehaviour
+    {
+        public int[] Values;
     }
 }

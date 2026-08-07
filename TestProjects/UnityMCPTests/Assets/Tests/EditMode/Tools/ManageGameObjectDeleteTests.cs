@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using NUnit.Framework;
+using UnityEditor;
 using UnityEngine;
 using Newtonsoft.Json.Linq;
 using MCPForUnity.Editor.Tools.GameObjects;
@@ -59,6 +60,30 @@ namespace MCPForUnityTests.Editor.Tools
             
             // Remove from our tracking list since it's deleted
             testObjects.Remove(target);
+        }
+
+        [Test]
+        public void Delete_ByName_CanBeUndone()
+        {
+            var target = CreateTestObject("UndoableDeleteTarget");
+
+            var result = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "delete",
+                ["target"] = target.name,
+                ["searchMethod"] = "by_name"
+            });
+            var resultObj = result as JObject ?? JObject.FromObject(result);
+
+            Assert.IsTrue(resultObj.Value<bool>("success"), resultObj.ToString());
+            Assert.IsNull(GameObject.Find("UndoableDeleteTarget"));
+
+            Undo.PerformUndo();
+
+            GameObject restored = GameObject.Find("UndoableDeleteTarget");
+            Assert.IsNotNull(restored, "Undo should restore a tool-deleted GameObject.");
+            testObjects.Remove(target);
+            testObjects.Add(restored);
         }
 
         [Test]
@@ -377,4 +402,3 @@ namespace MCPForUnityTests.Editor.Tools
         #endregion
     }
 }
-

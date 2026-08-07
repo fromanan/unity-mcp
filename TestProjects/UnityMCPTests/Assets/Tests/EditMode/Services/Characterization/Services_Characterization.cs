@@ -2,6 +2,7 @@ using System;
 using System.Reflection;
 using NUnit.Framework;
 using MCPForUnity.Editor.Services;
+using Newtonsoft.Json.Linq;
 using UnityEditor;
 
 namespace MCPForUnityTests.Editor.Services.Characterization
@@ -292,6 +293,43 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             Assert.IsNotNull(snapshot1);
             Assert.IsNotNull(snapshot2);
             Assert.Pass("EditorStateCache uses lock pattern for concurrent access safety");
+        }
+
+        [Test]
+        public void EditorStateCache_GetSnapshot_StampsTheLiveResponseTime()
+        {
+            FieldInfo cachedField = typeof(EditorStateCache).GetField(
+                "_cached",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.IsNotNull(cachedField);
+
+            JObject original = cachedField.GetValue(null) as JObject;
+            JObject aged = original != null
+                ? (JObject)original.DeepClone()
+                : EditorStateCache.GetSnapshot();
+            aged["observed_at_unix_ms"] = 1L;
+            cachedField.SetValue(null, aged);
+
+            try
+            {
+                long before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                JObject snapshot = EditorStateCache.GetSnapshot();
+                long observed = snapshot.Value<long>("observed_at_unix_ms");
+
+                Assert.GreaterOrEqual(observed, before,
+                    "A successful live resource response must not retain an aged cached timestamp.");
+            }
+            finally
+            {
+                cachedField.SetValue(null, original);
+            }
+        }
+
+        [Test]
+        public void EditorStateCache_EditModeIsNotAPlayModeTransition()
+        {
+            Assert.IsFalse(EditorApplication.isPlaying);
+            Assert.IsFalse(EditorStateCache.IsPlayModeTransitioning());
         }
 
         #endregion

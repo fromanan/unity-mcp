@@ -255,7 +255,6 @@ namespace MCPForUnity.Editor.Services
             {
                 _sequence = 0;
                 _observedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                _cached = BuildSnapshot("init");
 
                 EditorApplication.update += OnUpdate;
                 EditorApplication.playModeStateChanged += change =>
@@ -292,6 +291,11 @@ namespace MCPForUnity.Editor.Services
 
         private static void OnUpdate()
         {
+            if (_cached == null)
+            {
+                return;
+            }
+
             // Throttle to reduce overhead while keeping the snapshot fresh enough for polling clients.
             double now = EditorApplication.timeSinceStartup;
             // Use GetActualIsCompiling() to avoid isCompiling false positives (issues #549, #1276)
@@ -375,6 +379,11 @@ namespace MCPForUnity.Editor.Services
 
         private static void ForceUpdate(string reason)
         {
+            if (_cached == null)
+            {
+                return;
+            }
+
             lock (LockObj)
             {
                 _cached = BuildSnapshot(reason);
@@ -575,4 +584,3 @@ namespace MCPForUnity.Editor.Services
         }
     }
 }
-

@@ -15,7 +15,6 @@ namespace MCPForUnity.Editor.Resources.MenuItems
     {
         private static List<string> _cached;
 
-        [InitializeOnLoadMethod]
         private static void BuildCache() => Refresh();
 
         public static object HandleCommand(JObject @params)
@@ -40,7 +39,7 @@ namespace MCPForUnity.Editor.Resources.MenuItems
         {
             if (forceRefresh || _cached == null)
             {
-                Refresh();
+                BuildCache();
             }
 
             return (_cached ?? new List<string>()).ToList();

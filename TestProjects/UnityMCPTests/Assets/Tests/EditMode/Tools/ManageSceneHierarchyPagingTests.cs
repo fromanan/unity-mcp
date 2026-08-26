@@ -169,6 +169,19 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void EditorWindowScreenshotUtility_UsesLinearRenderTextureReadback()
+        {
+            System.Type helperType = typeof(ManageScene).Assembly.GetType("MCPForUnity.Editor.Helpers.EditorWindowScreenshotUtility");
+            Assert.IsNotNull(helperType, "Expected EditorWindowScreenshotUtility type.");
+
+            FieldInfo readWriteField = helperType.GetField("CaptureRenderTextureReadWrite", BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.IsNotNull(readWriteField, "Expected Scene View readback color-space configuration.");
+
+            RenderTextureReadWrite readWriteMode = (RenderTextureReadWrite)readWriteField.GetRawConstantValue();
+            Assert.AreEqual(RenderTextureReadWrite.Linear, readWriteMode);
+        }
+
+        [Test]
         public void Screenshot_ViewTargetAcceptedForGameView()
         {
             // view_target should be accepted for game_view (positioned capture path).

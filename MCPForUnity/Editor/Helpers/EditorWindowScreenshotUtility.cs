@@ -15,6 +15,8 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     internal static class EditorWindowScreenshotUtility
     {
+        private const RenderTextureReadWrite CaptureRenderTextureReadWrite = RenderTextureReadWrite.Linear;
+
         private static readonly HashSet<string> WindowsReservedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "CON", "PRN", "AUX", "NUL",
@@ -198,7 +200,8 @@ namespace MCPForUnity.Editor.Helpers
             RenderTexture previousActive = RenderTexture.active;
             try
             {
-                rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32)
+                // GrabPixels returns the already displayed viewport. A default sRGB target in a Linear project gamma-encodes it again.
+                rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, CaptureRenderTextureReadWrite)
                 {
                     antiAliasing = 1,
                     filterMode = FilterMode.Bilinear,

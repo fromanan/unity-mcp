@@ -97,6 +97,13 @@ def test_get_history_clamps_negative_limit(mock_unity):
     assert mock_unity["params"]["limit"] == 1
 
 
+# --- get_status action ---
+
+def test_get_status_forwards_to_unity(mock_unity):
+    asyncio.run(execute_code(SimpleNamespace(), action="get_status"))
+    assert mock_unity["params"] == {"action": "get_status"}
+
+
 # --- replay action ---
 
 def test_replay_forwards_index(mock_unity):

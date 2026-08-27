@@ -1,7 +1,7 @@
 """
 Execute arbitrary C# code inside the Unity Editor.
 
-Supports execute, history, replay, and clear actions with basic blocked-pattern
+Supports execute, status, history, replay, and clear actions with basic blocked-pattern
 checks. Code is compiled in-memory via CSharpCodeProvider — no script files created.
 
 WARNING: This tool runs arbitrary code in the Unity Editor process.
@@ -22,10 +22,11 @@ from transport.legacy.unity_connection import async_send_command_with_retry
     description=(
         "Execute arbitrary C# code inside the Unity Editor. "
         "The code runs as a method body with access to UnityEngine and UnityEditor namespaces. "
-        "Use 'return' to send data back. Compiled in-memory — no script files created. "
-        "Actions: execute (run code), get_history (list past executions), "
-        "replay (re-run a history entry), clear_history. "
-        "NOTE: safety_checks blocks known dangerous patterns but is not a full sandbox. "
+        "Use 'return' to send data back; returned Task and Task<T> values are awaited. "
+        "Compiled in-memory — no script files created. "
+        "Actions: execute (run code), get_status (compilation cache and domain budget), "
+        "get_history (list past executions), replay (re-run a history entry), clear_history. "
+        "NOTE: safety_checks blocks known dangerous and detached-work patterns but is not a full sandbox. "
         "Compiler options: 'auto' (Roslyn if available, else CodeDom), 'roslyn' (C# 12+, requires Microsoft.CodeAnalysis), 'codedom' (C# 6 only)."
     ),
     group="scripting_ext",
@@ -37,13 +38,14 @@ from transport.legacy.unity_connection import async_send_command_with_retry
 async def execute_code(
     ctx: Context,
     action: Annotated[
-        Literal["execute", "get_history", "replay", "clear_history"],
+        Literal["execute", "get_status", "get_history", "replay", "clear_history"],
         "Action to perform.",
     ],
     code: Annotated[
         str,
         "C# code to execute (for 'execute' action). Must be a valid method body. "
-        "Access UnityEngine and UnityEditor namespaces. Use 'return' to send data back.",
+        "Access UnityEngine and UnityEditor namespaces. Use 'return' to send data back, "
+        "including returning Task or Task<T> directly for awaited async work.",
     ] | None = None,
     safety_checks: Annotated[
         bool,

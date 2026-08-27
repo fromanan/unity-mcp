@@ -1,3 +1,4 @@
+using System.Reflection;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using MCPForUnity.Editor.Tools;
@@ -11,7 +12,7 @@ namespace MCPForUnityTests.Editor.Tools
         [SetUp]
         public void SetUp()
         {
-            ExecuteCode.HandleCommand(new JObject { ["action"] = "clear_history" });
+            HandleCommandSync(new JObject { ["action"] = "clear_history" });
         }
 
         // ──────────────────── Execute: success cases ────────────────────
@@ -124,6 +125,35 @@ namespace MCPForUnityTests.Editor.Tools
             Assert.IsNotNull(result["data"]["result"]);
         }
 
+        [Test]
+        public void Execute_ReturnTaskOfInt_AwaitsAndSerializesResult()
+        {
+            JObject result = Execute("return System.Threading.Tasks.Task.FromResult(17);");
+
+            Assert.IsTrue(result.Value<bool>("success"), result.ToString());
+            Assert.AreEqual(17, result["data"]["result"].Value<int>());
+        }
+
+        [Test]
+        public void Execute_IdenticalCode_ReusesCompiledSnippet()
+        {
+            JObject before = GetStatus();
+            string value = System.Guid.NewGuid().ToString("N");
+            string code = $"return \"{value}\";";
+
+            JObject first = Execute(code);
+            JObject second = Execute(code);
+            JObject after = GetStatus();
+
+            Assert.IsTrue(first.Value<bool>("success"), first.ToString());
+            Assert.IsTrue(second.Value<bool>("success"), second.ToString());
+            Assert.IsFalse(first["data"]["cacheHit"].Value<bool>());
+            Assert.IsTrue(second["data"]["cacheHit"].Value<bool>());
+            Assert.AreEqual(
+                before["data"]["uniqueCompilations"].Value<int>() + 1,
+                after["data"]["uniqueCompilations"].Value<int>());
+        }
+
         // ──────────────────── Execute: error cases ────────────────────
 
         [Test]
@@ -148,7 +178,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void Execute_MissingCode_ReturnsError()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute"
             }));
@@ -160,7 +190,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void Execute_EmptyCode_ReturnsError()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute",
                 ["code"] = "   "
@@ -199,9 +229,30 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void Execute_SafetyChecks_BlocksAssetDatabaseObjectLoad()
+        {
+            JObject result = Execute(
+                "return UnityEditor.AssetDatabase.LoadAssetAtPath<UnityEngine.Material>(\"Assets/Test.mat\");");
+
+            Assert.IsFalse(result.Value<bool>("success"), result.ToString());
+            StringAssert.Contains("AssetDatabase.LoadAssetAtPath", result.Value<string>("error"));
+        }
+
+        [Test]
+        public void Execute_SafetyChecks_BlocksDetachedContinuation()
+        {
+            JObject result = Execute(
+                "return System.Threading.Tasks.Task.FromResult(1).ContinueWith(value => value.Result);");
+
+            Assert.IsFalse(result.Value<bool>("success"), result.ToString());
+            StringAssert.Contains("detached work pattern", result.Value<string>("error"));
+            StringAssert.Contains("Return the Task", result.Value<string>("error"));
+        }
+
+        [Test]
         public void Execute_SafetyChecksDisabled_AllowsBlockedPattern()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute",
                 ["code"] = "while (true) { break; }  return null;",
@@ -221,7 +272,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void GetHistory_Empty_ReturnsZero()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "get_history"
             }));
@@ -235,7 +286,7 @@ namespace MCPForUnityTests.Editor.Tools
         {
             Execute("return 1;");
 
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "get_history"
             }));
@@ -255,7 +306,7 @@ namespace MCPForUnityTests.Editor.Tools
             Execute("return 2;");
             Execute("return 3;");
 
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "get_history",
                 ["limit"] = 2
@@ -273,13 +324,13 @@ namespace MCPForUnityTests.Editor.Tools
             Execute("return 1;");
             Execute("return 2;");
 
-            var clearResult = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var clearResult = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "clear_history"
             }));
             Assert.IsTrue(clearResult.Value<bool>("success"), clearResult.ToString());
 
-            var historyResult = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var historyResult = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "get_history"
             }));
@@ -293,7 +344,7 @@ namespace MCPForUnityTests.Editor.Tools
         {
             Execute("return 42;");
 
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "replay",
                 ["index"] = 0
@@ -308,7 +359,7 @@ namespace MCPForUnityTests.Editor.Tools
         {
             Execute("return 1;");
 
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "replay",
                 ["index"] = 99
@@ -321,7 +372,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void Replay_EmptyHistory_ReturnsError()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "replay",
                 ["index"] = 0
@@ -335,7 +386,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void UnknownAction_ReturnsError()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "invalid_action"
             }));
@@ -347,9 +398,48 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void NullParams_ReturnsError()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(null));
+            var result = ToJObject(HandleCommandSync(null));
 
             Assert.IsFalse(result.Value<bool>("success"), result.ToString());
+        }
+
+        [Test]
+        public void GetStatus_ReturnsCompilationBudgetAndCacheTelemetry()
+        {
+            JObject result = GetStatus();
+
+            Assert.IsTrue(result.Value<bool>("success"), result.ToString());
+            Assert.AreEqual(
+                ExecuteCode.MaxUniqueCompilationsPerDomain,
+                result["data"]["compilationLimit"].Value<int>());
+            Assert.GreaterOrEqual(result["data"]["cachedSnippets"].Value<int>(), 0);
+            Assert.GreaterOrEqual(result["data"]["roslynMetadataReferencesCached"].Value<int>(), 0);
+        }
+
+        [Test]
+        public void Execute_CompilationBudgetReached_RejectsUniqueCodeBeforeCompilation()
+        {
+            FieldInfo countField = typeof(ExecuteCode).GetField(
+                "_uniqueCompilationCount",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.IsNotNull(countField);
+            int originalCount = (int)countField.GetValue(null);
+
+            try
+            {
+                countField.SetValue(null, ExecuteCode.MaxUniqueCompilationsPerDomain);
+                JObject result = Execute($"return \"{System.Guid.NewGuid():N}\";");
+
+                Assert.IsFalse(result.Value<bool>("success"), result.ToString());
+                StringAssert.Contains("domain limit", result.Value<string>("error"));
+                Assert.AreEqual(
+                    ExecuteCode.MaxUniqueCompilationsPerDomain,
+                    result["data"]["uniqueCompilations"].Value<int>());
+            }
+            finally
+            {
+                countField.SetValue(null, originalCount);
+            }
         }
 
         // ──────────────────── CodeDom backend ────────────────────
@@ -361,7 +451,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void Execute_CodedomBackend_CompilesAndRuns()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute",
                 ["code"] = "return 1 + 1;",
@@ -376,7 +466,7 @@ namespace MCPForUnityTests.Editor.Tools
         [Test]
         public void Execute_CodedomBackend_ResolvesUnityTypes()
         {
-            var result = ToJObject(ExecuteCode.HandleCommand(new JObject
+            var result = ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute",
                 ["code"] = "return UnityEngine.Application.unityVersion;",
@@ -391,11 +481,24 @@ namespace MCPForUnityTests.Editor.Tools
 
         private static JObject Execute(string code)
         {
-            return ToJObject(ExecuteCode.HandleCommand(new JObject
+            return ToJObject(HandleCommandSync(new JObject
             {
                 ["action"] = "execute",
                 ["code"] = code
             }));
+        }
+
+        private static JObject GetStatus()
+        {
+            return ToJObject(HandleCommandSync(new JObject
+            {
+                ["action"] = "get_status"
+            }));
+        }
+
+        private static object HandleCommandSync(JObject parameters)
+        {
+            return ExecuteCode.HandleCommand(parameters).GetAwaiter().GetResult();
         }
 
     }

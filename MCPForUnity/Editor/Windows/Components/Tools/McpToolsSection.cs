@@ -46,6 +46,8 @@ namespace MCPForUnity.Editor.Windows.Components.Tools
             { "testing", "Testing" },
             { "probuilder", "ProBuilder — Experimental" },
             { "profiling", "Profiling & Frame Debugger" },
+            { "rendering_inspect", "Rendering Inspection" },
+            { "rendering_authoring", "Rendering Authoring — Opt-in" },
             { "asset_gen", "Asset Gen" },
         };
 

@@ -347,6 +347,15 @@ Unity API Verification (requires 'docs' tool group):
 - Workflow: `unity_reflect search` → `unity_reflect get_type` → `unity_reflect get_member` → `unity_docs get_doc` (if you need examples/caveats).
 - For shader/material questions: use `manage_asset(action="search", filter_type="Shader")` to find actual shaders in the project before recommending one.
 
+Rendering workflow (inspection is default-enabled; authoring is opt-in):
+- Prove the active owner closure before proposing a visual fix: `inspect_render_target` → `inspect_material` → `inspect_texture` and `inspect_shader_graph` → `validate_render_contract`.
+- Use exact asset paths and GUIDs from inspection results. Do not infer texture semantics from a filename alone when the semantic contract is unknown.
+- Treat serialized Shader Graph properties without a property-to-output trace as inert, even when a Material Inspector displays a value.
+- Use `render_probe` with a locked camera, resolution, quality level, scope, channel, and warmup count for visual A/B evidence. A changed camera/framing invalidates the comparison.
+- Use `profile_render_target` for static renderer/pass evidence and current Frame Debugger events; never present Editor/static evidence as Player or target-GPU proof.
+- Before any material, texture-importer, or Shader Graph mutation, enable the `rendering_authoring` group and call `manage_rendering_authoring` with dry_run=true. Apply only with the returned current SHA-256, an exact operation list, and any required project-owned copy path.
+- Vendor/package/generated assets fail the ownership guard unless a project successor is supplied or the caller explicitly authorizes direct owner mutation. Unknown render-contract proof fails strict validation.
+
 Payload sizing & paging (important):
 - Many Unity queries can return very large JSON. Prefer **paged + summary-first** calls.
 - `manage_scene(action="get_hierarchy")`:

@@ -25,10 +25,12 @@ TOOL_GROUPS: dict[str, str] = {
     "testing": "Test runner & async test jobs",
     "probuilder": "ProBuilder 3D modeling – requires com.unity.probuilder package",
     "profiling": "Unity Profiler session control, counters, memory snapshots & Frame Debugger",
+    "rendering_inspect": "Read-only renderer, material, texture, Shader Graph, render-contract & probe inspection",
+    "rendering_authoring": "Opt-in transactional material, texture-importer & Shader Graph authoring",
     "asset_gen": "AI asset generation – 3D model gen/import, 2D image gen & audio gen (bring-your-own-key)",
 }
 
-DEFAULT_ENABLED_GROUPS: set[str] = {"core"}
+DEFAULT_ENABLED_GROUPS: set[str] = {"core", "rendering_inspect"}
 
 
 def mcp_for_unity_tool(

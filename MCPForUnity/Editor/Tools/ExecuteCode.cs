@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -26,6 +27,9 @@ namespace MCPForUnity.Editor.Tools
         internal const int WrapperLineOffset = 10;
         private const string WrapperClassName = "MCPDynamicCode";
         private const string WrapperMethodName = "Execute";
+        private const string Cinemachine3BrainTypeName = "Unity.Cinemachine.CinemachineBrain";
+        private const string Cinemachine2BrainTypeName = "Cinemachine.CinemachineBrain";
+        private const string CinemachineManualUpdateMethodName = "ManualUpdate";
 
         private const string ActionExecute = "execute";
         private const string ActionGetHistory = "get_history";
@@ -37,6 +41,11 @@ namespace MCPForUnity.Editor.Tools
         private static readonly Dictionary<string, CompiledSnippet> _compiledSnippets =
             new Dictionary<string, CompiledSnippet>(StringComparer.Ordinal);
         private static readonly SemaphoreSlim _executionGate = new SemaphoreSlim(1, 1);
+        private static readonly Dictionary<ushort, OpCode> _opCodes = typeof(OpCodes)
+            .GetFields(BindingFlags.Public | BindingFlags.Static)
+            .Where(field => field.FieldType == typeof(OpCode))
+            .Select(field => (OpCode)field.GetValue(null))
+            .ToDictionary(opCode => unchecked((ushort)opCode.Value));
         private static readonly MethodInfo _serializeValueMethod = typeof(GameObjectSerializer).GetMethod(
             "SerializeValue",
             BindingFlags.Public | BindingFlags.Static);
@@ -154,7 +163,7 @@ namespace MCPForUnity.Editor.Tools
             try
             {
                 DateTime startTime = DateTime.UtcNow;
-                object result = await CompileAndExecuteAsync(code, compiler).ConfigureAwait(true);
+                object result = await CompileAndExecuteAsync(code, compiler, safetyChecks).ConfigureAwait(true);
                 double elapsed = (DateTime.UtcNow - startTime).TotalMilliseconds;
 
                 AddToHistory(code, result, elapsed, safetyChecks, compiler);
@@ -235,7 +244,10 @@ namespace MCPForUnity.Editor.Tools
 
         // ──────────────────── Compilation ────────────────────
 
-        private static async Task<object> CompileAndExecuteAsync(string code, string compiler)
+        private static async Task<object> CompileAndExecuteAsync(
+            string code,
+            string compiler,
+            bool safetyChecks)
         {
             if (!TryResolveCompiler(compiler, out string compilerUsed, out ErrorResponse compilerError))
                 return compilerError;
@@ -245,6 +257,9 @@ namespace MCPForUnity.Editor.Tools
             if (_compiledSnippets.TryGetValue(cacheKey, out CompiledSnippet cachedSnippet))
             {
                 _cacheHitCount++;
+                if (safetyChecks && cachedSnippet.SafetyViolation != null)
+                    return CreateBlockedInvocationError(cachedSnippet, true);
+
                 return await InvokeCompiledAsync(cachedSnippet, true).ConfigureAwait(true);
             }
 
@@ -286,9 +301,23 @@ namespace MCPForUnity.Editor.Tools
                     CreateCompilationStatus());
             }
 
-            CompiledSnippet snippet = new CompiledSnippet(method, compilerUsed);
+            string safetyViolation = FindBlockedCompiledInvocation(compiled);
+            CompiledSnippet snippet = new CompiledSnippet(method, compilerUsed, safetyViolation);
             _compiledSnippets.Add(cacheKey, snippet);
+            if (safetyChecks && safetyViolation != null)
+                return CreateBlockedInvocationError(snippet, false);
+
             return await InvokeCompiledAsync(snippet, false).ConfigureAwait(true);
+        }
+
+        private static object CreateBlockedInvocationError(CompiledSnippet snippet, bool cacheHit)
+        {
+            return new ErrorResponse($"Blocked invocation detected: {snippet.SafetyViolation}", new
+            {
+                compiler = snippet.Compiler,
+                cacheHit,
+                compilation = CreateCompilationStatus(),
+            });
         }
 
         private static bool TryResolveCompiler(
@@ -611,6 +640,182 @@ namespace MCPForUnity.Editor.Tools
             return null;
         }
 
+        private static string FindBlockedCompiledInvocation(Assembly assembly)
+        {
+            Type[] compiledTypes;
+            try
+            {
+                compiledTypes = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException exception)
+            {
+                compiledTypes = exception.Types.Where(type => type != null).ToArray();
+            }
+
+            foreach (Type compiledType in compiledTypes)
+            {
+                MethodInfo[] methods = compiledType.GetMethods(
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic |
+                    BindingFlags.Static |
+                    BindingFlags.Instance |
+                    BindingFlags.DeclaredOnly);
+
+                foreach (MethodInfo method in methods)
+                {
+                    if (ContainsMethodInvocation(
+                            method,
+                            Cinemachine3BrainTypeName,
+                            CinemachineManualUpdateMethodName) ||
+                        ContainsMethodInvocation(
+                            method,
+                            Cinemachine2BrainTypeName,
+                            CinemachineManualUpdateMethodName))
+                    {
+                        return "CinemachineBrain.ManualUpdate is valid only when the target brain is already in " +
+                               "ManualUpdate mode, outside FixedUpdate, and called exactly once per render frame. " +
+                               "execute_code will not change CinemachineBrain.UpdateMethod. Disable safety checks " +
+                               "only after explicitly verifying those preconditions for the intended brain.";
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        internal static bool ContainsMethodInvocation(
+            MethodInfo method,
+            string declaringTypeName,
+            string invokedMethodName)
+        {
+            MethodBody methodBody;
+            try
+            {
+                methodBody = method.GetMethodBody();
+            }
+            catch
+            {
+                return false;
+            }
+
+            byte[] il = methodBody?.GetILAsByteArray();
+            if (il == null)
+                return false;
+
+            int position = 0;
+            while (position < il.Length)
+            {
+                ushort opCodeValue = il[position++];
+                if (opCodeValue == 0xfe)
+                {
+                    if (position >= il.Length)
+                        return false;
+
+                    opCodeValue = (ushort)(0xfe00 | il[position++]);
+                }
+
+                if (!_opCodes.TryGetValue(opCodeValue, out OpCode opCode))
+                    return false;
+
+                int operandSize = GetOperandSize(opCode, il, position);
+                if (operandSize < 0 || position + operandSize > il.Length)
+                    return false;
+
+                if (opCode.OperandType == OperandType.InlineMethod)
+                {
+                    int metadataToken = BitConverter.ToInt32(il, position);
+                    MethodBase invokedMethod = ResolveInvokedMethod(method, metadataToken);
+                    if (invokedMethod != null &&
+                        string.Equals(invokedMethod.Name, invokedMethodName, StringComparison.Ordinal) &&
+                        string.Equals(
+                            invokedMethod.DeclaringType?.FullName,
+                            declaringTypeName,
+                            StringComparison.Ordinal))
+                    {
+                        return true;
+                    }
+                }
+
+                position += operandSize;
+            }
+
+            return false;
+        }
+
+        private static MethodBase ResolveInvokedMethod(MethodInfo containingMethod, int metadataToken)
+        {
+            try
+            {
+                Type[] declaringTypeArguments = containingMethod.DeclaringType?.IsGenericType == true
+                    ? containingMethod.DeclaringType.GetGenericArguments()
+                    : null;
+                Type[] methodArguments = containingMethod.IsGenericMethod
+                    ? containingMethod.GetGenericArguments()
+                    : null;
+                return containingMethod.Module.ResolveMethod(
+                    metadataToken,
+                    declaringTypeArguments,
+                    methodArguments);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static int GetOperandSize(OpCode opCode, byte[] il, int operandPosition)
+        {
+            switch (opCode.OperandType)
+            {
+                case OperandType.InlineNone:
+                {
+                    return 0;
+                }
+                case OperandType.ShortInlineBrTarget:
+                case OperandType.ShortInlineI:
+                case OperandType.ShortInlineVar:
+                {
+                    return 1;
+                }
+                case OperandType.InlineVar:
+                {
+                    return 2;
+                }
+                case OperandType.InlineBrTarget:
+                case OperandType.InlineField:
+                case OperandType.InlineI:
+                case OperandType.InlineMethod:
+                case OperandType.InlineSig:
+                case OperandType.InlineString:
+                case OperandType.InlineTok:
+                case OperandType.InlineType:
+                case OperandType.ShortInlineR:
+                {
+                    return 4;
+                }
+                case OperandType.InlineI8:
+                case OperandType.InlineR:
+                {
+                    return 8;
+                }
+                case OperandType.InlineSwitch:
+                {
+                    if (operandPosition + sizeof(int) > il.Length)
+                        return -1;
+
+                    int targetCount = BitConverter.ToInt32(il, operandPosition);
+                    if (targetCount < 0 || targetCount > (il.Length - operandPosition - sizeof(int)) / sizeof(int))
+                        return -1;
+
+                    return sizeof(int) + targetCount * sizeof(int);
+                }
+                default:
+                {
+                    return -1;
+                }
+            }
+        }
+
         private static void AddToHistory(string code, object result, double elapsedMs, bool safetyChecks, string compiler = "auto")
         {
             string preview;
@@ -666,15 +871,18 @@ namespace MCPForUnity.Editor.Tools
 
         private sealed class CompiledSnippet
         {
-            public CompiledSnippet(MethodInfo method, string compiler)
+            public CompiledSnippet(MethodInfo method, string compiler, string safetyViolation)
             {
                 Method = method;
                 Compiler = compiler;
+                SafetyViolation = safetyViolation;
             }
 
             public MethodInfo Method { get; }
 
             public string Compiler { get; }
+
+            public string SafetyViolation { get; }
         }
 
         private class HistoryEntry

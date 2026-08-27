@@ -1,8 +1,8 @@
 """
 Execute arbitrary C# code inside the Unity Editor.
 
-Supports execute, status, history, replay, and clear actions with basic blocked-pattern
-checks. Code is compiled in-memory via CSharpCodeProvider — no script files created.
+Supports execute, status, history, replay, and clear actions with blocked-pattern
+and compiled-invocation checks. Code is compiled in-memory — no script files created.
 
 WARNING: This tool runs arbitrary code in the Unity Editor process.
 Safety checks block known dangerous patterns but are NOT a security sandbox.
@@ -26,7 +26,8 @@ from transport.legacy.unity_connection import async_send_command_with_retry
         "Compiled in-memory — no script files created. "
         "Actions: execute (run code), get_status (compilation cache and domain budget), "
         "get_history (list past executions), replay (re-run a history entry), clear_history. "
-        "NOTE: safety_checks blocks known dangerous and detached-work patterns but is not a full sandbox. "
+        "NOTE: safety_checks blocks known dangerous patterns, detached work, and state-sensitive calls "
+        "such as CinemachineBrain.ManualUpdate; it is not a full sandbox. "
         "Compiler options: 'auto' (Roslyn if available, else CodeDom), 'roslyn' (C# 12+, requires Microsoft.CodeAnalysis), 'codedom' (C# 6 only)."
     ),
     group="scripting_ext",
@@ -49,7 +50,8 @@ async def execute_code(
     ] | None = None,
     safety_checks: Annotated[
         bool,
-        "Enable basic blocked-pattern checks (File.Delete, Process.Start, infinite loops, etc). "
+        "Enable blocked-pattern and compiled-invocation checks (File.Delete, Process.Start, "
+        "CinemachineBrain.ManualUpdate, infinite loops, etc). "
         "Not a full sandbox — advanced bypass is possible. Default: true.",
     ] = True,
     index: Annotated[

@@ -13,6 +13,7 @@ namespace MCPForUnityTests.Editor.Tools
         public void SetUp()
         {
             HandleCommandSync(new JObject { ["action"] = "clear_history" });
+            Unity.Cinemachine.CinemachineBrain.ManualUpdateCallCount = 0;
         }
 
         // ──────────────────── Execute: success cases ────────────────────
@@ -247,6 +248,62 @@ namespace MCPForUnityTests.Editor.Tools
             Assert.IsFalse(result.Value<bool>("success"), result.ToString());
             StringAssert.Contains("detached work pattern", result.Value<string>("error"));
             StringAssert.Contains("Return the Task", result.Value<string>("error"));
+        }
+
+        [Test]
+        public void Execute_SafetyChecks_CompiledInvocationInspectionUsesResolvedMethodSymbol()
+        {
+            MethodInfo caller = typeof(ExecuteCodeTests).GetMethod(
+                nameof(CallManualUpdateTestDouble),
+                BindingFlags.NonPublic | BindingFlags.Static);
+
+            Assert.IsTrue(ExecuteCode.ContainsMethodInvocation(
+                caller,
+                typeof(ManualUpdateTestDouble).FullName,
+                nameof(ManualUpdateTestDouble.ManualUpdate)));
+            Assert.IsFalse(ExecuteCode.ContainsMethodInvocation(
+                caller,
+                typeof(ManualUpdateTestDouble).FullName,
+                nameof(ManualUpdateTestDouble.ToString)));
+        }
+
+        [Test]
+        public void Execute_SafetyChecks_CompiledInvocationInspectionIgnoresMethodNameText()
+        {
+            MethodInfo caller = typeof(ExecuteCodeTests).GetMethod(
+                nameof(ReturnManualUpdateMethodName),
+                BindingFlags.NonPublic | BindingFlags.Static);
+
+            Assert.IsFalse(ExecuteCode.ContainsMethodInvocation(
+                caller,
+                typeof(ManualUpdateTestDouble).FullName,
+                nameof(ManualUpdateTestDouble.ManualUpdate)));
+        }
+
+        [Test]
+        public void Execute_SafetyChecks_BlocksCinemachineManualUpdateBeforeInvocation()
+        {
+            string code =
+                "var brain = new Unity.Cinemachine.CinemachineBrain();\n" +
+                "brain.ManualUpdate();\n" +
+                "return null;";
+
+            JObject blocked = Execute(code);
+
+            Assert.IsFalse(blocked.Value<bool>("success"), blocked.ToString());
+            StringAssert.Contains("CinemachineBrain.ManualUpdate", blocked.Value<string>("error"));
+            Assert.AreEqual(0, Unity.Cinemachine.CinemachineBrain.ManualUpdateCallCount);
+
+            JObject reviewedOverride = ToJObject(HandleCommandSync(new JObject
+            {
+                ["action"] = "execute",
+                ["code"] = code,
+                ["safety_checks"] = false
+            }));
+
+            Assert.IsTrue(reviewedOverride.Value<bool>("success"), reviewedOverride.ToString());
+            Assert.IsTrue(reviewedOverride["data"]["cacheHit"].Value<bool>());
+            Assert.AreEqual(1, Unity.Cinemachine.CinemachineBrain.ManualUpdateCallCount);
         }
 
         [Test]
@@ -501,5 +558,36 @@ namespace MCPForUnityTests.Editor.Tools
             return ExecuteCode.HandleCommand(parameters).GetAwaiter().GetResult();
         }
 
+        private static void CallManualUpdateTestDouble()
+        {
+            ManualUpdateTestDouble target = new ManualUpdateTestDouble();
+            target.ManualUpdate();
+        }
+
+        private static string ReturnManualUpdateMethodName()
+        {
+            return "ManualUpdate";
+        }
+
+        private sealed class ManualUpdateTestDouble
+        {
+            public void ManualUpdate()
+            {
+            }
+        }
+
+    }
+}
+
+namespace Unity.Cinemachine
+{
+    public sealed class CinemachineBrain
+    {
+        public static int ManualUpdateCallCount { get; set; }
+
+        public void ManualUpdate()
+        {
+            ManualUpdateCallCount++;
+        }
     }
 }

@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Tools.Profiler;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
@@ -33,6 +35,21 @@ namespace MCPForUnity.Editor.Tools.Rendering
             public HashSet<string> InertReferenceNames { get; set; } = new(StringComparer.Ordinal);
             public List<object> Targets { get; set; } = new();
             public object GraphVersion { get; set; }
+        }
+
+        private sealed class MaterialSampleView
+        {
+            public string Name { get; set; }
+            public string MeshKind { get; set; }
+            public Vector3 CameraPosition { get; set; }
+            public Vector3 CameraEuler { get; set; }
+            public Vector3 ObjectScale { get; set; }
+            public Vector3 ObjectEuler { get; set; }
+            public Color Background { get; set; }
+            public Vector3 KeyLightEuler { get; set; }
+            public float KeyLightIntensity { get; set; }
+            public float BackLightIntensity { get; set; }
+            public Color Ambient { get; set; }
         }
 
         public static object HandleCommand(JObject @params)
@@ -68,6 +85,10 @@ namespace MCPForUnity.Editor.Tools.Rendering
                     {
                         return ValidateRenderContract(parameters);
                     }
+                    case "sample_material":
+                    {
+                        return SampleMaterial(parameters);
+                    }
                     case "render_probe":
                     {
                         return RenderProbe(parameters);
@@ -89,7 +110,7 @@ namespace MCPForUnity.Editor.Tools.Rendering
                         return new ErrorResponse(
                             "Unknown action. Supported: inspect_render_target, inspect_material, "
                             + "inspect_texture, inspect_shader_graph, validate_render_contract, "
-                            + "render_probe, profile_render_target, ping.");
+                            + "sample_material, render_probe, profile_render_target, ping.");
                     }
                 }
             }
@@ -812,6 +833,381 @@ namespace MCPForUnity.Editor.Tools.Rendering
                     level = scope == "target" ? "isolated_editor_render" : "scene_editor_render",
                     locked_manifest = true,
                     limitations = new[] { "No Player/target-hardware timing proof." },
+                },
+            });
+        }
+
+        private static object SampleMaterial(ToolParams parameters)
+        {
+            string materialPath = RenderingAssetUtility.NormalizeAssetPath(parameters.Get("material_path"));
+            if (!RenderingAssetUtility.IsExactAssetPath(materialPath))
+            {
+                return new ErrorResponse("material_path must be an exact path under Assets/ or Packages/.");
+            }
+            Material sourceMaterial = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+            if (sourceMaterial == null)
+            {
+                return new ErrorResponse($"Could not load Material at '{materialPath}'.");
+            }
+            if (sourceMaterial.shader == null)
+            {
+                return new ErrorResponse($"Material '{materialPath}' has no shader.");
+            }
+
+            string comparisonPath = RenderingAssetUtility.NormalizeAssetPath(
+                parameters.Get("compare_to_material_path"));
+            Material comparisonMaterial = null;
+            if (!string.IsNullOrEmpty(comparisonPath))
+            {
+                if (!RenderingAssetUtility.IsExactAssetPath(comparisonPath))
+                {
+                    return new ErrorResponse(
+                        "compare_to_material_path must be an exact path under Assets/ or Packages/.");
+                }
+                comparisonMaterial = AssetDatabase.LoadAssetAtPath<Material>(comparisonPath);
+                if (comparisonMaterial == null)
+                {
+                    return new ErrorResponse($"Could not load comparison Material at '{comparisonPath}'.");
+                }
+                if (comparisonMaterial.shader == null)
+                {
+                    return new ErrorResponse($"Comparison Material '{comparisonPath}' has no shader.");
+                }
+            }
+
+            string requestedProfile = parameters.Get("profile", "auto").Trim().ToLowerInvariant();
+            if (!new[] { "auto", "pbr", "tiled", "foliage", "transparent" }.Contains(requestedProfile))
+            {
+                return new ErrorResponse(
+                    "Unsupported profile. Supported profiles are auto, pbr, tiled, foliage, and transparent.");
+            }
+            string cacheMode = parameters.Get("cache_mode", "use").Trim().ToLowerInvariant();
+            if (!new[] { "use", "refresh", "bypass" }.Contains(cacheMode))
+            {
+                return new ErrorResponse("Unsupported cache_mode. Supported modes are use, refresh, and bypass.");
+            }
+
+            JToken overrideToken = parameters.GetRaw("property_overrides");
+            if (overrideToken?.Type == JTokenType.String)
+            {
+                try
+                {
+                    overrideToken = JToken.Parse(overrideToken.ToString());
+                }
+                catch (JsonException exception)
+                {
+                    return new ErrorResponse($"property_overrides is not valid JSON: {exception.Message}");
+                }
+            }
+            if (overrideToken != null
+                && overrideToken.Type != JTokenType.Null
+                && overrideToken.Type != JTokenType.Object)
+            {
+                return new ErrorResponse(
+                    "property_overrides must be a JSON object keyed by shader property name.");
+            }
+            JObject propertyOverrides = overrideToken as JObject ?? new JObject();
+
+            int maxResolution = Math.Max(256, Math.Min(512, parameters.GetInt("max_resolution") ?? 384));
+            int warmupFrames = Math.Max(0, Math.Min(4, parameters.GetInt("warmup_frames") ?? 1));
+            bool includeImage = parameters.GetBool("include_image", true);
+            if (!TryResolveMaterialSampleOutputPath(
+                parameters.Get("output_path"),
+                out string outputPath,
+                out string fullOutputPath,
+                out string outputError))
+            {
+                return new ErrorResponse(outputError);
+            }
+
+            string selectedProfile = ResolveMaterialSampleProfile(
+                sourceMaterial,
+                materialPath,
+                requestedProfile,
+                out List<string> profileReasons);
+            List<MaterialSampleView> views = BuildMaterialSampleViews(selectedProfile);
+            int materialCount = comparisonMaterial == null ? 1 : 2;
+            int panelCount = views.Count * materialCount;
+            int columns = Math.Max(1, (int)Math.Ceiling(Math.Sqrt(panelCount)));
+            int rows = Math.Max(1, (int)Math.Ceiling(panelCount / (double)columns));
+            int panelSize = Math.Max(32, Math.Min(maxResolution / columns, maxResolution / rows));
+            int sheetWidth = panelSize * columns;
+            int sheetHeight = panelSize * rows;
+
+            bool sourceDirtyBefore = EditorUtility.IsDirty(sourceMaterial);
+            bool comparisonDirtyBefore = comparisonMaterial != null && EditorUtility.IsDirty(comparisonMaterial);
+            UnityEngine.SceneManagement.Scene activeScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            bool sceneDirtyBefore = activeScene.IsValid() && activeScene.isDirty;
+            int qualityBefore = QualitySettings.GetQualityLevel();
+            RenderTexture activeRenderTextureBefore = RenderTexture.active;
+            Material primaryClone = new(sourceMaterial)
+            {
+                name = $"{sourceMaterial.name} (MCP Material Sample)",
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+            Material comparisonClone = comparisonMaterial == null
+                ? null
+                : new Material(comparisonMaterial)
+                {
+                    name = $"{comparisonMaterial.name} (MCP Material Sample Comparison)",
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+
+            List<object> appliedOverrides = new();
+            byte[] png = null;
+            string cacheKey = null;
+            string cachePath = null;
+            string fullCachePath = null;
+            bool cacheHit = false;
+            List<object> panelManifest = BuildMaterialSamplePanelManifest(
+                views,
+                materialPath,
+                comparisonPath,
+                materialCount,
+                columns,
+                rows,
+                panelSize,
+                sheetHeight);
+            List<string> contextRequirements = BuildMaterialSampleContextRequirements(sourceMaterial, materialPath);
+            if (comparisonMaterial != null)
+            {
+                foreach (string requirement in BuildMaterialSampleContextRequirements(
+                    comparisonMaterial,
+                    comparisonPath))
+                {
+                    if (!contextRequirements.Contains(requirement))
+                    {
+                        contextRequirements.Add(requirement);
+                    }
+                }
+            }
+
+            RenderPipelineAsset pipeline = GraphicsSettings.currentRenderPipeline;
+            string pipelinePath = pipeline == null ? null : AssetDatabase.GetAssetPath(pipeline);
+            string primaryDependencyHash = AssetDatabase.GetAssetDependencyHash(materialPath).ToString();
+            string comparisonDependencyHash = comparisonMaterial == null
+                ? null
+                : AssetDatabase.GetAssetDependencyHash(comparisonPath).ToString();
+            string pipelineDependencyHash = string.IsNullOrEmpty(pipelinePath)
+                ? null
+                : AssetDatabase.GetAssetDependencyHash(pipelinePath).ToString();
+            try
+            {
+                if (!TryApplyMaterialSampleOverrides(
+                    primaryClone,
+                    propertyOverrides,
+                    appliedOverrides,
+                    out string overrideError))
+                {
+                    return new ErrorResponse(overrideError);
+                }
+
+                string cachePayload = JsonConvert.SerializeObject(new
+                {
+                    sampler = "unity-mcp/material-sampler@1",
+                    material_path = materialPath,
+                    material_dependency_hash = primaryDependencyHash,
+                    comparison_material_path = comparisonPath,
+                    comparison_dependency_hash = comparisonDependencyHash,
+                    pipeline_path = pipelinePath,
+                    pipeline_dependency_hash = pipelineDependencyHash,
+                    pipeline_type = pipeline?.GetType().FullName ?? "BuiltInRenderPipeline",
+                    color_space = PlayerSettings.colorSpace.ToString(),
+                    quality_level = qualityBefore,
+                    quality_name = QualitySettings.names.Length > qualityBefore
+                        ? QualitySettings.names[qualityBefore]
+                        : null,
+                    selected_profile = selectedProfile,
+                    views = views.Select(MaterialSampleViewRecord).ToArray(),
+                    overrides = appliedOverrides,
+                    max_resolution = maxResolution,
+                    sheet_width = sheetWidth,
+                    sheet_height = sheetHeight,
+                    panel_size = panelSize,
+                    warmup_frames = warmupFrames,
+                }, Formatting.None);
+                cacheKey = RenderingAssetUtility.ComputeSha256(Encoding.UTF8.GetBytes(cachePayload));
+                cachePath = $"Library/MCPForUnity/MaterialSamples/Cache/{cacheKey}.png";
+                fullCachePath = GetProjectFullPath(cachePath);
+
+                if (cacheMode == "use" && File.Exists(fullCachePath))
+                {
+                    byte[] cached = File.ReadAllBytes(fullCachePath);
+                    if (IsPng(cached))
+                    {
+                        png = cached;
+                        cacheHit = true;
+                    }
+                }
+                if (png == null)
+                {
+                    png = CaptureMaterialSampleContactSheet(
+                        primaryClone,
+                        comparisonClone,
+                        views,
+                        panelSize,
+                        columns,
+                        rows,
+                        warmupFrames);
+                    if (cacheMode != "bypass")
+                    {
+                        WriteBytes(fullCachePath, png);
+                        TrimMaterialSampleCache(Path.GetDirectoryName(fullCachePath), 128);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(fullOutputPath))
+                {
+                    WriteBytes(fullOutputPath, png);
+                }
+            }
+            finally
+            {
+                RenderTexture.active = activeRenderTextureBefore;
+                UnityEngine.Object.DestroyImmediate(primaryClone);
+                if (comparisonClone != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(comparisonClone);
+                }
+            }
+
+            bool sourceDirtyAfter = EditorUtility.IsDirty(sourceMaterial);
+            bool comparisonDirtyAfter = comparisonMaterial != null && EditorUtility.IsDirty(comparisonMaterial);
+            bool sceneDirtyAfter = activeScene.IsValid() && activeScene.isDirty;
+            List<object> validationChecks = BuildMaterialSampleValidation(sourceMaterial, materialPath);
+            if (comparisonMaterial != null)
+            {
+                validationChecks.AddRange(BuildMaterialSampleValidation(comparisonMaterial, comparisonPath));
+            }
+            string pngSha256 = RenderingAssetUtility.ComputeSha256(png);
+
+            return new SuccessResponse("Material sample rendered from an isolated locked manifest.", new
+            {
+                schema_version = "unity-mcp/material-sample@1",
+                material = BuildMaterialRecord(sourceMaterial, materialPath, false, 1, 0),
+                comparison_material = comparisonMaterial == null
+                    ? null
+                    : BuildMaterialRecord(comparisonMaterial, comparisonPath, false, 1, 0),
+                profile = new
+                {
+                    requested = requestedProfile,
+                    selected = selectedProfile,
+                    reasons = profileReasons,
+                },
+                property_overrides = new
+                {
+                    scope = "primary_temporary_clone_only",
+                    count = appliedOverrides.Count,
+                    applied = appliedOverrides,
+                },
+                preview = new
+                {
+                    mime_type = "image/png",
+                    png_base64 = includeImage ? Convert.ToBase64String(png) : null,
+                    image_included = includeImage,
+                    output_path = outputPath,
+                    output_sha256 = pngSha256,
+                    bytes = png.Length,
+                    width = sheetWidth,
+                    height = sheetHeight,
+                    max_resolution = maxResolution,
+                    panel_size = panelSize,
+                    columns,
+                    rows,
+                    panels = panelManifest,
+                },
+                locked_manifest = new
+                {
+                    sampler_version = "unity-mcp/material-sampler@1",
+                    primary = new
+                    {
+                        path = materialPath,
+                        guid = AssetDatabase.AssetPathToGUID(materialPath),
+                        sha256 = RenderingAssetUtility.ComputeSha256(materialPath),
+                        dependency_hash = primaryDependencyHash,
+                        shader = sourceMaterial.shader.name,
+                        shader_path = AssetDatabase.GetAssetPath(sourceMaterial.shader),
+                    },
+                    comparison = comparisonMaterial == null ? null : new
+                    {
+                        path = comparisonPath,
+                        guid = AssetDatabase.AssetPathToGUID(comparisonPath),
+                        sha256 = RenderingAssetUtility.ComputeSha256(comparisonPath),
+                        dependency_hash = comparisonDependencyHash,
+                        shader = comparisonMaterial.shader.name,
+                        shader_path = AssetDatabase.GetAssetPath(comparisonMaterial.shader),
+                    },
+                    render_pipeline = new
+                    {
+                        name = pipeline?.name ?? "Built-in Render Pipeline",
+                        type = pipeline?.GetType().FullName ?? "BuiltInRenderPipeline",
+                        path = pipelinePath,
+                        dependency_hash = pipelineDependencyHash,
+                    },
+                    color_space = PlayerSettings.colorSpace.ToString(),
+                    quality_level = qualityBefore,
+                    quality_name = QualitySettings.names.Length > qualityBefore
+                        ? QualitySettings.names[qualityBefore]
+                        : null,
+                    warmup_frames = warmupFrames,
+                    views = views.Select(MaterialSampleViewRecord).ToArray(),
+                    comparison_layout = comparisonMaterial == null
+                        ? "single_material"
+                        : "same_views_side_by_side",
+                },
+                context = new
+                {
+                    requires_scene_probe = contextRequirements.Count > 0,
+                    requirements = contextRequirements,
+                    next_step = contextRequirements.Count > 0
+                        ? "Use render_probe on the actual scene owner with a locked camera and manifest."
+                        : null,
+                },
+                validation = new
+                {
+                    check_count = validationChecks.Count,
+                    warning_count = validationChecks.Count(check =>
+                        string.Equals(JObject.FromObject(check)["status"]?.ToString(), "warning", StringComparison.Ordinal)),
+                    checks = validationChecks,
+                },
+                cache = new
+                {
+                    mode = cacheMode,
+                    key = cacheKey,
+                    hit = cacheHit,
+                    path = cacheMode == "bypass" ? null : cachePath,
+                    maximum_entries = 128,
+                },
+                restoration = new
+                {
+                    source_material_dirty_before = sourceDirtyBefore,
+                    source_material_dirty_after = sourceDirtyAfter,
+                    source_material_dirty_unchanged = sourceDirtyBefore == sourceDirtyAfter,
+                    comparison_material_dirty_before = comparisonMaterial == null ? (bool?)null : comparisonDirtyBefore,
+                    comparison_material_dirty_after = comparisonMaterial == null ? (bool?)null : comparisonDirtyAfter,
+                    comparison_material_dirty_unchanged = comparisonMaterial == null
+                        ? (bool?)null
+                        : comparisonDirtyBefore == comparisonDirtyAfter,
+                    scene_dirty_before = sceneDirtyBefore,
+                    scene_dirty_after = sceneDirtyAfter,
+                    scene_dirty_unchanged = sceneDirtyBefore == sceneDirtyAfter,
+                    render_texture_active_restored = ReferenceEquals(RenderTexture.active, activeRenderTextureBefore),
+                    quality_level_restored = QualitySettings.GetQualityLevel() == qualityBefore,
+                    project_assets_written = false,
+                },
+                proof = new
+                {
+                    level = "isolated_editor_material_sample",
+                    locked_manifest = true,
+                    source_assets_untouched = sourceDirtyBefore == sourceDirtyAfter
+                        && (comparisonMaterial == null || comparisonDirtyBefore == comparisonDirtyAfter),
+                    excludes = new[]
+                    {
+                        "actual scene lighting, probes, lightmaps, decals, and renderer-feature state",
+                        "Player build behavior",
+                        "target GPU behavior or timing",
+                        "visual acceptance without a locked scene render probe",
+                    },
                 },
             });
         }
@@ -2040,6 +2436,902 @@ namespace MCPForUnity.Editor.Tools.Rendering
                 importerMatches ? "pass" : "fail",
                 $"{owner} {propertyName} -> {texturePath}: {contract.Name}; sRGB={importer.sRGBTexture}, type={importer.textureType}, mips={importer.mipmapEnabled}.",
                 bindingProof));
+        }
+
+        private static string ResolveMaterialSampleProfile(
+            Material material,
+            string materialPath,
+            string requestedProfile,
+            out List<string> reasons)
+        {
+            reasons = new List<string>();
+            if (requestedProfile != "auto")
+            {
+                reasons.Add("Caller selected the profile explicitly.");
+                return requestedProfile;
+            }
+
+            string shaderPath = material.shader == null ? null : AssetDatabase.GetAssetPath(material.shader);
+            string identity = string.Join(" ", new[]
+            {
+                material.name,
+                materialPath,
+                material.shader?.name,
+                shaderPath,
+                material.GetTag("RenderType", false, string.Empty),
+                string.Join(" ", material.shaderKeywords),
+            }).ToLowerInvariant();
+            bool transparent = material.renderQueue >= 3000
+                || identity.Contains("transparent")
+                || (TryGetFloat(material, "_Surface") ?? 0f) > 0.5f;
+            if (transparent)
+            {
+                reasons.Add("Render queue, RenderType, shader identity, or _Surface indicates transparency.");
+                return "transparent";
+            }
+
+            bool cutout = identity.Contains("vegetation")
+                || identity.Contains("foliage")
+                || identity.Contains("leaf")
+                || identity.Contains("grass")
+                || identity.Contains("transparentcutout")
+                || (TryGetFloat(material, "_AlphaClip") ?? 0f) > 0.5f;
+            if (cutout)
+            {
+                reasons.Add("Shader/material identity or alpha clipping indicates foliage or cutout rendering.");
+                return "foliage";
+            }
+
+            if (identity.Contains("triplanar")
+                || identity.Contains("microsplat")
+                || identity.Contains("terrain")
+                || identity.Contains("tiled"))
+            {
+                reasons.Add("Shader/material identity indicates tiled, triplanar, or terrain mapping.");
+                return "tiled";
+            }
+
+            reasons.Add("No transparent, cutout/foliage, or tiled/triplanar signal was found.");
+            return "pbr";
+        }
+
+        private static List<MaterialSampleView> BuildMaterialSampleViews(string profile)
+        {
+            Color dark = new(0.035f, 0.04f, 0.05f, 1f);
+            Color mid = new(0.12f, 0.13f, 0.15f, 1f);
+            Color light = new(0.78f, 0.80f, 0.84f, 1f);
+            Color ambient = new(0.18f, 0.19f, 0.21f, 1f);
+            switch (profile)
+            {
+                case "tiled":
+                {
+                    return new List<MaterialSampleView>
+                    {
+                        NewMaterialSampleView("cube", "cube", new Vector3(0f, 0f, -3.8f),
+                            Vector3.zero, Vector3.one, new Vector3(18f, -28f, 0f), mid,
+                            new Vector3(48f, -32f, 0f), 1.25f, 0.15f, ambient),
+                        NewMaterialSampleView("grazing_plane", "quad", new Vector3(0f, 0f, -3.2f),
+                            Vector3.zero, new Vector3(1.45f, 1.45f, 1f), new Vector3(63f, 0f, 0f), mid,
+                            new Vector3(55f, -24f, 0f), 1.35f, 0.1f, ambient),
+                    };
+                }
+                case "foliage":
+                {
+                    return new List<MaterialSampleView>
+                    {
+                        NewMaterialSampleView("front_card", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), Vector3.zero, mid,
+                            new Vector3(40f, -25f, 0f), 1.2f, 0.1f, ambient),
+                        NewMaterialSampleView("back_card", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), new Vector3(0f, 180f, 0f), mid,
+                            new Vector3(40f, 155f, 0f), 1.2f, 0.1f, ambient),
+                        NewMaterialSampleView("backlit_card", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), new Vector3(0f, 18f, 0f), dark,
+                            new Vector3(25f, -20f, 0f), 0.25f, 1.8f, new Color(0.05f, 0.05f, 0.06f, 1f)),
+                    };
+                }
+                case "transparent":
+                {
+                    return new List<MaterialSampleView>
+                    {
+                        NewMaterialSampleView("dark_background", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), Vector3.zero, dark,
+                            new Vector3(42f, -28f, 0f), 1.2f, 0.1f, ambient),
+                        NewMaterialSampleView("light_background", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), Vector3.zero, light,
+                            new Vector3(42f, -28f, 0f), 1.2f, 0.1f, new Color(0.32f, 0.32f, 0.32f, 1f)),
+                        NewMaterialSampleView("oblique_card", "quad", new Vector3(0f, 0f, -3.0f),
+                            Vector3.zero, new Vector3(1.35f, 1.35f, 1f), new Vector3(0f, 52f, 0f), mid,
+                            new Vector3(35f, -35f, 0f), 1.3f, 0.2f, ambient),
+                    };
+                }
+                default:
+                {
+                    return new List<MaterialSampleView>
+                    {
+                        NewMaterialSampleView("sphere", "sphere", new Vector3(0f, 0f, -3.4f),
+                            Vector3.zero, Vector3.one, new Vector3(0f, 22f, 0f), mid,
+                            new Vector3(48f, -32f, 0f), 1.25f, 0.15f, ambient),
+                        NewMaterialSampleView("grazing_plane", "quad", new Vector3(0f, 0f, -3.2f),
+                            Vector3.zero, new Vector3(1.45f, 1.45f, 1f), new Vector3(63f, 0f, 0f), mid,
+                            new Vector3(55f, -24f, 0f), 1.35f, 0.1f, ambient),
+                    };
+                }
+            }
+        }
+
+        private static MaterialSampleView NewMaterialSampleView(
+            string name,
+            string meshKind,
+            Vector3 cameraPosition,
+            Vector3 cameraEuler,
+            Vector3 objectScale,
+            Vector3 objectEuler,
+            Color background,
+            Vector3 keyLightEuler,
+            float keyLightIntensity,
+            float backLightIntensity,
+            Color ambient)
+        {
+            return new MaterialSampleView
+            {
+                Name = name,
+                MeshKind = meshKind,
+                CameraPosition = cameraPosition,
+                CameraEuler = cameraEuler,
+                ObjectScale = objectScale,
+                ObjectEuler = objectEuler,
+                Background = background,
+                KeyLightEuler = keyLightEuler,
+                KeyLightIntensity = keyLightIntensity,
+                BackLightIntensity = backLightIntensity,
+                Ambient = ambient,
+            };
+        }
+
+        private static object MaterialSampleViewRecord(MaterialSampleView view)
+        {
+            return new
+            {
+                name = view.Name,
+                mesh = view.MeshKind,
+                camera = new
+                {
+                    position = Vector3Record(view.CameraPosition),
+                    rotation = Vector3Record(view.CameraEuler),
+                    field_of_view = 30f,
+                    near_clip = 0.01f,
+                    far_clip = 20f,
+                },
+                geometry = new
+                {
+                    scale = Vector3Record(view.ObjectScale),
+                    rotation = Vector3Record(view.ObjectEuler),
+                },
+                lighting = new
+                {
+                    key_rotation = Vector3Record(view.KeyLightEuler),
+                    key_intensity = view.KeyLightIntensity,
+                    back_intensity = view.BackLightIntensity,
+                    ambient = ColorRecord(view.Ambient),
+                },
+                background = ColorRecord(view.Background),
+            };
+        }
+
+        private static object ColorRecord(Color value)
+        {
+            return new { r = value.r, g = value.g, b = value.b, a = value.a };
+        }
+
+        private static List<object> BuildMaterialSamplePanelManifest(
+            List<MaterialSampleView> views,
+            string materialPath,
+            string comparisonPath,
+            int materialCount,
+            int columns,
+            int rows,
+            int panelSize,
+            int sheetHeight)
+        {
+            List<object> panels = new();
+            int cell = 0;
+            foreach (MaterialSampleView view in views)
+            {
+                for (int materialIndex = 0; materialIndex < materialCount; materialIndex++)
+                {
+                    int column = cell % columns;
+                    int row = cell / columns;
+                    int x = column * panelSize;
+                    int yBottom = sheetHeight - ((row + 1) * panelSize);
+                    panels.Add(new
+                    {
+                        index = cell,
+                        view = view.Name,
+                        role = materialIndex == 0 ? "primary" : "comparison",
+                        material_path = materialIndex == 0 ? materialPath : comparisonPath,
+                        x,
+                        y_top = row * panelSize,
+                        y_bottom = yBottom,
+                        width = panelSize,
+                        height = panelSize,
+                    });
+                    cell++;
+                }
+            }
+            return panels;
+        }
+
+        private static byte[] CaptureMaterialSampleContactSheet(
+            Material primary,
+            Material comparison,
+            List<MaterialSampleView> views,
+            int panelSize,
+            int columns,
+            int rows,
+            int warmupFrames)
+        {
+            int width = columns * panelSize;
+            int height = rows * panelSize;
+            Texture2D sheet = new(width, height, TextureFormat.RGBA32, false, false)
+            {
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+            try
+            {
+                Color32[] background = Enumerable.Repeat(
+                    new Color32(12, 13, 16, 255),
+                    width * height).ToArray();
+                sheet.SetPixels32(background);
+                Material[] materials = comparison == null
+                    ? new[] { primary }
+                    : new[] { primary, comparison };
+                int cell = 0;
+                foreach (MaterialSampleView view in views)
+                {
+                    foreach (Material material in materials)
+                    {
+                        Color32[] pixels = CaptureMaterialSamplePanel(
+                            material,
+                            view,
+                            panelSize,
+                            warmupFrames);
+                        int column = cell % columns;
+                        int row = cell / columns;
+                        int x = column * panelSize;
+                        int y = height - ((row + 1) * panelSize);
+                        sheet.SetPixels32(x, y, panelSize, panelSize, pixels);
+                        cell++;
+                    }
+                }
+                sheet.Apply(false, false);
+                return sheet.EncodeToPNG();
+            }
+            finally
+            {
+                UnityEngine.Object.DestroyImmediate(sheet);
+            }
+        }
+
+        private static Color32[] CaptureMaterialSamplePanel(
+            Material material,
+            MaterialSampleView view,
+            int panelSize,
+            int warmupFrames)
+        {
+            PreviewRenderUtility preview = new();
+            Texture2D image = null;
+            try
+            {
+                preview.camera.clearFlags = CameraClearFlags.SolidColor;
+                preview.camera.backgroundColor = view.Background;
+                preview.camera.fieldOfView = 30f;
+                preview.camera.nearClipPlane = 0.01f;
+                preview.camera.farClipPlane = 20f;
+                preview.camera.transform.SetPositionAndRotation(
+                    view.CameraPosition,
+                    Quaternion.Euler(view.CameraEuler));
+                preview.ambientColor = view.Ambient;
+                if (preview.lights.Length > 0)
+                {
+                    preview.lights[0].type = LightType.Directional;
+                    preview.lights[0].color = Color.white;
+                    preview.lights[0].intensity = view.KeyLightIntensity;
+                    preview.lights[0].transform.rotation = Quaternion.Euler(view.KeyLightEuler);
+                }
+                if (preview.lights.Length > 1)
+                {
+                    preview.lights[1].type = LightType.Directional;
+                    preview.lights[1].color = new Color(0.65f, 0.75f, 1f, 1f);
+                    preview.lights[1].intensity = view.BackLightIntensity;
+                    preview.lights[1].transform.rotation = Quaternion.Euler(
+                        -view.KeyLightEuler.x,
+                        view.KeyLightEuler.y + 180f,
+                        0f);
+                }
+
+                Mesh mesh = ResolveMaterialSampleMesh(view.MeshKind);
+                preview.BeginStaticPreview(new Rect(0f, 0f, panelSize, panelSize));
+                Matrix4x4 matrix = Matrix4x4.TRS(
+                    Vector3.zero,
+                    Quaternion.Euler(view.ObjectEuler),
+                    view.ObjectScale);
+                for (int subMesh = 0; subMesh < Math.Max(1, mesh.subMeshCount); subMesh++)
+                {
+                    preview.DrawMesh(mesh, matrix, material, subMesh);
+                }
+                for (int index = 0; index < warmupFrames; index++)
+                {
+                    preview.Render(true);
+                }
+                preview.Render(true);
+                image = preview.EndStaticPreview();
+                if (image == null)
+                {
+                    throw new InvalidOperationException($"Preview rendering returned no image for view '{view.Name}'.");
+                }
+                return image.GetPixels32();
+            }
+            finally
+            {
+                if (image != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(image);
+                }
+                preview.Cleanup();
+            }
+        }
+
+        private static Mesh ResolveMaterialSampleMesh(string meshKind)
+        {
+            string[] names = meshKind == "sphere"
+                ? new[] { "New-Sphere.fbx", "Sphere.fbx" }
+                : meshKind == "cube"
+                    ? new[] { "Cube.fbx", "New-Cube.fbx" }
+                    : new[] { "Quad.fbx", "New-Quad.fbx" };
+            foreach (string name in names)
+            {
+                Mesh mesh = UnityEngine.Resources.GetBuiltinResource<Mesh>(name);
+                if (mesh != null)
+                {
+                    return mesh;
+                }
+            }
+            throw new InvalidOperationException(
+                $"Unity built-in preview mesh '{meshKind}' could not be resolved.");
+        }
+
+        private static bool TryApplyMaterialSampleOverrides(
+            Material material,
+            JObject overrides,
+            List<object> applied,
+            out string error)
+        {
+            error = null;
+            Shader shader = material.shader;
+            foreach (JProperty property in overrides.Properties().OrderBy(
+                item => item.Name,
+                StringComparer.Ordinal))
+            {
+                int propertyIndex = -1;
+                for (int index = 0; index < shader.GetPropertyCount(); index++)
+                {
+                    if (string.Equals(shader.GetPropertyName(index), property.Name, StringComparison.Ordinal))
+                    {
+                        propertyIndex = index;
+                        break;
+                    }
+                }
+                if (propertyIndex < 0 || !material.HasProperty(property.Name))
+                {
+                    error = $"Shader '{shader.name}' has no material property '{property.Name}'.";
+                    return false;
+                }
+
+                ShaderPropertyType propertyType = shader.GetPropertyType(propertyIndex);
+                switch (propertyType)
+                {
+                    case ShaderPropertyType.Color:
+                    {
+                        if (!TryReadVector4(property.Value, true, out Vector4 vector, out error))
+                        {
+                            error = $"Override '{property.Name}' must be a color array/object: {error}";
+                            return false;
+                        }
+                        Color color = new(vector.x, vector.y, vector.z, vector.w);
+                        material.SetColor(property.Name, color);
+                        applied.Add(new
+                        {
+                            property = property.Name,
+                            type = "Color",
+                            value = ColorRecord(color),
+                        });
+                        break;
+                    }
+                    case ShaderPropertyType.Vector:
+                    {
+                        if (!TryReadVector4(property.Value, false, out Vector4 vector, out error))
+                        {
+                            error = $"Override '{property.Name}' must be a vector array/object: {error}";
+                            return false;
+                        }
+                        material.SetVector(property.Name, vector);
+                        applied.Add(new
+                        {
+                            property = property.Name,
+                            type = "Vector",
+                            value = new { x = vector.x, y = vector.y, z = vector.z, w = vector.w },
+                        });
+                        break;
+                    }
+                    case ShaderPropertyType.Float:
+                    case ShaderPropertyType.Range:
+                    {
+                        if (!TryReadFloat(property.Value, out float value))
+                        {
+                            error = $"Override '{property.Name}' must be numeric.";
+                            return false;
+                        }
+                        material.SetFloat(property.Name, value);
+                        applied.Add(new
+                        {
+                            property = property.Name,
+                            type = propertyType.ToString(),
+                            value,
+                        });
+                        break;
+                    }
+                    case ShaderPropertyType.Int:
+                    {
+                        if (!TryReadFloat(property.Value, out float numeric)
+                            || Math.Abs(numeric - Math.Round(numeric)) > 0.0001f)
+                        {
+                            error = $"Override '{property.Name}' must be an integer.";
+                            return false;
+                        }
+                        int value = (int)Math.Round(numeric);
+                        material.SetInteger(property.Name, value);
+                        applied.Add(new
+                        {
+                            property = property.Name,
+                            type = "Int",
+                            value,
+                        });
+                        break;
+                    }
+                    case ShaderPropertyType.Texture:
+                    {
+                        if (!TryApplyMaterialSampleTextureOverride(
+                            material,
+                            property.Name,
+                            property.Value,
+                            out object record,
+                            out error))
+                        {
+                            return false;
+                        }
+                        applied.Add(record);
+                        break;
+                    }
+                    default:
+                    {
+                        error = $"Override '{property.Name}' uses unsupported type '{propertyType}'.";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private static bool TryApplyMaterialSampleTextureOverride(
+            Material material,
+            string propertyName,
+            JToken token,
+            out object record,
+            out string error)
+        {
+            record = null;
+            error = null;
+            string texturePath = null;
+            JToken scaleToken = null;
+            JToken offsetToken = null;
+            if (token == null || token.Type == JTokenType.Null)
+            {
+                texturePath = null;
+            }
+            else if (token.Type == JTokenType.String)
+            {
+                texturePath = RenderingAssetUtility.NormalizeAssetPath(token.ToString());
+            }
+            else if (token is JObject textureObject)
+            {
+                texturePath = RenderingAssetUtility.NormalizeAssetPath(
+                    textureObject["texture_path"]?.ToString() ?? textureObject["path"]?.ToString());
+                scaleToken = textureObject["scale"];
+                offsetToken = textureObject["offset"];
+            }
+            else
+            {
+                error = $"Override '{propertyName}' must be a texture path, null, or texture object.";
+                return false;
+            }
+
+            Texture texture = null;
+            if (!string.IsNullOrEmpty(texturePath))
+            {
+                if (!RenderingAssetUtility.IsExactAssetPath(texturePath))
+                {
+                    error = $"Override '{propertyName}' texture path must be exact under Assets/ or Packages/.";
+                    return false;
+                }
+                texture = AssetDatabase.LoadAssetAtPath<Texture>(texturePath);
+                if (texture == null)
+                {
+                    error = $"Could not load override Texture at '{texturePath}'.";
+                    return false;
+                }
+            }
+            material.SetTexture(propertyName, texture);
+
+            Vector2 scale = material.GetTextureScale(propertyName);
+            if (scaleToken != null)
+            {
+                if (!TryReadVector2(scaleToken, out scale, out error))
+                {
+                    error = $"Override '{propertyName}' texture scale is invalid: {error}";
+                    return false;
+                }
+                material.SetTextureScale(propertyName, scale);
+            }
+            Vector2 offset = material.GetTextureOffset(propertyName);
+            if (offsetToken != null)
+            {
+                if (!TryReadVector2(offsetToken, out offset, out error))
+                {
+                    error = $"Override '{propertyName}' texture offset is invalid: {error}";
+                    return false;
+                }
+                material.SetTextureOffset(propertyName, offset);
+            }
+            record = new
+            {
+                property = propertyName,
+                type = "Texture",
+                value = new
+                {
+                    path = texturePath,
+                    guid = string.IsNullOrEmpty(texturePath)
+                        ? null
+                        : AssetDatabase.AssetPathToGUID(texturePath),
+                    dependency_hash = string.IsNullOrEmpty(texturePath)
+                        ? null
+                        : AssetDatabase.GetAssetDependencyHash(texturePath).ToString(),
+                    scale = Vector2Record(scale),
+                    offset = Vector2Record(offset),
+                },
+            };
+            return true;
+        }
+
+        private static bool TryReadVector4(
+            JToken token,
+            bool color,
+            out Vector4 value,
+            out string error)
+        {
+            value = color ? new Vector4(0f, 0f, 0f, 1f) : Vector4.zero;
+            error = null;
+            if (token is JArray array)
+            {
+                int minimum = color ? 3 : 2;
+                if (array.Count < minimum || array.Count > 4)
+                {
+                    error = $"expected {minimum}-4 numeric components";
+                    return false;
+                }
+                float[] components = new float[4] { 0f, 0f, 0f, color ? 1f : 0f };
+                for (int index = 0; index < array.Count; index++)
+                {
+                    if (!TryReadFloat(array[index], out components[index]))
+                    {
+                        error = $"component {index} is not numeric";
+                        return false;
+                    }
+                }
+                value = new Vector4(components[0], components[1], components[2], components[3]);
+                return true;
+            }
+            if (token is JObject valueObject)
+            {
+                string[] names = color
+                    ? new[] { "r", "g", "b", "a" }
+                    : new[] { "x", "y", "z", "w" };
+                int minimum = color ? 3 : 2;
+                float[] components = new float[4] { 0f, 0f, 0f, color ? 1f : 0f };
+                for (int index = 0; index < names.Length; index++)
+                {
+                    JToken component = valueObject[names[index]];
+                    if (component == null)
+                    {
+                        if (index < minimum)
+                        {
+                            error = $"missing component '{names[index]}'";
+                            return false;
+                        }
+                        continue;
+                    }
+                    if (!TryReadFloat(component, out components[index]))
+                    {
+                        error = $"component '{names[index]}' is not numeric";
+                        return false;
+                    }
+                }
+                value = new Vector4(components[0], components[1], components[2], components[3]);
+                return true;
+            }
+            error = "expected an array or object";
+            return false;
+        }
+
+        private static bool TryReadVector2(JToken token, out Vector2 value, out string error)
+        {
+            value = Vector2.zero;
+            error = null;
+            if (token is JArray array && array.Count == 2
+                && TryReadFloat(array[0], out float x)
+                && TryReadFloat(array[1], out float y))
+            {
+                value = new Vector2(x, y);
+                return true;
+            }
+            if (token is JObject valueObject
+                && TryReadFloat(valueObject["x"], out x)
+                && TryReadFloat(valueObject["y"], out y))
+            {
+                value = new Vector2(x, y);
+                return true;
+            }
+            error = "expected two numeric components";
+            return false;
+        }
+
+        private static bool TryReadFloat(JToken token, out float value)
+        {
+            value = 0f;
+            if (token == null
+                || (token.Type != JTokenType.Integer
+                    && token.Type != JTokenType.Float
+                    && token.Type != JTokenType.String))
+            {
+                return false;
+            }
+            return float.TryParse(
+                token.ToString(),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out value);
+        }
+
+        private static List<string> BuildMaterialSampleContextRequirements(
+            Material material,
+            string materialPath)
+        {
+            HashSet<string> requirements = new(StringComparer.Ordinal);
+            Shader shader = material.shader;
+            string shaderPath = shader == null ? null : AssetDatabase.GetAssetPath(shader);
+            StringBuilder identityEvidence = new();
+            identityEvidence.Append(material.name).Append(' ')
+                .Append(materialPath).Append(' ')
+                .Append(shader?.name).Append(' ')
+                .Append(shaderPath).Append(' ')
+                .Append(string.Join(" ", material.shaderKeywords));
+            if (shader != null)
+            {
+                for (int index = 0; index < shader.GetPropertyCount(); index++)
+                {
+                    identityEvidence.Append(' ').Append(shader.GetPropertyName(index));
+                }
+            }
+            string identityText = identityEvidence.ToString().ToLowerInvariant();
+            string sourceText = string.Empty;
+            string shaderFullPath = string.IsNullOrEmpty(shaderPath)
+                ? null
+                : RenderingAssetUtility.GetFullPath(shaderPath);
+            if (!string.IsNullOrEmpty(shaderFullPath) && File.Exists(shaderFullPath))
+            {
+                FileInfo info = new(shaderFullPath);
+                if (info.Length <= 2 * 1024 * 1024)
+                {
+                    sourceText = File.ReadAllText(shaderFullPath).ToLowerInvariant();
+                }
+            }
+            string text = identityText + " " + sourceText;
+            if (text.Contains("the vegetation engine")
+                || text.Contains("the visual engine")
+                || ContainsMaterialSampleIdentifierToken(identityText, "tve"))
+            {
+                requirements.Add("TVE vegetation integration and its scene/global shader state are not present in isolation.");
+            }
+            if (text.Contains("microsplat") || text.Contains("terrainlit") || text.Contains("terrain shader"))
+            {
+                requirements.Add("Terrain or MicroSplat control textures, geometry, and integration state require the actual scene owner.");
+            }
+            if (text.Contains("bakery")
+                || text.Contains("adaptive probe volume")
+                || text.Contains("probevolume")
+                || ContainsMaterialSampleIdentifierToken(identityText, "apv")
+                || sourceText.Contains("apv_")
+                || sourceText.Contains("_apv"))
+            {
+                requirements.Add("Bakery, APV, or probe-volume lighting requires scene lighting/probe evidence.");
+            }
+            if (text.Contains("scenecolornode") || text.Contains("_cameraopaquetexture"))
+            {
+                requirements.Add("Scene Color or camera opaque texture sampling requires a real camera and renderer configuration.");
+            }
+            if (text.Contains("scenedepthnode") || text.Contains("_cameradepthtexture"))
+            {
+                requirements.Add("Scene Depth or camera depth texture sampling requires a real camera and renderer configuration.");
+            }
+            if (identityText.Contains("decal")
+                || identityText.Contains("rendererfeature")
+                || identityText.Contains("renderer feature")
+                || sourceText.Contains("decalsubtarget"))
+            {
+                requirements.Add("Decal or renderer-feature participation requires the actual renderer and scene context.");
+            }
+            return requirements.OrderBy(value => value, StringComparer.Ordinal).ToList();
+        }
+
+        private static bool ContainsMaterialSampleIdentifierToken(string value, string token)
+        {
+            return (value ?? string.Empty)
+                .Split(new[] { ' ', '/', '\\', '_', '-', '.', ':', '(', ')', '[', ']' },
+                    StringSplitOptions.RemoveEmptyEntries)
+                .Any(part => string.Equals(part, token, StringComparison.Ordinal));
+        }
+
+        private static List<object> BuildMaterialSampleValidation(Material material, string materialPath)
+        {
+            List<object> checks = new()
+            {
+                new
+                {
+                    check = "shader_supported",
+                    owner = materialPath,
+                    status = material.shader != null && material.shader.isSupported ? "pass" : "warning",
+                    evidence = material.shader == null
+                        ? "Material has no shader."
+                        : $"Shader '{material.shader.name}' isSupported={material.shader.isSupported}.",
+                },
+            };
+            Shader shader = material.shader;
+            if (shader == null)
+            {
+                return checks;
+            }
+            for (int index = 0; index < shader.GetPropertyCount(); index++)
+            {
+                if (shader.GetPropertyType(index) != ShaderPropertyType.Texture)
+                {
+                    continue;
+                }
+                string propertyName = shader.GetPropertyName(index);
+                Texture texture = material.GetTexture(propertyName);
+                if (texture == null)
+                {
+                    continue;
+                }
+                string texturePath = AssetDatabase.GetAssetPath(texture);
+                TextureSemanticContract contract = RenderingAssetUtility.ClassifyTextureContract(texturePath, null);
+                checks.Add(new
+                {
+                    check = "texture_semantic_contract",
+                    owner = materialPath,
+                    property = propertyName,
+                    texture_path = texturePath,
+                    status = contract.IsKnown ? "pass" : "warning",
+                    evidence = contract.IsKnown
+                        ? $"Classified as '{contract.Name}' from '{contract.Source}'."
+                        : "Texture semantic contract is unknown; channel meaning is not proven.",
+                });
+            }
+            return checks;
+        }
+
+        private static bool TryResolveMaterialSampleOutputPath(
+            string requested,
+            out string projectRelativePath,
+            out string fullPath,
+            out string error)
+        {
+            projectRelativePath = null;
+            fullPath = null;
+            error = null;
+            if (string.IsNullOrWhiteSpace(requested))
+            {
+                return true;
+            }
+            string normalized = requested.Trim().Replace('\\', '/');
+            if (Path.IsPathRooted(normalized)
+                || normalized.Contains(":")
+                || normalized.Split('/').Any(segment => segment == "..")
+                || !normalized.StartsWith(
+                    "Library/MCPForUnity/MaterialSamples/",
+                    StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(Path.GetExtension(normalized), ".png", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "output_path must be a relative .png path under Library/MCPForUnity/MaterialSamples/.";
+                return false;
+            }
+            string root = GetProjectFullPath("Library/MCPForUnity/MaterialSamples");
+            string candidate = GetProjectFullPath(normalized);
+            string rootPrefix = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                error = "output_path resolves outside Library/MCPForUnity/MaterialSamples/.";
+                return false;
+            }
+            projectRelativePath = normalized;
+            fullPath = candidate;
+            return true;
+        }
+
+        private static string GetProjectFullPath(string projectRelativePath)
+        {
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            return Path.GetFullPath(Path.Combine(
+                projectRoot,
+                projectRelativePath.Replace('/', Path.DirectorySeparatorChar)));
+        }
+
+        private static void WriteBytes(string fullPath, byte[] content)
+        {
+            string directory = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            File.WriteAllBytes(fullPath, content);
+        }
+
+        private static bool IsPng(byte[] content)
+        {
+            return content != null
+                && content.Length >= 8
+                && content[0] == 0x89
+                && content[1] == 0x50
+                && content[2] == 0x4E
+                && content[3] == 0x47
+                && content[4] == 0x0D
+                && content[5] == 0x0A
+                && content[6] == 0x1A
+                && content[7] == 0x0A;
+        }
+
+        private static void TrimMaterialSampleCache(string directory, int maximumEntries)
+        {
+            if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory))
+            {
+                return;
+            }
+            try
+            {
+                foreach (FileInfo file in new DirectoryInfo(directory)
+                    .GetFiles("*.png")
+                    .OrderByDescending(candidate => candidate.LastWriteTimeUtc)
+                    .Skip(maximumEntries))
+                {
+                    file.Delete();
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
 
         private static Camera ResolveCamera(string value)

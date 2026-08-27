@@ -72,6 +72,150 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void SampleMaterial_RendersCloneOnlyOverrideAndPreservesAssetsAndScene()
+        {
+            Material material = AssetDatabase.LoadAssetAtPath<Material>(_materialPath);
+            Color sourceColor = material.GetColor(_colorProperty);
+            string sourceSha = RenderingAssetUtility.ComputeSha256(_materialPath);
+            bool materialDirtyBefore = EditorUtility.IsDirty(material);
+            bool sceneDirtyBefore = UnityEngine.SceneManagement.SceneManager.GetActiveScene().isDirty;
+            string outputPath = $"Library/MCPForUnity/MaterialSamples/Tests/sample-{Guid.NewGuid():N}.png";
+            string fullOutputPath = Path.GetFullPath(Path.Combine(
+                Path.GetFullPath(Path.Combine(Application.dataPath, "..")),
+                outputPath.Replace('/', Path.DirectorySeparatorChar)));
+            try
+            {
+                JObject result = ToJObject(InspectRendering.HandleCommand(new JObject
+                {
+                    ["action"] = "sample_material",
+                    ["material_path"] = _materialPath,
+                    ["profile"] = "pbr",
+                    ["property_overrides"] = new JObject
+                    {
+                        [_colorProperty] = new JArray(0.15f, 0.35f, 0.75f, 1f),
+                    },
+                    ["max_resolution"] = 256,
+                    ["warmup_frames"] = 0,
+                    ["include_image"] = true,
+                    ["output_path"] = outputPath,
+                    ["cache_mode"] = "bypass",
+                }));
+
+                Assert.IsTrue(result.Value<bool>("success"), result.ToString());
+                Assert.AreEqual("unity-mcp/material-sample@1", result["data"]?["schema_version"]?.ToString());
+                Assert.AreEqual("isolated_editor_material_sample", result["data"]?["proof"]?["level"]?.ToString());
+                Assert.IsFalse(result["data"]?["context"]?["requires_scene_probe"]?.Value<bool>() ?? true);
+                Assert.AreEqual("primary_temporary_clone_only", result["data"]?["property_overrides"]?["scope"]?.ToString());
+                Assert.AreEqual(2, result["data"]?["preview"]?["panels"]?.Count());
+                Assert.LessOrEqual(result["data"]?["preview"]?["width"]?.Value<int>() ?? int.MaxValue, 256);
+                Assert.LessOrEqual(result["data"]?["preview"]?["height"]?.Value<int>() ?? int.MaxValue, 256);
+                string encodedPng = result["data"]?["preview"]?["png_base64"]?.ToString();
+                Assert.IsNotEmpty(encodedPng);
+                Texture2D sampledImage = new(2, 2, TextureFormat.RGBA32, false, false);
+                try
+                {
+                    Assert.IsTrue(sampledImage.LoadImage(Convert.FromBase64String(encodedPng)));
+                    Assert.Greater(sampledImage.GetPixels32().Distinct().Count(), 8);
+                }
+                finally
+                {
+                    UnityEngine.Object.DestroyImmediate(sampledImage);
+                }
+                Assert.IsTrue(File.Exists(fullOutputPath), fullOutputPath);
+                Assert.IsTrue(result["data"]?["restoration"]?["source_material_dirty_unchanged"]?.Value<bool>() ?? false);
+                Assert.IsTrue(result["data"]?["restoration"]?["scene_dirty_unchanged"]?.Value<bool>() ?? false);
+                Assert.IsTrue(result["data"]?["restoration"]?["render_texture_active_restored"]?.Value<bool>() ?? false);
+                Assert.AreEqual(sourceColor, material.GetColor(_colorProperty));
+                Assert.AreEqual(sourceSha, RenderingAssetUtility.ComputeSha256(_materialPath));
+                Assert.AreEqual(materialDirtyBefore, EditorUtility.IsDirty(material));
+                Assert.AreEqual(sceneDirtyBefore, UnityEngine.SceneManagement.SceneManager.GetActiveScene().isDirty);
+            }
+            finally
+            {
+                if (File.Exists(fullOutputPath))
+                {
+                    File.Delete(fullOutputPath);
+                }
+            }
+        }
+
+        [Test]
+        public void SampleMaterial_LocksComparisonViewsAndReusesDependencyCache()
+        {
+            JObject parameters = new()
+            {
+                ["action"] = "sample_material",
+                ["material_path"] = _materialPath,
+                ["compare_to_material_path"] = _materialPath,
+                ["profile"] = "pbr",
+                ["max_resolution"] = 256,
+                ["warmup_frames"] = 0,
+                ["include_image"] = false,
+                ["cache_mode"] = "refresh",
+            };
+            string fullCachePath = null;
+            try
+            {
+                JObject first = ToJObject(InspectRendering.HandleCommand(parameters));
+                Assert.IsTrue(first.Value<bool>("success"), first.ToString());
+                Assert.IsFalse(first["data"]?["cache"]?["hit"]?.Value<bool>() ?? true);
+                Assert.AreEqual("same_views_side_by_side", first["data"]?["locked_manifest"]?["comparison_layout"]?.ToString());
+                Assert.AreEqual(4, first["data"]?["preview"]?["panels"]?.Count());
+                Assert.IsNull(first["data"]?["preview"]?["png_base64"]?.Value<string>());
+                string cachePath = first["data"]?["cache"]?["path"]?.ToString();
+                Assert.IsNotEmpty(cachePath);
+                fullCachePath = Path.GetFullPath(Path.Combine(
+                    Path.GetFullPath(Path.Combine(Application.dataPath, "..")),
+                    cachePath.Replace('/', Path.DirectorySeparatorChar)));
+                Assert.IsTrue(File.Exists(fullCachePath), fullCachePath);
+
+                parameters["cache_mode"] = "use";
+                JObject second = ToJObject(InspectRendering.HandleCommand(parameters));
+                Assert.IsTrue(second.Value<bool>("success"), second.ToString());
+                Assert.IsTrue(second["data"]?["cache"]?["hit"]?.Value<bool>() ?? false);
+                Assert.AreEqual(
+                    first["data"]?["preview"]?["output_sha256"]?.ToString(),
+                    second["data"]?["preview"]?["output_sha256"]?.ToString());
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(fullCachePath) && File.Exists(fullCachePath))
+                {
+                    File.Delete(fullCachePath);
+                }
+            }
+        }
+
+        [Test]
+        public void SampleMaterial_RejectsUnknownOverrideAndEscapingOutputWithoutMutation()
+        {
+            Material material = AssetDatabase.LoadAssetAtPath<Material>(_materialPath);
+            string sourceSha = RenderingAssetUtility.ComputeSha256(_materialPath);
+            bool dirtyBefore = EditorUtility.IsDirty(material);
+
+            JObject unknownOverride = ToJObject(InspectRendering.HandleCommand(new JObject
+            {
+                ["action"] = "sample_material",
+                ["material_path"] = _materialPath,
+                ["property_overrides"] = new JObject { ["_DefinitelyMissing"] = 1f },
+                ["cache_mode"] = "bypass",
+            }));
+            Assert.IsFalse(unknownOverride.Value<bool>("success"), unknownOverride.ToString());
+            StringAssert.Contains("has no material property", unknownOverride["error"]?.ToString());
+
+            JObject escapingOutput = ToJObject(InspectRendering.HandleCommand(new JObject
+            {
+                ["action"] = "sample_material",
+                ["material_path"] = _materialPath,
+                ["output_path"] = "Library/MCPForUnity/MaterialSamples/../escaped.png",
+            }));
+            Assert.IsFalse(escapingOutput.Value<bool>("success"), escapingOutput.ToString());
+            StringAssert.Contains("output_path", escapingOutput["error"]?.ToString());
+            Assert.AreEqual(sourceSha, RenderingAssetUtility.ComputeSha256(_materialPath));
+            Assert.AreEqual(dirtyBefore, EditorUtility.IsDirty(material));
+        }
+
+        [Test]
         public void InspectRenderTarget_ReportsMaterialSlotPropertyBlockAndPreservesSceneDirtyState()
         {
             GameObject gameObject = GameObject.CreatePrimitive(PrimitiveType.Cube);

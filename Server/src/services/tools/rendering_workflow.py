@@ -111,6 +111,75 @@ async def inspect_material(
     unity_target="inspect_rendering",
     group="rendering_inspect",
     description=(
+        "Render one exact material in an isolated, deterministic Editor preview. "
+        "Selects canonical geometry for PBR, tiled/triplanar, foliage/cutout, or "
+        "transparent materials; supports clone-only typed property overrides and a "
+        "locked side-by-side comparison. Returns a bounded PNG contact sheet, exact "
+        "dependency/preview manifest, material inspection, context warnings, cache "
+        "evidence, and restoration proof. This is a fast authoring sample, not scene, "
+        "Player, or target-GPU truth."
+    ),
+    annotations=ToolAnnotations(
+        title="Sample Material",
+        readOnlyHint=False,
+        destructiveHint=False,
+    ),
+)
+async def sample_material(
+    ctx: Context,
+    material_path: Annotated[str, "Exact material path under Assets/ or Packages/."],
+    profile: Annotated[
+        Literal["auto", "pbr", "tiled", "foliage", "transparent"],
+        "Canonical preview profile; auto classifies the material and shader.",
+    ] = "auto",
+    compare_to_material_path: Annotated[
+        str | None,
+        "Optional exact material path rendered beside the primary with the same views.",
+    ] = None,
+    property_overrides: Annotated[
+        dict[str, Any] | str | None,
+        "Typed property overrides applied only to temporary material clones.",
+    ] = None,
+    max_resolution: Annotated[int, "Maximum contact-sheet width/height (256-512)."] = 384,
+    warmup_frames: Annotated[int, "Preview renders before each captured panel (0-4)."] = 1,
+    include_image: Annotated[bool, "Include the contact-sheet PNG as base64."] = True,
+    output_path: Annotated[
+        str | None,
+        "Optional .png path under Library/MCPForUnity/MaterialSamples/.",
+    ] = None,
+    cache_mode: Annotated[
+        Literal["use", "refresh", "bypass"],
+        "Use a valid cached sample, refresh it, or bypass cache reads and writes.",
+    ] = "use",
+) -> dict[str, Any]:
+    try:
+        parsed_overrides = _parse_object(property_overrides)
+    except ValueError as exc:
+        return {"success": False, "message": str(exc)}
+    if parsed_overrides is not None and not isinstance(parsed_overrides, dict):
+        return {
+            "success": False,
+            "message": "property_overrides must be a JSON object keyed by shader property name.",
+        }
+
+    return await _send(ctx, "inspect_rendering", {
+        "action": "sample_material",
+        "material_path": material_path,
+        "profile": profile,
+        "compare_to_material_path": compare_to_material_path,
+        "property_overrides": parsed_overrides,
+        "max_resolution": max_resolution,
+        "warmup_frames": warmup_frames,
+        "include_image": include_image,
+        "output_path": output_path,
+        "cache_mode": cache_mode,
+    })
+
+
+@mcp_for_unity_tool(
+    unity_target="inspect_rendering",
+    group="rendering_inspect",
+    description=(
         "Inspect one texture by exact asset path. Reports source/imported size, "
         "importer and platform overrides, runtime format/storage, color-space and "
         "mip settings, bounded per-channel statistics, edge discontinuity, normal "

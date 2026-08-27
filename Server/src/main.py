@@ -351,6 +351,7 @@ Rendering workflow (inspection is default-enabled; authoring is opt-in):
 - Prove the active owner closure before proposing a visual fix: `inspect_render_target` → `inspect_material` → `inspect_texture` and `inspect_shader_graph` → `validate_render_contract`.
 - Use exact asset paths and GUIDs from inspection results. Do not infer texture semantics from a filename alone when the semantic contract is unknown.
 - Treat serialized Shader Graph properties without a property-to-output trace as inert, even when a Material Inspector displays a value.
+- Use `sample_material` for a fast isolated canonical preview, clone-only property experiments, or locked material-to-material A/B. Treat `requires_scene_probe=true` as a hard boundary and follow with `render_probe` on the actual owner when scene lighting, terrain/vegetation integration, camera textures, decals, probes, or renderer features matter.
 - Use `render_probe` with a locked camera, resolution, quality level, scope, channel, and warmup count for visual A/B evidence. A changed camera/framing invalidates the comparison.
 - Use `profile_render_target` for static renderer/pass evidence and current Frame Debugger events; never present Editor/static evidence as Player or target-GPU proof.
 - Before any material, texture-importer, or Shader Graph mutation, enable the `rendering_authoring` group and call `manage_rendering_authoring` with dry_run=true. Apply only with the returned current SHA-256, an exact operation list, and any required project-owned copy path.

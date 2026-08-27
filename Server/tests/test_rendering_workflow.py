@@ -15,6 +15,7 @@ from services.tools.rendering_workflow import (
     manage_rendering_authoring,
     profile_render_target,
     render_probe,
+    sample_material,
     validate_render_contract,
 )
 
@@ -63,6 +64,7 @@ def test_tool_metadata_splits_inspection_from_authoring():
         "inspect_texture",
         "inspect_shader_graph",
         "validate_render_contract",
+        "sample_material",
         "render_probe",
         "profile_render_target",
     }
@@ -141,6 +143,51 @@ def test_render_probe_forwards_locked_capture_manifest(mock_unity):
     assert params["channel"] == "wireframe"
     assert params["warmup_frames"] == 2
     assert params["quality_level"] == 3
+
+
+def test_sample_material_parses_overrides_and_forwards_locked_ab_manifest(mock_unity):
+    result = asyncio.run(
+        sample_material(
+            SimpleNamespace(),
+            material_path="Assets/Primary.mat",
+            profile="foliage",
+            compare_to_material_path="Assets/Reference.mat",
+            property_overrides='{"_BaseColor":[0.2,0.4,0.6,1.0]}',
+            max_resolution=512,
+            warmup_frames=2,
+            include_image=False,
+            output_path="Library/MCPForUnity/MaterialSamples/Tests/sample.png",
+            cache_mode="refresh",
+        )
+    )
+    assert result["success"] is True
+    params = mock_unity[-1]["params"]
+    assert params["action"] == "sample_material"
+    assert params["material_path"] == "Assets/Primary.mat"
+    assert params["compare_to_material_path"] == "Assets/Reference.mat"
+    assert params["profile"] == "foliage"
+    assert params["property_overrides"]["_BaseColor"] == [0.2, 0.4, 0.6, 1.0]
+    assert params["max_resolution"] == 512
+    assert params["warmup_frames"] == 2
+    assert params["include_image"] is False
+    assert params["cache_mode"] == "refresh"
+
+
+@pytest.mark.parametrize("overrides", ["[1,2]", "{invalid"])
+def test_sample_material_rejects_non_object_or_invalid_overrides_without_transport(
+    mock_unity,
+    overrides,
+):
+    result = asyncio.run(
+        sample_material(
+            SimpleNamespace(),
+            material_path="Assets/Test.mat",
+            property_overrides=overrides,
+        )
+    )
+    assert result["success"] is False
+    assert "property_overrides" in result["message"] or "Invalid JSON" in result["message"]
+    assert mock_unity == []
 
 
 def test_authoring_apply_requires_sha_before_transport(mock_unity):

@@ -10,6 +10,7 @@ from models import MCPResponse
 from services.registry import mcp_for_unity_resource
 from services.tools import get_unity_instance_from_context
 from services.state.external_changes_scanner import external_changes_scanner
+from services.state.editor_state_store import editor_state_store
 import transport.unity_transport as unity_transport
 from transport.legacy.unity_connection import async_send_command_with_retry
 from transport.plugin_hub import PluginHub
@@ -89,6 +90,8 @@ class EditorStateTests(BaseModel):
 class EditorStateTransport(BaseModel):
     unity_bridge_connected: bool | None = None
     last_message_unix_ms: int | None = None
+    last_editor_heartbeat_unix_ms: int | None = None
+    last_editor_heartbeat_received_unix_ms: int | None = None
 
 
 class EditorStateSettings(BaseModel):
@@ -105,11 +108,13 @@ class EditorStateAdvice(BaseModel):
 class EditorStateStaleness(BaseModel):
     age_ms: int | None = None
     is_stale: bool | None = None
+    basis: str | None = None
 
 
 class EditorStateData(BaseModel):
     schema_version: str
     observed_at_unix_ms: int
+    served_at_unix_ms: int | None = None
     sequence: int
     unity: EditorStateUnity | None = None
     editor: EditorStateEditor | None = None
@@ -175,17 +180,24 @@ async def infer_single_instance_id(ctx: Context) -> str | None:
     return None
 
 
-def _enrich_advice_and_staleness(state_v2: dict[str, Any]) -> dict[str, Any]:
+def _enrich_advice_and_staleness(
+    state_v2: dict[str, Any],
+    *,
+    freshness_unix_ms: int | None = None,
+    freshness_basis: str = "observed_at_unix_ms",
+    stale_after_ms: int = 2000,
+) -> dict[str, Any]:
     now_ms = _now_unix_ms()
-    observed = state_v2.get("observed_at_unix_ms")
+    observed = freshness_unix_ms
+    if observed is None:
+        observed = state_v2.get("observed_at_unix_ms")
     try:
         observed_ms = int(observed)
     except Exception:
         observed_ms = now_ms
 
     age_ms = max(0, now_ms - observed_ms)
-    # Conservative default: treat >2s as stale (covers common unfocused-editor throttling).
-    is_stale = age_ms > 2000
+    is_stale = age_ms > max(1, int(stale_after_ms))
 
     compilation = state_v2.get("compilation") or {}
     tests = state_v2.get("tests") or {}
@@ -212,7 +224,11 @@ def _enrich_advice_and_staleness(state_v2: dict[str, Any]) -> dict[str, Any]:
         "recommended_retry_after_ms": 0 if ready_for_tools else 500,
         "recommended_next_action": "none" if ready_for_tools else "retry_later",
     }
-    state_v2["staleness"] = {"age_ms": age_ms, "is_stale": is_stale}
+    state_v2["staleness"] = {
+        "age_ms": age_ms,
+        "is_stale": is_stale,
+        "basis": freshness_basis,
+    }
     return state_v2
 
 
@@ -223,23 +239,45 @@ def _enrich_advice_and_staleness(state_v2: dict[str, Any]) -> dict[str, Any]:
 )
 async def get_editor_state(ctx: Context) -> MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)
+    if not unity_instance and not _in_pytest():
+        unity_instance = await infer_single_instance_id(ctx)
 
-    response = await unity_transport.send_with_unity_instance(
-        async_send_command_with_retry,
-        unity_instance,
-        "get_editor_state",
-        {},
-    )
+    cached_record = editor_state_store.get(
+        unity_instance) if unity_instance else None
+    is_proactive_cache = cached_record is not None and cached_record.state is not None
 
-    # If Unity returns a structured retry hint or error, surface it directly.
-    if isinstance(response, dict) and not response.get("success", True):
-        return MCPResponse(**response)
+    if is_proactive_cache:
+        state_v2 = cached_record.state or {}
+        freshness_unix_ms = (
+            cached_record.last_editor_heartbeat_received_unix_ms
+            or cached_record.last_state_received_unix_ms
+        )
+        freshness_basis = (
+            "editor_main_thread_heartbeat"
+            if cached_record.last_editor_heartbeat_received_unix_ms is not None
+            else "state_received"
+        )
+    else:
+        response = await unity_transport.send_with_unity_instance(
+            async_send_command_with_retry,
+            unity_instance,
+            "get_editor_state",
+            {},
+        )
 
-    state_v2 = response.get("data") if isinstance(
-        response, dict) and isinstance(response.get("data"), dict) else {}
+        # If Unity returns a structured retry hint or error, surface it directly.
+        if isinstance(response, dict) and not response.get("success", True):
+            return MCPResponse(**response)
+
+        state_v2 = response.get("data") if isinstance(
+            response, dict) and isinstance(response.get("data"), dict) else {}
+        freshness_unix_ms = _now_unix_ms()
+        freshness_basis = "direct_unity_response"
+
     state_v2.setdefault("schema_version", "unity-mcp/editor_state@2")
     state_v2.setdefault("observed_at_unix_ms", _now_unix_ms())
     state_v2.setdefault("sequence", 0)
+    state_v2["served_at_unix_ms"] = _now_unix_ms()
 
     # Ensure the returned snapshot is clearly associated with the targeted instance.
     unity_section = state_v2.get("unity")
@@ -250,28 +288,37 @@ async def get_editor_state(ctx: Context) -> MCPResponse:
     if current_instance_id in (None, ""):
         if unity_instance:
             unity_section["instance_id"] = unity_instance
-        else:
-            inferred = await infer_single_instance_id(ctx)
-            if inferred:
-                unity_section["instance_id"] = inferred
 
     # External change detection (server-side): compute per instance based on project root path.
     try:
         instance_id = unity_section.get("instance_id")
         if isinstance(instance_id, str) and instance_id.strip():
-            from services.resources.project_info import get_project_info
+            from services.resources.project_info import (
+                get_cached_project_root,
+                get_project_info,
+            )
 
-            proj_resp = await get_project_info(ctx)
-            proj = proj_resp.model_dump() if hasattr(
-                proj_resp, "model_dump") else proj_resp
-            proj_data = proj.get("data") if isinstance(proj, dict) else None
-            project_root = proj_data.get("projectRoot") if isinstance(
-                proj_data, dict) else None
+            project_root = editor_state_store.get_project_root(instance_id)
+            if not project_root:
+                project_root = get_cached_project_root(instance_id)
+            if not project_root:
+                proj_resp = await get_project_info(ctx)
+                proj = proj_resp.model_dump() if hasattr(
+                    proj_resp, "model_dump") else proj_resp
+                proj_data = proj.get("data") if isinstance(proj, dict) else None
+                project_root = proj_data.get("projectRoot") if isinstance(
+                    proj_data, dict) else None
             if isinstance(project_root, str) and project_root.strip():
                 external_changes_scanner.set_project_root(
                     instance_id, project_root)
+                if cached_record is None:
+                    await external_changes_scanner.start_tracking(
+                        instance_id,
+                        project_root,
+                        f"resource:{instance_id}",
+                    )
 
-            ext = external_changes_scanner.update_and_get(instance_id)
+            ext = external_changes_scanner.get_snapshot(instance_id)
 
             assets = state_v2.get("assets")
             if not isinstance(assets, dict):
@@ -288,7 +335,24 @@ async def get_editor_state(ctx: Context) -> MCPResponse:
     except Exception:
         pass
 
-    state_v2 = _enrich_advice_and_staleness(state_v2)
+    transport = state_v2.get("transport")
+    if not isinstance(transport, dict):
+        transport = {}
+        state_v2["transport"] = transport
+    transport["unity_bridge_connected"] = True
+    if cached_record is not None:
+        transport["last_message_unix_ms"] = cached_record.last_message_received_unix_ms
+        transport["last_editor_heartbeat_unix_ms"] = (
+            cached_record.last_editor_heartbeat_unix_ms)
+        transport["last_editor_heartbeat_received_unix_ms"] = (
+            cached_record.last_editor_heartbeat_received_unix_ms)
+
+    state_v2 = _enrich_advice_and_staleness(
+        state_v2,
+        freshness_unix_ms=freshness_unix_ms,
+        freshness_basis=freshness_basis,
+        stale_after_ms=2500,
+    )
 
     try:
         if hasattr(EditorStateData, "model_validate"):

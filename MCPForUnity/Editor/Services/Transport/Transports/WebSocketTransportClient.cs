@@ -45,7 +45,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private CancellationTokenSource _connectionCts;
         private Task _receiveTask;
         private Task _keepAliveTask;
+        private Task _editorStateTask;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
+        private readonly SemaphoreSlim _editorStateSignal = new(0, 1);
 
         private Uri _endpointUri;
         private string _sessionId;
@@ -59,6 +61,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private int _isReconnectingFlag;
         private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
         private string _apiKey;
+        private bool _editorStateSubscribed;
+        private bool _supportsEditorStatePush;
         private bool _disposed;
 
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
@@ -116,6 +120,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _lifecycleCts = new CancellationTokenSource();
             _endpointUri = BuildWebSocketUri(HttpEndpointUtility.GetBaseUrl());
             _sessionId = null;
+            SubscribeEditorState();
 
             if (!await EstablishConnectionAsync(_lifecycleCts.Token))
             {
@@ -131,6 +136,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         public async Task StopAsync()
         {
+            UnsubscribeEditorState();
+
             if (_lifecycleCts == null)
             {
                 return;
@@ -175,6 +182,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         /// </summary>
         public void ForceStop()
         {
+            UnsubscribeEditorState();
             try { _lifecycleCts?.Cancel(); } catch { }
             try { _connectionCts?.Cancel(); } catch { }
 
@@ -189,6 +197,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _connectionCts = null;
             _receiveTask = null;
             _keepAliveTask = null;
+            _editorStateTask = null;
             Interlocked.Exchange(ref _isReconnectingFlag, 0);
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
@@ -241,6 +250,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             _sendLock?.Dispose();
+            _editorStateSignal?.Dispose();
             _socket?.Dispose();
             _lifecycleCts?.Dispose();
             _disposed = true;
@@ -249,6 +259,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private async Task<bool> EstablishConnectionAsync(CancellationToken token)
         {
             await StopConnectionLoopsAsync().ConfigureAwait(false);
+            _sessionId = null;
+            _supportsEditorStatePush = false;
 
             _connectionCts?.Dispose();
             _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
@@ -358,6 +370,19 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 }
             }
 
+            if (_editorStateTask != null)
+            {
+                if (awaitTasks)
+                {
+                    try { await _editorStateTask.ConfigureAwait(false); } catch { }
+                    _editorStateTask = null;
+                }
+                else if (_editorStateTask.IsCompleted)
+                {
+                    _editorStateTask = null;
+                }
+            }
+
             if (_connectionCts != null)
             {
                 _connectionCts.Dispose();
@@ -367,13 +392,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private void StartBackgroundLoops(CancellationToken token)
         {
-            if ((_receiveTask != null && !_receiveTask.IsCompleted) || (_keepAliveTask != null && !_keepAliveTask.IsCompleted))
+            if ((_receiveTask != null && !_receiveTask.IsCompleted)
+                || (_keepAliveTask != null && !_keepAliveTask.IsCompleted)
+                || (_editorStateTask != null && !_editorStateTask.IsCompleted))
             {
                 return;
             }
 
             _receiveTask = Task.Run(() => ReceiveLoopAsync(token), CancellationToken.None);
             _keepAliveTask = Task.Run(() => KeepAliveLoopAsync(token), CancellationToken.None);
+            _editorStateTask = Task.Run(() => EditorStateLoopAsync(token), CancellationToken.None);
         }
 
         private async Task ReceiveLoopAsync(CancellationToken token)
@@ -492,6 +520,21 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private void ApplyWelcome(JObject payload)
         {
+            JArray capabilities = payload["capabilities"] as JArray;
+            _supportsEditorStatePush = false;
+            if (capabilities != null)
+            {
+                foreach (JToken capability in capabilities)
+                {
+                    if (string.Equals(capability?.Value<string>(), "editor_state_push_v1",
+                            StringComparison.Ordinal))
+                    {
+                        _supportsEditorStatePush = true;
+                        break;
+                    }
+                }
+            }
+
             int? keepAliveSeconds = payload.Value<int?>("keepAliveInterval");
             if (keepAliveSeconds.HasValue && keepAliveSeconds.Value > 0)
             {
@@ -519,7 +562,119 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 McpLog.Info($"[WebSocket] Registered with session ID: {_sessionId}", false);
 
                 await SendRegisterToolsAsync(token).ConfigureAwait(false);
+                await SendEditorStateAsync(token).ConfigureAwait(false);
             }
+        }
+
+        private void SubscribeEditorState()
+        {
+            if (_editorStateSubscribed)
+            {
+                return;
+            }
+
+            EditorStateCache.SnapshotChanged += OnEditorStateSnapshotChanged;
+            _editorStateSubscribed = true;
+        }
+
+        private void UnsubscribeEditorState()
+        {
+            if (!_editorStateSubscribed)
+            {
+                return;
+            }
+
+            EditorStateCache.SnapshotChanged -= OnEditorStateSnapshotChanged;
+            _editorStateSubscribed = false;
+        }
+
+        private void OnEditorStateSnapshotChanged()
+        {
+            if (!_editorStateSubscribed || _editorStateSignal.CurrentCount != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                _editorStateSignal.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+                // Another change already queued a coalesced snapshot push.
+            }
+        }
+
+        private async Task EditorStateLoopAsync(CancellationToken token)
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    bool stateChanged = await _editorStateSignal.WaitAsync(
+                        TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
+
+                    if (stateChanged)
+                    {
+                        while (_editorStateSignal.Wait(0))
+                        {
+                            // Coalesce every pending state change into one current snapshot.
+                        }
+
+                        await SendEditorStateAsync(token).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        await SendEditorHeartbeatAsync(token).ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Warn($"[WebSocket] Editor state publication failed: {ex.Message}");
+                    await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
+                    break;
+                }
+            }
+        }
+
+        private async Task SendEditorStateAsync(CancellationToken token)
+        {
+            if (!_supportsEditorStatePush || string.IsNullOrEmpty(_sessionId))
+            {
+                return;
+            }
+
+            JObject snapshot = await TransportCommandDispatcher.RunOnMainThreadAsync(
+                EditorStateCache.GetSnapshot, token).ConfigureAwait(false);
+            JObject payload = new()
+            {
+                ["type"] = "editor_state",
+                ["session_id"] = _sessionId,
+                ["state"] = snapshot
+            };
+
+            await SendJsonAsync(payload, token).ConfigureAwait(false);
+        }
+
+        private Task SendEditorHeartbeatAsync(CancellationToken token)
+        {
+            if (!_supportsEditorStatePush || string.IsNullOrEmpty(_sessionId))
+            {
+                return Task.CompletedTask;
+            }
+
+            JObject payload = new()
+            {
+                ["type"] = "editor_heartbeat",
+                ["session_id"] = _sessionId,
+                ["editor_heartbeat_unix_ms"] = EditorStateCache.GetLastMainThreadHeartbeatUnixMs()
+            };
+
+            return SendJsonAsync(payload, token);
         }
 
         private async Task SendRegisterToolsAsync(CancellationToken token)

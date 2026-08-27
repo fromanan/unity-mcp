@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from services.registry import get_registered_resources
@@ -55,5 +57,100 @@ async def test_editor_state_v2_is_registered_and_has_contract_fields(monkeypatch
     assert "sequence" in data
     assert "advice" in data
     assert "staleness" in data
+    assert "served_at_unix_ms" in data
+    assert data["staleness"]["basis"] == "direct_unity_response"
 
 
+@pytest.mark.asyncio
+async def test_editor_state_uses_proactive_instance_cache_without_unity_roundtrip(
+    monkeypatch,
+    tmp_path,
+):
+    import services.resources.editor_state as editor_state
+    from services.state.editor_state_store import editor_state_store
+
+    instance_id = "Test@deadbeef"
+    session_id = "session-1"
+    now_ms = int(time.time() * 1000)
+    editor_state_store.begin_session(instance_id, session_id, str(tmp_path))
+    editor_state_store.update_state(
+        session_id,
+        {
+            "schema_version": "unity-mcp/editor_state@2",
+            "observed_at_unix_ms": now_ms - 100,
+            "sequence": 7,
+            "compilation": {
+                "is_compiling": False,
+                "is_domain_reload_pending": False,
+            },
+            "tests": {"is_running": False},
+        },
+    )
+    editor_state_store.touch_editor_heartbeat(session_id, now_ms)
+
+    async def fake_instance(_ctx):
+        return instance_id
+
+    async def fail_transport(*_args, **_kwargs):
+        raise AssertionError("cached editor state must not call Unity")
+
+    monkeypatch.setattr(editor_state, "get_unity_instance_from_context", fake_instance)
+    monkeypatch.setattr(
+        editor_state.unity_transport,
+        "send_with_unity_instance",
+        fail_transport,
+    )
+
+    try:
+        result = await editor_state.get_editor_state(DummyContext())
+        payload = result.model_dump() if hasattr(result, "model_dump") else result
+        data = payload["data"]
+
+        assert data["sequence"] == 7
+        assert data["unity"]["instance_id"] == instance_id
+        assert data["transport"]["unity_bridge_connected"] is True
+        assert data["transport"]["last_editor_heartbeat_unix_ms"] == now_ms
+        assert data["staleness"]["basis"] == "editor_main_thread_heartbeat"
+        assert data["advice"]["ready_for_tools"] is True
+    finally:
+        editor_state_store.end_session(session_id)
+
+
+@pytest.mark.asyncio
+async def test_project_info_is_cached_per_explicit_instance(monkeypatch):
+    import services.resources.project_info as project_info
+
+    instance_id = "Test@cafebabe"
+    calls = 0
+
+    async def fake_instance(_ctx):
+        return instance_id
+
+    async def fake_send(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {
+            "success": True,
+            "data": {
+                "projectRoot": "C:/Project",
+                "projectName": "Project",
+                "unityVersion": "6000.3.19f1",
+                "platform": "WindowsEditor",
+                "assetsPath": "C:/Project/Assets",
+            },
+        }
+
+    project_info.clear_project_info_cache()
+    monkeypatch.setattr(project_info, "get_unity_instance_from_context", fake_instance)
+    monkeypatch.setattr(project_info, "send_with_unity_instance", fake_send)
+
+    try:
+        first = await project_info.get_project_info(DummyContext())
+        second = await project_info.get_project_info(DummyContext())
+
+        assert calls == 1
+        assert first.data.projectRoot == "C:/Project"
+        assert second.data.projectRoot == "C:/Project"
+        assert second.message == "Retrieved cached project information."
+    finally:
+        project_info.clear_project_info_cache()

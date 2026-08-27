@@ -36,32 +36,42 @@ mcpforunity://{category}/{resource_path}[?query_params]
 **Returns:**
 ```json
 {
-  "unity_version": "2022.3.10f1",
-  "is_compiling": false,
-  "is_domain_reload_pending": false,
-  "play_mode": {
-    "is_playing": false,
-    "is_paused": false
+  "schema_version": "unity-mcp/editor_state@2",
+  "observed_at_unix_ms": 1730000000000,
+  "served_at_unix_ms": 1730000000125,
+  "sequence": 42,
+  "compilation": {
+    "is_compiling": false,
+    "is_domain_reload_pending": false
   },
-  "active_scene": {
-    "path": "Assets/Scenes/Main.unity",
-    "name": "Main"
+  "transport": {
+    "unity_bridge_connected": true,
+    "last_editor_heartbeat_unix_ms": 1730000000100,
+    "last_editor_heartbeat_received_unix_ms": 1730000000110
   },
-  "ready_for_tools": true,
-  "blocking_reasons": [],
-  "recommended_retry_after_ms": null,
+  "advice": {
+    "ready_for_tools": true,
+    "blocking_reasons": [],
+    "recommended_retry_after_ms": 0
+  },
   "staleness": {
-    "age_ms": 150,
-    "is_stale": false
+    "age_ms": 15,
+    "is_stale": false,
+    "basis": "editor_main_thread_heartbeat"
   }
 }
 ```
 
 **Key Fields:**
-- `ready_for_tools`: Only proceed if `true`
-- `is_compiling`: Wait if `true`
-- `blocking_reasons`: Array explaining why tools might fail
-- `recommended_retry_after_ms`: Suggested wait time
+- `advice.ready_for_tools`: Only proceed if `true`
+- `compilation.is_compiling`: Wait if `true`
+- `advice.blocking_reasons`: Array explaining why tools might fail
+- `advice.recommended_retry_after_ms`: Suggested wait time
+- `observed_at_unix_ms`: Time the semantic snapshot last changed
+- `served_at_unix_ms`: Time this cached response was served
+- `staleness.basis`: Freshness signal used by the server; proactive WebSocket sessions use an advancing Unity main-thread heartbeat
+
+Unity proactively publishes changed snapshots after capability negotiation. The server keeps one defensive per-instance copy, so ordinary reads avoid a Unity command round trip. Stable editors send a lightweight heartbeat; repeating an unchanged heartbeat does not refresh main-thread liveness.
 
 ### mcpforunity://editor/selection
 

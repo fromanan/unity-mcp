@@ -24,8 +24,11 @@ from transport.unity_instance_middleware import UnityInstanceMiddleware, get_uni
 from transport.plugin_registry import PluginRegistry, PluginSession
 from transport.plugin_hub import PluginHub, NoUnitySessionError, InstanceSelectionRequiredError, PluginDisconnectedError
 from transport.models import (
+    WelcomeMessage,
     RegisterMessage,
     RegisterToolsMessage,
+    EditorStateMessage,
+    EditorHeartbeatMessage,
     CommandResultMessage,
     PongMessage,
     SessionList,
@@ -951,6 +954,28 @@ class TestPluginRegistryFunctionality:
 
 class TestPluginHubMessageHandling:
     """Test PluginHub message parsing and registration flow."""
+
+    def test_welcome_advertises_editor_state_push_capability(self):
+        message = WelcomeMessage(
+            serverTimeout=30,
+            keepAliveInterval=10,
+            capabilities=["editor_state_push_v1"],
+        )
+
+        assert message.capabilities == ["editor_state_push_v1"]
+
+    def test_editor_state_publication_messages_parse(self):
+        state_message = EditorStateMessage(
+            session_id="session",
+            state={"sequence": 3},
+        )
+        heartbeat_message = EditorHeartbeatMessage(
+            session_id="session",
+            editor_heartbeat_unix_ms=123456,
+        )
+
+        assert state_message.state["sequence"] == 3
+        assert heartbeat_message.editor_heartbeat_unix_ms == 123456
 
     def test_register_message_parsing(self):
         """

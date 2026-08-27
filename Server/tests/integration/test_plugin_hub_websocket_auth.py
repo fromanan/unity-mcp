@@ -181,3 +181,11 @@ class TestUserIdFlowsToRegistration:
         assert session.user_id == "user-99"
         assert session.project_name == "TestProject"
         assert session.project_hash == "abc123"
+
+        from services.state.editor_state_store import editor_state_store
+        state_record = editor_state_store.get("TestProject@abc123")
+        assert state_record is not None
+        assert state_record.session_id == session.session_id
+
+        await hub.on_disconnect(ws, 1000)
+        assert editor_state_store.get("TestProject@abc123") is None

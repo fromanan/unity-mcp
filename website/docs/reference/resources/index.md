@@ -60,7 +60,7 @@ URI: mcpforunity://editor/selection
 
 **URI:** `mcpforunity://editor/state`
 
-Canonical editor readiness snapshot. Includes advice and server-computed staleness.
+Canonical editor readiness snapshot. Unity proactively publishes changed snapshots and a main-thread heartbeat after capability negotiation, while the server serves a defensive per-instance cache. `observed_at_unix_ms` remains the semantic snapshot time, `served_at_unix_ms` is the response time, and `staleness.basis` identifies the freshness signal used. External-change status comes from an event-driven background watcher with periodic reconciliation rather than a recursive scan during this resource request.
 
 URI: mcpforunity://editor/state
 
@@ -256,5 +256,4 @@ URI: mcpforunity://instances
 **URI:** `mcpforunity://scene/volumes`
 
 Lists all Volume components in the active scene with their profiles, effects, and settings.
-
 

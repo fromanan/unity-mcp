@@ -1,6 +1,9 @@
+import asyncio
 import os
 import time
 from pathlib import Path
+
+import pytest
 
 
 def test_external_changes_scanner_marks_dirty_and_clears(tmp_path, monkeypatch):
@@ -84,3 +87,56 @@ def test_external_changes_scanner_includes_file_dependency_roots(tmp_path, monke
     assert changed["external_changes_dirty"] is True
 
 
+def test_external_changes_snapshot_never_scans(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    from services.state.external_changes_scanner import ExternalChangesScanner
+
+    root = tmp_path / "Project"
+    (root / "Assets").mkdir(parents=True)
+    scanner = ExternalChangesScanner(scan_interval_ms=0)
+    scanner.set_project_root("Test@cached", str(root))
+
+    def fail_scan(_roots):
+        raise AssertionError("get_snapshot must not scan the filesystem")
+
+    monkeypatch.setattr(scanner, "_scan_paths_max_mtime_ns", fail_scan)
+    snapshot = scanner.get_snapshot("Test@cached")
+    assert snapshot["external_changes_dirty"] is False
+
+
+@pytest.mark.asyncio
+async def test_external_changes_background_watcher_marks_dirty(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    from services.state.external_changes_scanner import ExternalChangesScanner
+
+    root = tmp_path / "Project"
+    assets = root / "Assets"
+    assets.mkdir(parents=True)
+    (root / "ProjectSettings").mkdir()
+    packages = root / "Packages"
+    packages.mkdir()
+    (packages / "manifest.json").write_text(
+        '{"dependencies": {}}', encoding="utf-8")
+
+    instance_id = "Test@watcher"
+    session_id = "session-watcher"
+    scanner = ExternalChangesScanner(
+        scan_interval_ms=0,
+        reconcile_interval_seconds=1.0,
+    )
+    await scanner.start_tracking(instance_id, str(root), session_id)
+
+    try:
+        deadline = time.monotonic() + 5.0
+        while scanner._get_state(instance_id).last_seen_mtime_ns is None:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.05)
+
+        (assets / "Changed.txt").write_text("changed", encoding="utf-8")
+        while not scanner.get_snapshot(instance_id)["external_changes_dirty"]:
+            assert time.monotonic() < deadline
+            await asyncio.sleep(0.05)
+    finally:
+        await scanner.stop_tracking(instance_id, session_id)

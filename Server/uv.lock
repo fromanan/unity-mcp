@@ -895,6 +895,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "tomli" },
     { name = "uvicorn" },
+    { name = "watchfiles" },
 ]
 
 [package.optional-dependencies]
@@ -920,6 +921,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },
     { name = "tomli", specifier = ">=2.3.0" },
     { name = "uvicorn", specifier = ">=0.35.0" },
+    { name = "watchfiles", specifier = ">=1.0,<2" },
 ]
 provides-extras = ["dev"]
 

@@ -1,5 +1,6 @@
 using System;
 using System.Reflection;
+using System.Threading;
 using MCPForUnity.Editor.Helpers;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -18,8 +19,11 @@ namespace MCPForUnity.Editor.Services
     internal static class EditorStateCache
     {
         private static readonly object LockObj = new();
+        internal static event Action SnapshotChanged;
+
         private static long _sequence;
         private static long _observedUnixMs;
+        private static long _lastMainThreadHeartbeatUnixMs;
 
         private static bool _lastIsCompiling;
         private static long? _lastCompileStartedUnixMs;
@@ -42,6 +46,8 @@ namespace MCPForUnity.Editor.Services
         private static bool _lastTrackedIsUpdating;
         private static bool _lastTrackedTestsRunning;
         private static string _lastTrackedActivityPhase;
+        private static string _activityPhase = "idle";
+        private static long _activityPhaseSinceUnixMs;
 
         private static JObject _cached;
 
@@ -257,18 +263,26 @@ namespace MCPForUnity.Editor.Services
                 _observedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
                 EditorApplication.update += OnUpdate;
-                EditorApplication.playModeStateChanged += change =>
-                {
-                    _playModeTransitionPending = change == PlayModeStateChange.ExitingEditMode
-                        || change == PlayModeStateChange.ExitingPlayMode;
-                    ForceUpdate("playmode");
-                };
+                EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
+                EditorApplication.pauseStateChanged += OnPauseStateChanged;
+                EditorApplication.focusChanged += OnFocusChanged;
+                EditorApplication.projectChanged += OnProjectChanged;
+                EditorSceneManager.activeSceneChangedInEditMode += OnActiveSceneChangedInEditMode;
+                TestRunStatus.StateChanged += OnTestRunStateChanged;
 
                 // Tracks whether an assembly compilation is actually running, for
                 // GetActualIsCompiling. Statics reset on domain reload and this
                 // [InitializeOnLoad] ctor re-subscribes, so the flag is per-domain.
-                UnityEditor.Compilation.CompilationPipeline.compilationStarted += _ => _pipelineCompilationRunning = true;
-                UnityEditor.Compilation.CompilationPipeline.compilationFinished += _ => _pipelineCompilationRunning = false;
+                UnityEditor.Compilation.CompilationPipeline.compilationStarted += _ =>
+                {
+                    _pipelineCompilationRunning = true;
+                    ForceUpdate("compilation_started");
+                };
+                UnityEditor.Compilation.CompilationPipeline.compilationFinished += _ =>
+                {
+                    _pipelineCompilationRunning = false;
+                    ForceUpdate("compilation_finished");
+                };
 
                 AssemblyReloadEvents.beforeAssemblyReload += () =>
                 {
@@ -287,6 +301,39 @@ namespace MCPForUnity.Editor.Services
             {
                 McpLog.Error($"[EditorStateCache] Failed to initialise: {ex.Message}\n{ex.StackTrace}");
             }
+        }
+
+        private static void OnPlayModeStateChanged(PlayModeStateChange change)
+        {
+            _playModeTransitionPending = change == PlayModeStateChange.ExitingEditMode
+                || change == PlayModeStateChange.ExitingPlayMode;
+            ForceUpdate("playmode");
+        }
+
+        private static void OnPauseStateChanged(PauseState change)
+        {
+            ForceUpdate("pause");
+        }
+
+        private static void OnFocusChanged(bool focused)
+        {
+            ForceUpdate("focus");
+        }
+
+        private static void OnProjectChanged()
+        {
+            ForceUpdate("project");
+        }
+
+        private static void OnActiveSceneChangedInEditMode(UnityEngine.SceneManagement.Scene previousScene,
+            UnityEngine.SceneManagement.Scene nextScene)
+        {
+            ForceUpdate("active_scene");
+        }
+
+        private static void OnTestRunStateChanged()
+        {
+            ForceUpdate("tests");
         }
 
         private static void OnUpdate()
@@ -312,6 +359,8 @@ namespace MCPForUnity.Editor.Services
             // Advance the throttle even when state is unchanged. Otherwise, once a stable editor
             // crosses the interval, these probes run on every editor update until a state changes.
             _lastUpdateTimeSinceStartup = now;
+            Interlocked.Exchange(ref _lastMainThreadHeartbeatUnixMs,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
             // Fast state-change detection BEFORE building snapshot.
             // This avoids the expensive BuildSnapshot() call entirely when nothing changed.
@@ -384,9 +433,20 @@ namespace MCPForUnity.Editor.Services
                 return;
             }
 
+            Action snapshotChanged;
             lock (LockObj)
             {
                 _cached = BuildSnapshot(reason);
+                snapshotChanged = SnapshotChanged;
+            }
+
+            try
+            {
+                snapshotChanged?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[EditorStateCache] Snapshot listener failed: {ex.Message}");
             }
         }
 
@@ -394,6 +454,7 @@ namespace MCPForUnity.Editor.Services
         {
             _sequence++;
             _observedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Interlocked.Exchange(ref _lastMainThreadHeartbeatUnixMs, _observedUnixMs);
 
             bool isCompiling = GetActualIsCompiling();
             if (isCompiling && !_lastIsCompiling)
@@ -437,6 +498,25 @@ namespace MCPForUnity.Editor.Services
                 activityPhase = "playmode_transition";
             }
 
+            if (!string.Equals(_activityPhase, activityPhase, StringComparison.Ordinal))
+            {
+                _activityPhase = activityPhase;
+                _activityPhaseSinceUnixMs = _observedUnixMs;
+            }
+            else if (_activityPhaseSinceUnixMs == 0)
+            {
+                _activityPhaseSinceUnixMs = _observedUnixMs;
+            }
+
+            _lastTrackedScenePath = scenePath;
+            _lastTrackedSceneName = scene.name ?? string.Empty;
+            _lastTrackedIsFocused = isFocused;
+            _lastTrackedIsPlaying = EditorApplication.isPlaying;
+            _lastTrackedIsPaused = EditorApplication.isPaused;
+            _lastTrackedIsUpdating = EditorApplication.isUpdating;
+            _lastTrackedTestsRunning = testsRunning;
+            _lastTrackedActivityPhase = activityPhase;
+
             var snapshot = new EditorStateSnapshot
             {
                 SchemaVersion = "unity-mcp/editor_state@2",
@@ -469,7 +549,7 @@ namespace MCPForUnity.Editor.Services
                 Activity = new EditorStateActivity
                 {
                     Phase = activityPhase,
-                    SinceUnixMs = _observedUnixMs,
+                    SinceUnixMs = _activityPhaseSinceUnixMs,
                     Reasons = new[] { reason }
                 },
                 Compilation = new EditorStateCompilation
@@ -535,18 +615,19 @@ namespace MCPForUnity.Editor.Services
                     _cached = BuildSnapshot("rebuild");
                 }
 
-                // Always return a fresh clone to prevent mutation bugs.
-                // The main GC optimization comes from state-change detection (OnUpdate)
-                // which prevents unnecessary _cached rebuilds, not from caching the clone.
-                var clone = (JObject)_cached.DeepClone();
+                Interlocked.Exchange(ref _lastMainThreadHeartbeatUnixMs,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
 
-                // Serving this resource is itself a live response from the Unity main thread.
-                // Keep the state payload cached, but stamp the response time so a stable editor
-                // cannot be misclassified as unresponsive merely because no state changed.
-                clone["observed_at_unix_ms"] = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-
-                return clone;
+                // Always return a fresh clone to prevent mutation bugs. observed_at_unix_ms is
+                // deliberately the semantic snapshot time; transport liveness is reported
+                // separately so an unchanged editor state does not look newly observed.
+                return (JObject)_cached.DeepClone();
             }
+        }
+
+        internal static long GetLastMainThreadHeartbeatUnixMs()
+        {
+            return Interlocked.Read(ref _lastMainThreadHeartbeatUnixMs);
         }
 
         internal static bool IsPlayModeTransitioning()

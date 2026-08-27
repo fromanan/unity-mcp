@@ -29,6 +29,8 @@ from transport.models import (
     RegisterMessage,
     RegisterToolsMessage,
     PongMessage,
+    EditorStateMessage,
+    EditorHeartbeatMessage,
     CommandResultMessage,
     SessionList,
     SessionDetails,
@@ -197,6 +199,13 @@ class PluginHub(WebSocketEndpoint):
                 await websocket.close(code=1001)
             except Exception:
                 pass
+        from services.state.editor_state_store import editor_state_store
+        from services.state.external_changes_scanner import external_changes_scanner
+        from services.resources.project_info import clear_project_info_cache
+
+        await external_changes_scanner.shutdown()
+        editor_state_store.clear()
+        clear_project_info_cache()
         cls._registry = None
         cls._mcp = None
         cls._loop = None
@@ -252,6 +261,7 @@ class PluginHub(WebSocketEndpoint):
         msg = WelcomeMessage(
             serverTimeout=self.SERVER_TIMEOUT,
             keepAliveInterval=self.KEEP_ALIVE_INTERVAL,
+            capabilities=["editor_state_push_v1"],
         )
         await websocket.send_json(msg.model_dump())
 
@@ -268,6 +278,11 @@ class PluginHub(WebSocketEndpoint):
                 await self._handle_register_tools(websocket, RegisterToolsMessage(**data))
             elif message_type == "pong":
                 await self._handle_pong(PongMessage(**data))
+            elif message_type == "editor_state":
+                await self._handle_editor_state(websocket, EditorStateMessage(**data))
+            elif message_type == "editor_heartbeat":
+                await self._handle_editor_heartbeat(
+                    websocket, EditorHeartbeatMessage(**data))
             elif message_type == "command_result":
                 await self._handle_command_result(CommandResultMessage(**data))
             else:
@@ -280,6 +295,7 @@ class PluginHub(WebSocketEndpoint):
         lock = cls._lock
         if lock is None:
             return
+        session_id: str | None = None
         async with lock:
             session_id = next(
                 (sid for sid, ws in cls._connections.items() if ws is websocket), None)
@@ -320,6 +336,9 @@ class PluginHub(WebSocketEndpoint):
                     pass
                 logger.info(
                     f"Plugin session {session_id} disconnected ({close_code})")
+
+        if session_id:
+            await cls._cleanup_editor_state_session(session_id)
 
     # ------------------------------------------------------------------
     # Public API
@@ -495,6 +514,23 @@ class PluginHub(WebSocketEndpoint):
         await websocket.send_json(response.model_dump())
 
         session, evicted_session_id = await registry.register(session_id, project_name, project_hash, unity_version, project_path, user_id=user_id)
+        instance_id = f"{project_name}@{project_hash}"
+
+        from services.resources.project_info import clear_project_info_cache
+        from services.state.editor_state_store import editor_state_store
+        from services.state.external_changes_scanner import external_changes_scanner
+
+        clear_project_info_cache(instance_id)
+        editor_state_store.begin_session(
+            instance_id,
+            session_id,
+            project_path,
+        )
+        await external_changes_scanner.start_tracking(
+            instance_id,
+            project_path,
+            session_id,
+        )
         evicted_ws = None
         async with lock:
             # Clean up the evicted session's connection, ping loop, and pending commands
@@ -709,6 +745,59 @@ class PluginHub(WebSocketEndpoint):
                 async with lock:
                     cls._last_pong[session_id] = time.monotonic()
 
+    async def _handle_editor_state(
+        self,
+        websocket: WebSocket,
+        payload: EditorStateMessage,
+    ) -> None:
+        session_id = await type(self)._session_id_for_websocket(websocket)
+        if not session_id:
+            logger.warning("Received editor state from an unknown plugin connection")
+            return
+
+        from services.state.editor_state_store import editor_state_store
+        if not editor_state_store.update_state(session_id, payload.state):
+            logger.debug("Ignored editor state for inactive session %s", session_id)
+
+    async def _handle_editor_heartbeat(
+        self,
+        websocket: WebSocket,
+        payload: EditorHeartbeatMessage,
+    ) -> None:
+        session_id = await type(self)._session_id_for_websocket(websocket)
+        if not session_id:
+            return
+
+        from services.state.editor_state_store import editor_state_store
+        editor_state_store.touch_editor_heartbeat(
+            session_id,
+            payload.editor_heartbeat_unix_ms,
+        )
+
+    @classmethod
+    async def _session_id_for_websocket(cls, websocket: WebSocket) -> str | None:
+        lock = cls._lock
+        if lock is None:
+            return None
+        async with lock:
+            return next(
+                (session_id for session_id, connection in cls._connections.items()
+                 if connection is websocket),
+                None,
+            )
+
+    @classmethod
+    async def _cleanup_editor_state_session(cls, session_id: str) -> None:
+        from services.resources.project_info import clear_project_info_cache
+        from services.state.editor_state_store import editor_state_store
+        from services.state.external_changes_scanner import external_changes_scanner
+
+        instance_id = editor_state_store.end_session(session_id)
+        if instance_id is None:
+            return
+        await external_changes_scanner.stop_tracking(instance_id, session_id)
+        clear_project_info_cache(instance_id)
+
     @classmethod
     async def _ping_loop(cls, session_id: str, websocket: WebSocket) -> None:
         """Server-initiated ping loop to detect dead connections.
@@ -831,6 +920,7 @@ class PluginHub(WebSocketEndpoint):
                     session_id,
                     exc_info=True,
                 )
+        await cls._cleanup_editor_state_session(session_id)
         try:
             from services.custom_tool_service import CustomToolService
             CustomToolService.get_instance().unregister_global_tools_for_owner(

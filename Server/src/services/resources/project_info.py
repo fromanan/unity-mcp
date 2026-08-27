@@ -1,4 +1,6 @@
-from pydantic import BaseModel
+import threading
+
+from pydantic import BaseModel, Field
 from fastmcp import Context
 
 from models import MCPResponse
@@ -20,7 +22,33 @@ class ProjectInfoData(BaseModel):
 
 class ProjectInfoResponse(MCPResponse):
     """Static project configuration information."""
-    data: ProjectInfoData = ProjectInfoData()
+    data: ProjectInfoData = Field(default_factory=ProjectInfoData)
+
+
+_cache_lock = threading.RLock()
+_project_info_cache: dict[str, ProjectInfoData] = {}
+
+
+def _copy_project_info(data: ProjectInfoData) -> ProjectInfoData:
+    if hasattr(data, "model_copy"):
+        return data.model_copy(deep=True)
+    return ProjectInfoData.parse_obj(data.dict())  # type: ignore[attr-defined]
+
+
+def clear_project_info_cache(instance_id: str | None = None) -> None:
+    with _cache_lock:
+        if instance_id is None:
+            _project_info_cache.clear()
+        else:
+            _project_info_cache.pop(instance_id, None)
+
+
+def get_cached_project_root(instance_id: str | None) -> str | None:
+    if not instance_id:
+        return None
+    with _cache_lock:
+        data = _project_info_cache.get(instance_id)
+        return data.projectRoot if data is not None else None
 
 
 @mcp_for_unity_resource(
@@ -31,10 +59,24 @@ class ProjectInfoResponse(MCPResponse):
 async def get_project_info(ctx: Context) -> ProjectInfoResponse | MCPResponse:
     """Get static project configuration information."""
     unity_instance = await get_unity_instance_from_context(ctx)
+    if unity_instance:
+        with _cache_lock:
+            cached = _project_info_cache.get(unity_instance)
+            if cached is not None:
+                return ProjectInfoResponse(
+                    success=True,
+                    message="Retrieved cached project information.",
+                    data=_copy_project_info(cached),
+                )
+
     response = await send_with_unity_instance(
         async_send_command_with_retry,
         unity_instance,
         "get_project_info",
         {}
     )
-    return parse_resource_response(response, ProjectInfoResponse)
+    parsed = parse_resource_response(response, ProjectInfoResponse)
+    if unity_instance and isinstance(parsed, ProjectInfoResponse) and parsed.success:
+        with _cache_lock:
+            _project_info_cache[unity_instance] = _copy_project_info(parsed.data)
+    return parsed

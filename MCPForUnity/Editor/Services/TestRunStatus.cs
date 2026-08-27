@@ -1,4 +1,5 @@
 using System;
+using MCPForUnity.Editor.Helpers;
 using UnityEditor.TestTools.TestRunner.Api;
 
 namespace MCPForUnity.Editor.Services
@@ -10,6 +11,7 @@ namespace MCPForUnity.Editor.Services
     internal static class TestRunStatus
     {
         private static readonly object LockObj = new();
+        internal static event Action StateChanged;
 
         private static bool _isRunning;
         private static TestMode? _mode;
@@ -45,6 +47,8 @@ namespace MCPForUnity.Editor.Services
                 _startedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _finishedUnixMs = null;
             }
+
+            NotifyStateChanged();
         }
 
         public static void MarkFinished()
@@ -55,8 +59,20 @@ namespace MCPForUnity.Editor.Services
                 _finishedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _mode = null;
             }
+
+            NotifyStateChanged();
+        }
+
+        private static void NotifyStateChanged()
+        {
+            try
+            {
+                StateChanged?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestRunStatus] State listener failed: {ex.Message}");
+            }
         }
     }
 }
-
-

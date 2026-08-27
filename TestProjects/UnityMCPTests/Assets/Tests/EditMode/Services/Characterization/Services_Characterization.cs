@@ -296,7 +296,7 @@ namespace MCPForUnityTests.Editor.Services.Characterization
         }
 
         [Test]
-        public void EditorStateCache_GetSnapshot_StampsTheLiveResponseTime()
+        public void EditorStateCache_GetSnapshot_PreservesObservationTimeAndStampsHeartbeat()
         {
             FieldInfo cachedField = typeof(EditorStateCache).GetField(
                 "_cached",
@@ -316,12 +316,37 @@ namespace MCPForUnityTests.Editor.Services.Characterization
                 JObject snapshot = EditorStateCache.GetSnapshot();
                 long observed = snapshot.Value<long>("observed_at_unix_ms");
 
-                Assert.GreaterOrEqual(observed, before,
-                    "A successful live resource response must not retain an aged cached timestamp.");
+                Assert.AreEqual(1L, observed,
+                    "Snapshot reads must preserve the semantic observation time.");
+                Assert.GreaterOrEqual(EditorStateCache.GetLastMainThreadHeartbeatUnixMs(), before,
+                    "A live main-thread read must advance the separate heartbeat.");
             }
             finally
             {
                 cachedField.SetValue(null, original);
+            }
+        }
+
+        [Test]
+        public void EditorStateCache_ForceUpdate_NotifiesSnapshotListeners()
+        {
+            EditorStateCache.GetSnapshot();
+            MethodInfo forceUpdate = typeof(EditorStateCache).GetMethod(
+                "ForceUpdate",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.IsNotNull(forceUpdate);
+
+            int notificationCount = 0;
+            Action handler = () => notificationCount++;
+            EditorStateCache.SnapshotChanged += handler;
+            try
+            {
+                forceUpdate.Invoke(null, new object[] { "test" });
+                Assert.AreEqual(1, notificationCount);
+            }
+            finally
+            {
+                EditorStateCache.SnapshotChanged -= handler;
             }
         }
 

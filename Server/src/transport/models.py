@@ -9,6 +9,7 @@ class WelcomeMessage(BaseModel):
     type: str = "welcome"
     serverTimeout: int
     keepAliveInterval: int
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class RegisteredMessage(BaseModel):
@@ -47,6 +48,18 @@ class RegisterToolsMessage(BaseModel):
 class PongMessage(BaseModel):
     type: str = "pong"
     session_id: str | None = None
+
+
+class EditorStateMessage(BaseModel):
+    type: str = "editor_state"
+    session_id: str | None = None
+    state: dict[str, Any] = Field(default_factory=dict)
+
+
+class EditorHeartbeatMessage(BaseModel):
+    type: str = "editor_heartbeat"
+    session_id: str | None = None
+    editor_heartbeat_unix_ms: int | None = None
 
 
 class CommandResultMessage(BaseModel):

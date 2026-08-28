@@ -1,10 +1,11 @@
 import asyncio
 from collections import OrderedDict
 import inspect
+import json
 import logging
 import time
 from hashlib import sha256
-from typing import Optional
+from typing import Any, Optional
 
 from fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field, ValidationError
@@ -13,7 +14,8 @@ from starlette.responses import JSONResponse
 
 from core.config import config
 from models.models import MCPResponse, ToolDefinitionModel, ToolParameterModel
-from core.logging_decorator import log_execution
+from core.logging_decorator import log_execution, summarize_value
+from core.result_budget import enforce_result_budget
 from core.telemetry_decorator import telemetry_tool
 from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import (
@@ -133,7 +135,9 @@ class CustomToolService:
         legacy = list(self._project_tools.get(project_id, {}).values())
         self._touch_project(project_id)
         hub_tools = await PluginHub.get_tools_for_project(project_id, user_id=user_id)
-        return legacy + hub_tools
+        by_name = {tool.name: tool for tool in legacy}
+        by_name.update({tool.name: tool for tool in hub_tools})
+        return list(by_name.values())
 
     async def get_tool_definition(
         self,
@@ -144,10 +148,13 @@ class CustomToolService:
         tool = self._project_tools.get(project_id, {}).get(tool_name)
         if tool:
             return tool
-        tool = self._global_tools.get(tool_name)
+        tool = await PluginHub.get_tool_definition(project_id, tool_name, user_id=user_id)
         if tool:
             return tool
-        return await PluginHub.get_tool_definition(project_id, tool_name, user_id=user_id)
+        owners = self._global_tool_owners.get(tool_name, {})
+        if len(owners) == 1:
+            return next(iter(owners.values()))
+        return self._global_tools.get(tool_name)
 
     async def execute_tool(
         self,
@@ -159,7 +166,11 @@ class CustomToolService:
     ) -> MCPResponse:
         params = params or {}
         logger.info(
-            f"Executing tool '{tool_name}' for project '{project_id}' (instance={unity_instance}) with params: {params}"
+            "Executing custom tool '%s' for project '%s' (instance=%s): %s",
+            tool_name,
+            project_id,
+            unity_instance,
+            summarize_value(params),
         )
 
         definition = await self.get_tool_definition(project_id, tool_name, user_id=user_id)
@@ -168,6 +179,10 @@ class CustomToolService:
                 success=False,
                 message=f"Tool '{tool_name}' not found for project {project_id}",
             )
+
+        validation_error = self._validate_parameters(definition, params)
+        if validation_error:
+            return MCPResponse(success=False, message=validation_error)
 
         response = await send_with_unity_instance(
             async_send_command_with_retry,
@@ -179,7 +194,11 @@ class CustomToolService:
 
         if not definition.requires_polling:
             result = self._normalize_response(response)
-            logger.info(f"Tool '{tool_name}' immediate response: {result}")
+            logger.info(
+                "Custom tool '%s' completed: %s",
+                tool_name,
+                summarize_value(result),
+            )
             return result
 
         result = await self._poll_until_complete(
@@ -191,8 +210,65 @@ class CustomToolService:
             user_id=user_id,
             max_poll_seconds=definition.max_poll_seconds or 0,
         )
-        logger.info(f"Tool '{tool_name}' polled response: {result}")
+        logger.info(
+            "Custom tool '%s' polling completed: %s",
+            tool_name,
+            summarize_value(result),
+        )
         return result
+
+    @staticmethod
+    def _validate_parameters(
+        definition: ToolDefinitionModel,
+        params: dict[str, object],
+    ) -> str | None:
+        expected = {parameter.name: parameter for parameter in definition.parameters}
+        if not expected:
+            return None
+        unknown = sorted(set(params) - set(expected))
+        if unknown:
+            return (
+                f"Unknown parameter(s) for '{definition.name}': {', '.join(unknown)}. "
+                f"Expected: {', '.join(sorted(expected)) or 'none'}."
+            )
+
+        missing = sorted(
+            parameter.name
+            for parameter in definition.parameters
+            if parameter.required and (
+                parameter.name not in params or params[parameter.name] is None
+            )
+        )
+        if missing:
+            return f"Missing required parameter(s) for '{definition.name}': {', '.join(missing)}."
+
+        for name, value in params.items():
+            if value is None:
+                continue
+            parameter = expected[name]
+            if not CustomToolService._matches_parameter_type(parameter.type, value):
+                return (
+                    f"Parameter '{name}' for '{definition.name}' must be "
+                    f"{parameter.type}; received {type(value).__name__}."
+                )
+        return None
+
+    @staticmethod
+    def _matches_parameter_type(parameter_type: str | None, value: object) -> bool:
+        normalized = (parameter_type or "string").lower()
+        if normalized in {"any", "json"}:
+            return True
+        if normalized in {"integer", "int"}:
+            return isinstance(value, int) and not isinstance(value, bool)
+        if normalized in {"number", "float", "double"}:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if normalized in {"bool", "boolean"}:
+            return isinstance(value, bool)
+        if normalized in {"array", "list"}:
+            return isinstance(value, list)
+        if normalized in {"object", "dict"}:
+            return isinstance(value, dict)
+        return isinstance(value, str)
 
     # --- Internal helpers ------------------------------------------------
     def _is_registered(self, project_id: str, tool_name: str) -> bool:
@@ -206,6 +282,10 @@ class CustomToolService:
         if not project_hash:
             return None
         return self._hash_to_project.get(project_hash.lower())
+
+    def get_global_tool_names(self) -> set[str]:
+        """Return the dynamic dispatch names currently registered with FastMCP."""
+        return set(self._global_tools)
 
     async def _poll_until_complete(
         self,
@@ -221,7 +301,7 @@ class CustomToolService:
         poll_params["action"] = poll_action or "status"
 
         timeout = max_poll_seconds if max_poll_seconds > 0 else _MAX_POLL_SECONDS
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         response = initial_response
 
         while True:
@@ -230,7 +310,7 @@ class CustomToolService:
             if status in ("complete", "error", "final"):
                 return self._normalize_response(response)
 
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 return MCPResponse(
                     success=False,
                     message=f"Timeout waiting for {tool_name} to complete",
@@ -371,8 +451,7 @@ class CustomToolService:
                 continue
             owners = self._global_tool_owners.setdefault(tool.name, {})
             owners[owner_id] = tool
-            canonical_owner = min(owners)
-            canonical = owners[canonical_owner]
+            merged = self._merge_owner_definitions(tool.name, owners)
             existing = self._global_tools.get(tool.name)
             if existing is None:
                 if len(self._global_tools) >= self.MAX_GLOBAL_CUSTOM_TOOLS:
@@ -384,9 +463,9 @@ class CustomToolService:
                         tool.name,
                     )
                     continue
-                self._register_global_tool(canonical)
-            elif existing.model_dump() != canonical.model_dump():
-                self._replace_global_tool(canonical)
+                self._register_global_tool(merged)
+            elif existing.model_dump() != merged.model_dump():
+                self._replace_global_tool(merged)
 
     def unregister_global_tools_for_owner(self, owner_id: str) -> None:
         for tool_name, owners in list(self._global_tool_owners.items()):
@@ -397,10 +476,10 @@ class CustomToolService:
                     self._mcp.local_provider.remove_tool(tool_name)
                     self._global_tools.pop(tool_name, None)
                 continue
-            canonical = owners[min(owners)]
+            merged = self._merge_owner_definitions(tool_name, owners)
             existing = self._global_tools.get(tool_name)
-            if existing is None or existing.model_dump() != canonical.model_dump():
-                self._replace_global_tool(canonical)
+            if existing is None or existing.model_dump() != merged.model_dump():
+                self._replace_global_tool(merged)
 
     def replace_global_tools_for_owner(
         self,
@@ -415,6 +494,53 @@ class CustomToolService:
     def _get_builtin_tool_names(self) -> set[str]:
         return {tool["name"] for tool in get_registered_tools()}
 
+    def _merge_owner_definitions(
+        self,
+        tool_name: str,
+        owners: dict[str, ToolDefinitionModel],
+    ) -> ToolDefinitionModel:
+        """Build a permissive dispatch schema; middleware exposes the exact active schema."""
+        definitions = [owners[owner_id] for owner_id in sorted(owners)]
+        parameters_by_name: dict[str, list[ToolParameterModel]] = {}
+        for definition in definitions:
+            for parameter in definition.parameters:
+                parameters_by_name.setdefault(parameter.name, []).append(parameter)
+
+        merged_parameters: list[ToolParameterModel] = []
+        for name in sorted(parameters_by_name):
+            variants = parameters_by_name[name]
+            normalized_types = {
+                (variant.type or "string").lower() for variant in variants
+            }
+            merged_type = next(iter(normalized_types)) if len(normalized_types) == 1 else "any"
+            merged_parameters.append(
+                ToolParameterModel(
+                    name=name,
+                    description=variants[0].description,
+                    type=merged_type,
+                    required=False,
+                    default_value=None,
+                )
+            )
+
+        groups = {definition.group for definition in definitions}
+        return ToolDefinitionModel(
+            name=tool_name,
+            description=(
+                definitions[0].description
+                if len(definitions) == 1
+                else "Custom Unity tool. Its exact schema depends on the active Unity instance."
+            ),
+            structured_output=all(
+                definition.structured_output is not False
+                for definition in definitions
+            ),
+            requires_polling=False,
+            group=next(iter(groups)) if len(groups) == 1 else None,
+            is_built_in=False,
+            parameters=merged_parameters,
+        )
+
     def _register_global_tool(self, definition: ToolDefinitionModel) -> None:
         existing = self._global_tools.get(definition.name)
         if existing:
@@ -426,7 +552,8 @@ class CustomToolService:
             return
 
         handler = self._build_global_tool_handler(definition)
-        wrapped = log_execution(definition.name, "Tool")(handler)
+        wrapped = enforce_result_budget(definition.name)(handler)
+        wrapped = log_execution(definition.name, "Tool")(wrapped)
         wrapped = telemetry_tool(definition.name)(wrapped)
 
         try:
@@ -534,6 +661,8 @@ class CustomToolService:
 
     def _map_param_type(self, param: ToolParameterModel):
         ptype = (param.type or "string").lower()
+        if ptype in ("any", "json"):
+            return Any
         if ptype in ("integer", "int"):
             return int
         if ptype in ("number", "float", "double"):
@@ -557,6 +686,8 @@ class CustomToolService:
                 return float(value)
             if ptype in ("bool", "boolean"):
                 return str(value).lower() in ("1", "true", "yes", "on")
+            if ptype in ("array", "list", "object", "dict", "json"):
+                return json.loads(value)
             return value
         except Exception:
             return value
@@ -578,39 +709,44 @@ def resolve_project_id_for_unity_instance(unity_instance: str | None) -> str | N
         return None
 
     # stdio transport: resolve via discovered instances with name+path
-    try:
-        pool = get_unity_connection_pool()
-        instances = pool.discover_all_instances()
-        target = None
-        if "@" in unity_instance:
-            name_part, _, hash_hint = unity_instance.partition("@")
-            target = next(
-                (
-                    inst for inst in instances
-                    if inst.name == name_part and inst.hash.startswith(hash_hint)
-                ),
-                None,
-            )
-        else:
-            target = next(
-                (
-                    inst for inst in instances
-                    if inst.id == unity_instance or inst.hash.startswith(unity_instance)
-                ),
-                None,
-            )
+    if (config.transport_mode or "stdio").lower() != "http":
+        try:
+            pool = get_unity_connection_pool()
+            instances = pool.discover_all_instances()
+            target = None
+            if "@" in unity_instance:
+                name_part, _, hash_hint = unity_instance.partition("@")
+                target = next(
+                    (
+                        inst for inst in instances
+                        if inst.name == name_part and inst.hash.startswith(hash_hint)
+                    ),
+                    None,
+                )
+            else:
+                target = next(
+                    (
+                        inst for inst in instances
+                        if inst.id == unity_instance or inst.hash.startswith(unity_instance)
+                    ),
+                    None,
+                )
 
-        if target:
-            # Return the project_hash from Unity (not a computed SHA256 hash).
-            # This matches the hash Unity uses when registering tools via WebSocket.
-            if target.hash:
-                return target.hash
-            logger.warning(
-                f"Unity instance {target.id} has empty hash; cannot resolve project ID")
-            return None
-    except Exception:
-        logger.debug(
-            f"Failed to resolve project id via connection pool for {unity_instance}")
+            if target:
+                # Return the project_hash from Unity (not a computed SHA256 hash).
+                # This matches the hash Unity uses when registering tools via WebSocket.
+                if target.hash:
+                    return target.hash
+                logger.warning(
+                    "Unity instance %s has empty hash; cannot resolve project ID",
+                    target.id,
+                )
+                return None
+        except Exception:
+            logger.debug(
+                "Failed to resolve project id via connection pool for %s",
+                unity_instance,
+            )
 
     # HTTP/WebSocket transport: resolve via PluginHub using project_hash
     try:

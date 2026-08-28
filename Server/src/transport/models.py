@@ -34,15 +34,15 @@ class PingMessage(BaseModel):
 
 class RegisterMessage(BaseModel):
     type: str = "register"
-    project_name: str = "Unknown Project"
-    project_hash: str
-    unity_version: str = "Unknown"
-    project_path: str | None = None  # Full path to project root (for focus nudging)
+    project_name: str = Field(default="Unknown Project", max_length=256)
+    project_hash: str = Field(max_length=128)
+    unity_version: str = Field(default="Unknown", max_length=128)
+    project_path: str | None = Field(default=None, max_length=4096)  # Full path to project root (for focus nudging)
 
 
 class RegisterToolsMessage(BaseModel):
     type: str = "register_tools"
-    tools: list[ToolDefinitionModel] = Field(max_length=1024)
+    tools: list[ToolDefinitionModel] = Field(max_length=256)
 
 
 class PongMessage(BaseModel):

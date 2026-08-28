@@ -1,105 +1,120 @@
-"""
-Telemetry decorator for MCP for Unity tools
-"""
+"""Low-overhead telemetry decorators for MCP tools and resources."""
+
+from __future__ import annotations
 
 import functools
 import inspect
 import logging
 import time
-from typing import Callable, Any
+from typing import Any, Callable
 
-from core.telemetry import record_resource_usage, record_tool_usage, record_milestone, MilestoneType
+from core.logging_decorator import bounded_diagnostic_text
+from core.telemetry import (
+    MilestoneType,
+    record_milestone,
+    record_resource_usage,
+    record_tool_usage,
+)
 
 _log = logging.getLogger("unity-mcp-telemetry")
-_decorator_log_count = 0
+_MAX_ERROR_CHARS = 256
+
+
+def _bounded_error(exc: Exception) -> str:
+    return bounded_diagnostic_text(exc, _MAX_ERROR_CHARS)
 
 
 def telemetry_tool(tool_name: str):
-    """Decorator to add telemetry tracking to MCP tools"""
+    """Decorator to add telemetry tracking to MCP tools."""
     def decorator(func: Callable) -> Callable:
+        action_arg_index: int | None = None
+        try:
+            signature = inspect.signature(func)
+            positional_parameters = (
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            )
+            action_arg_index = next(
+                (
+                    index
+                    for index, parameter in enumerate(positional_parameters)
+                    if parameter.name == "action"
+                ),
+                None,
+            )
+        except (TypeError, ValueError):
+            pass
+
+        def extract_sub_action(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if "action" in kwargs:
+                return kwargs["action"]
+            if action_arg_index is not None and action_arg_index < len(args):
+                return args[action_arg_index]
+            return None
+
+        def emit_milestones(action: Any) -> None:
+            try:
+                if tool_name == "manage_script" and action == "create":
+                    record_milestone(MilestoneType.FIRST_SCRIPT_CREATION)
+                elif tool_name.startswith("manage_scene"):
+                    record_milestone(MilestoneType.FIRST_SCENE_MODIFICATION)
+                record_milestone(MilestoneType.FIRST_TOOL_USAGE)
+            except Exception:
+                _log.debug("milestone emit failed", exc_info=True)
+
         @functools.wraps(func)
         def _sync_wrapper(*args, **kwargs) -> Any:
-            start_time = time.time()
+            started = time.perf_counter()
             success = False
             error = None
-            # Extract sub-action (e.g., 'get_hierarchy') from bound args when available
-            sub_action = None
+            sub_action = extract_sub_action(args, kwargs)
             try:
-                sig = inspect.signature(func)
-                bound = sig.bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                sub_action = bound.arguments.get("action")
-            except Exception:
-                sub_action = None
-            try:
-                global _decorator_log_count
-                if _decorator_log_count < 10:
-                    _log.info(f"telemetry_decorator sync: tool={tool_name}")
-                    _decorator_log_count += 1
                 result = func(*args, **kwargs)
                 success = True
-                action_val = sub_action or kwargs.get("action")
-                try:
-                    if tool_name == "manage_script" and action_val == "create":
-                        record_milestone(MilestoneType.FIRST_SCRIPT_CREATION)
-                    elif tool_name.startswith("manage_scene"):
-                        record_milestone(
-                            MilestoneType.FIRST_SCENE_MODIFICATION)
-                    record_milestone(MilestoneType.FIRST_TOOL_USAGE)
-                except Exception:
-                    _log.debug("milestone emit failed", exc_info=True)
+                emit_milestones(sub_action)
                 return result
-            except Exception as e:
-                error = str(e)
+            except Exception as exc:
+                error = _bounded_error(exc)
                 raise
             finally:
-                duration_ms = (time.time() - start_time) * 1000
                 try:
-                    record_tool_usage(tool_name, success,
-                                      duration_ms, error, sub_action=sub_action)
+                    record_tool_usage(
+                        tool_name,
+                        success,
+                        (time.perf_counter() - started) * 1000,
+                        error,
+                        sub_action=sub_action,
+                    )
                 except Exception:
                     _log.debug("record_tool_usage failed", exc_info=True)
 
         @functools.wraps(func)
         async def _async_wrapper(*args, **kwargs) -> Any:
-            start_time = time.time()
+            started = time.perf_counter()
             success = False
             error = None
-            # Extract sub-action (e.g., 'get_hierarchy') from bound args when available
-            sub_action = None
+            sub_action = extract_sub_action(args, kwargs)
             try:
-                sig = inspect.signature(func)
-                bound = sig.bind_partial(*args, **kwargs)
-                bound.apply_defaults()
-                sub_action = bound.arguments.get("action")
-            except Exception:
-                sub_action = None
-            try:
-                global _decorator_log_count
-                if _decorator_log_count < 10:
-                    _log.info(f"telemetry_decorator async: tool={tool_name}")
-                    _decorator_log_count += 1
                 result = await func(*args, **kwargs)
                 success = True
-                action_val = sub_action or kwargs.get("action")
-                try:
-                    if tool_name == "manage_script" and action_val == "create":
-                        record_milestone(MilestoneType.FIRST_SCRIPT_CREATION)
-                    elif tool_name.startswith("manage_scene"):
-                        record_milestone(
-                            MilestoneType.FIRST_SCENE_MODIFICATION)
-                    record_milestone(MilestoneType.FIRST_TOOL_USAGE)
-                except Exception:
-                    _log.debug("milestone emit failed", exc_info=True)
+                emit_milestones(sub_action)
                 return result
-            except Exception as e:
-                error = str(e)
+            except Exception as exc:
+                error = _bounded_error(exc)
                 raise
             finally:
-                duration_ms = (time.time() - start_time) * 1000
                 try:
-                    record_tool_usage(tool_name, success,
-                                      duration_ms, error, sub_action=sub_action)
+                    record_tool_usage(
+                        tool_name,
+                        success,
+                        (time.perf_counter() - started) * 1000,
+                        error,
+                        sub_action=sub_action,
+                    )
                 except Exception:
                     _log.debug("record_tool_usage failed", exc_info=True)
 
@@ -108,55 +123,51 @@ def telemetry_tool(tool_name: str):
 
 
 def telemetry_resource(resource_name: str):
-    """Decorator to add telemetry tracking to MCP resources"""
+    """Decorator to add telemetry tracking to MCP resources."""
     def decorator(func: Callable) -> Callable:
         @functools.wraps(func)
         def _sync_wrapper(*args, **kwargs) -> Any:
-            start_time = time.time()
+            started = time.perf_counter()
             success = False
             error = None
             try:
-                global _decorator_log_count
-                if _decorator_log_count < 10:
-                    _log.info(
-                        f"telemetry_decorator sync: resource={resource_name}")
-                    _decorator_log_count += 1
                 result = func(*args, **kwargs)
                 success = True
                 return result
-            except Exception as e:
-                error = str(e)
+            except Exception as exc:
+                error = _bounded_error(exc)
                 raise
             finally:
-                duration_ms = (time.time() - start_time) * 1000
                 try:
-                    record_resource_usage(resource_name, success,
-                                          duration_ms, error)
+                    record_resource_usage(
+                        resource_name,
+                        success,
+                        (time.perf_counter() - started) * 1000,
+                        error,
+                    )
                 except Exception:
                     _log.debug("record_resource_usage failed", exc_info=True)
 
         @functools.wraps(func)
         async def _async_wrapper(*args, **kwargs) -> Any:
-            start_time = time.time()
+            started = time.perf_counter()
             success = False
             error = None
             try:
-                global _decorator_log_count
-                if _decorator_log_count < 10:
-                    _log.info(
-                        f"telemetry_decorator async: resource={resource_name}")
-                    _decorator_log_count += 1
                 result = await func(*args, **kwargs)
                 success = True
                 return result
-            except Exception as e:
-                error = str(e)
+            except Exception as exc:
+                error = _bounded_error(exc)
                 raise
             finally:
-                duration_ms = (time.time() - start_time) * 1000
                 try:
-                    record_resource_usage(resource_name, success,
-                                          duration_ms, error)
+                    record_resource_usage(
+                        resource_name,
+                        success,
+                        (time.perf_counter() - started) * 1000,
+                        error,
+                    )
                 except Exception:
                     _log.debug("record_resource_usage failed", exc_info=True)
 

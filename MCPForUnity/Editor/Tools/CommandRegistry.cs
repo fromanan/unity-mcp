@@ -70,28 +70,21 @@ namespace MCPForUnity.Editor.Tools
 
             try
             {
-                var allTypes = UnityAssembliesCompat.GetLoadedAssemblies()
-                    .Where(a => !a.IsDynamic)
-                    .SelectMany(a =>
-                    {
-                        try { return a.GetTypes(); }
-                        catch { return new Type[0]; }
-                    })
-                    .ToList();
-
                 // Discover tools
-                var toolTypes = allTypes.Where(t => HasAttributeSafe<McpForUnityToolAttribute>(t));
+                IReadOnlyList<Type> toolTypes =
+                    AttributedTypeCatalog.GetTypesWithAttribute<McpForUnityToolAttribute>();
                 int toolCount = 0;
-                foreach (var type in toolTypes)
+                foreach (Type type in toolTypes)
                 {
                     if (RegisterCommandType(type, isResource: false))
                         toolCount++;
                 }
 
                 // Discover resources
-                var resourceTypes = allTypes.Where(t => HasAttributeSafe<McpForUnityResourceAttribute>(t));
+                IReadOnlyList<Type> resourceTypes =
+                    AttributedTypeCatalog.GetTypesWithAttribute<McpForUnityResourceAttribute>();
                 int resourceCount = 0;
-                foreach (var type in resourceTypes)
+                foreach (Type type in resourceTypes)
                 {
                     if (RegisterCommandType(type, isResource: true))
                         resourceCount++;

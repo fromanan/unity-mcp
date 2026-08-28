@@ -201,3 +201,60 @@ def test_zero_length_payload_heartbeat():
         conn.disconnect()
 
 
+def test_legacy_receive_scans_chunks_once_and_ignores_braces_in_strings():
+    payload = b'{"status":"success","result":{"content":"brace } and quote \\"x\\""}}'
+
+    class ChunkSocket:
+        def __init__(self, chunks):
+            self._chunks = iter(chunks)
+
+        def recv(self, _count):
+            return next(self._chunks, b"")
+
+    conn = UnityConnection(port=6400)
+    conn.use_framing = False
+    response = conn.receive_full_response(
+        ChunkSocket([payload[:11], payload[11:29], payload[29:]]),
+        buffer_size=16 * 1024 * 1024,
+    )
+
+    assert bytes(response) == payload
+    assert json.loads(response.decode("utf-8"))["result"]["content"].startswith("brace }")
+
+
+def test_legacy_receive_rejects_incomplete_disconnect():
+    class ChunkSocket:
+        def __init__(self):
+            self._chunks = iter([b'{"status":"success"', b""])
+
+        def recv(self, _count):
+            return next(self._chunks, b"")
+
+    conn = UnityConnection(port=6400)
+    conn.use_framing = False
+
+    with pytest.raises(ConnectionError, match="complete JSON response"):
+        conn.receive_full_response(ChunkSocket())
+
+
+def test_stdio_command_rejects_oversized_payload_before_serializing(monkeypatch):
+    monkeypatch.setattr(
+        "transport.legacy.unity_connection.COMMAND_MAX_BYTES",
+        128,
+    )
+    monkeypatch.setattr(
+        "transport.legacy.unity_connection.json.dumps",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized command should not be serialized")
+        ),
+    )
+    conn = UnityConnection(port=6400)
+
+    result = conn.send_command(
+        "large_tool",
+        {"payload": "x" * 512},
+        max_attempts=0,
+    )
+
+    assert result.success is False
+    assert result.error == "command_payload_too_large"

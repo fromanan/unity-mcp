@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from fastmcp import FastMCP
+import pytest
 from starlette.testclient import TestClient
+from unittest.mock import AsyncMock, patch
 
 from core.config import config
-from models.models import ToolDefinitionModel
+from models.models import ToolDefinitionModel, ToolParameterModel
 from services.custom_tool_service import CustomToolService
 from transport.bounded_streamable_http import create_bounded_streamable_http_app
 
@@ -97,3 +99,68 @@ def test_legacy_project_registry_is_bounded():
     assert len(service._project_tools) == CustomToolService.MAX_LEGACY_PROJECTS
     assert "project-0" not in service._project_tools
     assert "hash-0" not in service._hash_to_project
+
+
+def test_same_name_owner_schemas_merge_to_bounded_dispatch_signature():
+    service, _ = _service_app()
+    service.register_global_tools(
+        [
+            ToolDefinitionModel(
+                name="project_specific_tool",
+                parameters=[
+                    ToolParameterModel(name="count", type="integer"),
+                    ToolParameterModel(name="shared", type="string"),
+                ],
+            )
+        ],
+        owner_id="session-a",
+    )
+    service.register_global_tools(
+        [
+            ToolDefinitionModel(
+                name="project_specific_tool",
+                parameters=[
+                    ToolParameterModel(name="enabled", type="boolean"),
+                    ToolParameterModel(name="shared", type="integer"),
+                ],
+            )
+        ],
+        owner_id="session-b",
+    )
+
+    merged = service._global_tools["project_specific_tool"]
+    by_name = {parameter.name: parameter for parameter in merged.parameters}
+    assert list(by_name) == ["count", "enabled", "shared"]
+    assert all(parameter.required is False for parameter in by_name.values())
+    assert by_name["shared"].type == "any"
+    assert "active Unity instance" in (merged.description or "")
+
+
+@pytest.mark.asyncio
+async def test_active_project_definition_wins_over_merged_global_schema():
+    service, _ = _service_app()
+    global_definition = ToolDefinitionModel(
+        name="project_specific_tool",
+        parameters=[ToolParameterModel(name="generic", required=False)],
+    )
+    project_definition = ToolDefinitionModel(
+        name="project_specific_tool",
+        parameters=[ToolParameterModel(name="exact", type="integer")],
+    )
+    service.register_global_tools([global_definition], owner_id="session-a")
+
+    with patch.object(
+        service,
+        "_project_tools",
+        {"project-a": {"project_specific_tool": project_definition}},
+    ), patch(
+        "services.custom_tool_service.PluginHub.get_tool_definition",
+        new=AsyncMock(),
+    ) as hub_lookup:
+        resolved = await service.get_tool_definition(
+            "project-a",
+            "project_specific_tool",
+        )
+
+    assert resolved == project_definition
+    hub_lookup.assert_not_awaited()

@@ -111,6 +111,15 @@ class TestIsInStringContext:
 # ── _find_best_closing_brace_match ───────────────────────────────────
 
 class TestFindBestClosingBraceMatch:
+    def test_match_keeps_later_code_brace_after_string_brace(self):
+        code = 'public class Foo { void M() { string s = "}"; } }'
+        matches = list(re.finditer(r'"}";\s*}', code))
+
+        best = _find_best_closing_brace_match(matches, code)
+
+        assert len(matches) == 1
+        assert best is matches[0]
+
     def test_skips_braces_in_interpolated_strings(self):
         """Braces inside $"...{x}..." should not be scored as class-end."""
         code = (

@@ -35,6 +35,8 @@ except ImportError:
 
 logger = logging.getLogger("unity-mcp-telemetry")
 PACKAGE_NAME = "mcpforunityserver"
+_QUEUE_STOP = object()
+_QUEUE_MAX_RECORDS = 1000
 
 
 def _version_from_local_pyproject() -> str:
@@ -165,7 +167,7 @@ class TelemetryConfig:
             pass
 
         # Local storage for UUID and milestones
-        self.data_dir = self._get_data_directory()
+        self.data_dir = self._get_data_directory(create=self.enabled)
         self.uuid_file = self.data_dir / "customer_uuid.txt"
         self.milestones_file = self.data_dir / "milestones.json"
 
@@ -196,7 +198,7 @@ class TelemetryConfig:
                 return True
         return False
 
-    def _get_data_directory(self) -> Path:
+    def _get_data_directory(self, *, create: bool = True) -> Path:
         """Get directory for storing telemetry data"""
         if os.name == 'nt':  # Windows
             base_dir = Path(os.environ.get(
@@ -211,7 +213,8 @@ class TelemetryConfig:
             base_dir = Path.home() / '.unity-mcp'
 
         data_dir = base_dir / 'UnityMCP'
-        data_dir.mkdir(parents=True, exist_ok=True)
+        if create:
+            data_dir.mkdir(parents=True, exist_ok=True)
         return data_dir
 
     def _validated_endpoint(self, candidate: str, fallback: str) -> str:
@@ -248,13 +251,18 @@ class TelemetryCollector:
         self._milestones: dict[str, dict[str, Any]] = {}
         self._lock: threading.Lock = threading.Lock()
         # Bounded queue with single background worker (records only; no context propagation)
-        self._queue: "queue.Queue[TelemetryRecord]" = queue.Queue(maxsize=1000)
+        self._queue: "queue.Queue[TelemetryRecord | object]" = queue.Queue(
+            maxsize=_QUEUE_MAX_RECORDS
+        )
         self._shutdown: bool = False
-        # Load persistent data before starting worker so first events have UUID
-        self._load_persistent_data()
-        self._worker: threading.Thread = threading.Thread(
-            target=self._worker_loop, daemon=True)
-        self._worker.start()
+        self._http_client = None
+        self._worker: threading.Thread | None = None
+        if self.config.enabled:
+            # Load persistent data before starting worker so first events have UUID.
+            self._load_persistent_data()
+            self._worker = threading.Thread(
+                target=self._worker_loop, daemon=True)
+            self._worker.start()
 
     def _load_persistent_data(self):
         """Load UUID and milestones from disk"""
@@ -328,7 +336,7 @@ class TelemetryCollector:
                data: dict[str, Any],
                milestone: MilestoneType | None = None):
         """Record a telemetry event (async, non-blocking)"""
-        if not self.config.enabled:
+        if not self.config.enabled or self._shutdown:
             return
 
         # Allow fallback sender when httpx is unavailable (no early return)
@@ -350,12 +358,11 @@ class TelemetryCollector:
 
     def _worker_loop(self):
         """Background worker that serializes telemetry sends."""
-        while not self._shutdown:
+        while True:
+            rec = self._queue.get()
             try:
-                rec = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
+                if rec is _QUEUE_STOP or self._shutdown:
+                    return
                 # Run sender directly; do not reuse caller context/thread-locals
                 self._send_telemetry(rec)
             except Exception:
@@ -366,9 +373,32 @@ class TelemetryCollector:
 
     def shutdown(self):
         """Shutdown the telemetry collector and worker thread."""
+        if self._shutdown:
+            return
         self._shutdown = True
-        if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=2.0)
+        worker = self._worker
+        if worker is not None:
+            try:
+                self._queue.put_nowait(_QUEUE_STOP)
+            except queue.Full:
+                # Preserve non-blocking shutdown even under backpressure. Dropping one
+                # queued telemetry record creates room for the stop sentinel.
+                with contextlib.suppress(queue.Empty):
+                    self._queue.get_nowait()
+                    self._queue.task_done()
+                with contextlib.suppress(queue.Full):
+                    self._queue.put_nowait(_QUEUE_STOP)
+            if worker.is_alive():
+                worker.join(timeout=2.0)
+        if self._http_client is not None:
+            with contextlib.suppress(Exception):
+                self._http_client.close()
+            self._http_client = None
+
+    def _get_http_client(self):
+        if self._http_client is None and httpx:
+            self._http_client = httpx.Client(timeout=self.config.timeout)
+        return self._http_client
 
     def _send_telemetry(self, record: TelemetryRecord):
         """Send telemetry data to endpoint"""
@@ -400,16 +430,16 @@ class TelemetryCollector:
 
             # Prefer httpx when available; otherwise fall back to urllib
             if httpx:
-                with httpx.Client(timeout=self.config.timeout) as client:
-                    # Re-validate endpoint at send time to handle dynamic changes
-                    endpoint = self.config._validated_endpoint(
-                        self.config.endpoint, self.config.default_endpoint)
-                    response = client.post(endpoint, json=payload)
-                    if 200 <= response.status_code < 300:
-                        logger.debug(f"Telemetry sent: {record.record_type}")
-                    else:
-                        logger.warning(
-                            f"Telemetry failed: HTTP {response.status_code}")
+                client = self._get_http_client()
+                # Re-validate endpoint at send time to handle dynamic changes
+                endpoint = self.config._validated_endpoint(
+                    self.config.endpoint, self.config.default_endpoint)
+                response = client.post(endpoint, json=payload)
+                if 200 <= response.status_code < 300:
+                    logger.debug(f"Telemetry sent: {record.record_type}")
+                else:
+                    logger.warning(
+                        f"Telemetry failed: HTTP {response.status_code}")
             else:
                 import urllib.request
                 import urllib.error
@@ -452,10 +482,16 @@ def get_telemetry() -> TelemetryCollector:
 
 def reset_telemetry():
     """Reset the global telemetry collector. For testing only."""
+    shutdown_telemetry()
+
+
+def shutdown_telemetry() -> None:
+    """Stop and release the global collector without creating one."""
     global _telemetry_collector
-    if _telemetry_collector is not None:
-        _telemetry_collector.shutdown()
-        _telemetry_collector = None
+    collector = _telemetry_collector
+    _telemetry_collector = None
+    if collector is not None:
+        collector.shutdown()
 
 
 def record_telemetry(record_type: RecordType,

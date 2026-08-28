@@ -166,10 +166,11 @@ namespace MCPForUnity.Editor.Tools
                         ?? new List<string> { "error", "warning" };
                     int? count = p.GetInt("count");
                     int? pageSize = p.GetInt("pageSize");
-                    int? cursor = p.GetInt("cursor");
+                    string cursor = p.Get("cursor");
                     string filterText = p.Get("filterText");
                     string format = p.Get("format", "plain").ToLower();
                     bool includeStacktrace = p.GetBool("includeStacktrace", false);
+                    bool includeTotal = p.GetBool("includeTotal", false);
 
                     if (types.Contains("all"))
                     {
@@ -183,7 +184,8 @@ namespace MCPForUnity.Editor.Tools
                         cursor,
                         filterText,
                         format,
-                        includeStacktrace
+                        includeStacktrace,
+                        includeTotal
                     );
                 }
                 else
@@ -222,29 +224,41 @@ namespace MCPForUnity.Editor.Tools
         /// <param name="types">Log types to include (e.g., "error", "warning", "log").</param>
         /// <param name="count">Maximum entries to return in non-paging mode. Ignored when paging is active.</param>
         /// <param name="pageSize">Number of entries per page. Defaults to 50 when omitted.</param>
-        /// <param name="cursor">Starting index for paging (0-based). Defaults to 0.</param>
+        /// <param name="cursor">Opaque raw-entry cursor, or a legacy matching-entry offset.</param>
         /// <param name="filterText">Optional text filter (case-insensitive substring match).</param>
         /// <param name="format">Output format: "plain", "detailed", or "json".</param>
         /// <param name="includeStacktrace">Whether to include stack traces in the output.</param>
+        /// <param name="includeTotal">Whether to scan all entries for an exact total.</param>
         /// <returns>A success response with entries, or an error response.</returns>
         private static object GetConsoleEntries(
             List<string> types,
             int? count,
             int? pageSize,
-            int? cursor,
+            string cursor,
             string filterText,
             string format,
-            bool includeStacktrace
+            bool includeStacktrace,
+            bool includeTotal
         )
         {
             List<object> formattedEntries = new List<object>();
             int retrievedCount = 0;
             int totalMatches = 0;
-            bool usePaging = pageSize.HasValue || cursor.HasValue;
+            bool usePaging = pageSize.HasValue || !string.IsNullOrEmpty(cursor);
             // pageSize defaults to 50 when omitted; count is the overall non-paging limit only
             int resolvedPageSize = Mathf.Clamp(pageSize ?? 50, 1, 500);
-            int resolvedCursor = Mathf.Max(0, cursor ?? 0);
-            int pageEndExclusive = resolvedCursor + resolvedPageSize;
+            string filterFingerprint = BuildFilterFingerprint(types, filterText);
+            if (!TryResolveCursor(
+                    cursor,
+                    filterFingerprint,
+                    out int rawStartIndex,
+                    out int legacyMatchOffset,
+                    out string cursorError))
+            {
+                return new ErrorResponse(cursorError);
+            }
+            int? nextRawIndex = null;
+            bool truncated = false;
 
             try
             {
@@ -264,11 +278,15 @@ namespace MCPForUnity.Editor.Tools
                         "Could not find internal type UnityEditor.LogEntry during GetConsoleEntries."
                     );
                 object logEntryInstance = Activator.CreateInstance(logEntryType);
+                object[] getEntryArguments = { 0, logEntryInstance };
 
-                for (int i = 0; i < totalEntries; i++)
+                int scanStartIndex = includeTotal ? 0 : rawStartIndex;
+                int remainingLegacyMatches = legacyMatchOffset;
+                for (int i = scanStartIndex; i < totalEntries; i++)
                 {
                     // Get the entry data into our instance using reflection
-                    _getEntryMethod.Invoke(null, new object[] { i, logEntryInstance });
+                    getEntryArguments[0] = i;
+                    _getEntryMethod.Invoke(null, getEntryArguments);
 
                     // Extract data using reflection
                     int mode = (int)_modeField.GetValue(logEntryInstance);
@@ -319,13 +337,40 @@ namespace MCPForUnity.Editor.Tools
                         continue;
                     }
 
+                    totalMatches++;
+
+                    if (usePaging)
+                    {
+                        if (i < rawStartIndex)
+                        {
+                            continue;
+                        }
+                        if (remainingLegacyMatches > 0)
+                        {
+                            remainingLegacyMatches--;
+                            continue;
+                        }
+                        if (retrievedCount >= resolvedPageSize)
+                        {
+                            // The page is full. Record the first matching raw entry
+                            // for the next cursor without allocating formatted output.
+                            truncated = true;
+                            nextRawIndex ??= i;
+                            if (!includeTotal)
+                            {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
                     var (messageOnly, stackTrace) = SplitMessageAndStackTrace(message);
                     if (!includeStacktrace)
                     {
                         stackTrace = null;
                     }
 
-                    object formattedEntry = null;
+                    object formattedEntry;
                     switch (format)
                     {
                         case "plain":
@@ -345,27 +390,11 @@ namespace MCPForUnity.Editor.Tools
                             break;
                     }
 
-                    totalMatches++;
+                    formattedEntries.Add(formattedEntry);
+                    retrievedCount++;
 
-                    if (usePaging)
+                    if (!usePaging)
                     {
-                        if (totalMatches > resolvedCursor && totalMatches <= pageEndExclusive)
-                        {
-                            formattedEntries.Add(formattedEntry);
-                            retrievedCount++;
-                        }
-                        // Early exit: we've filled the page and only need to check if more exist
-                        else if (totalMatches > pageEndExclusive)
-                        {
-                            // We've passed the page; totalMatches now indicates truncation
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        formattedEntries.Add(formattedEntry);
-                        retrievedCount++;
-
                         // Apply count limit (after filtering)
                         if (count.HasValue && retrievedCount >= count.Value)
                         {
@@ -396,17 +425,21 @@ namespace MCPForUnity.Editor.Tools
 
             if (usePaging)
             {
-                bool truncated = totalMatches > pageEndExclusive;
-                string nextCursor = truncated ? pageEndExclusive.ToString() : null;
-                var payload = new
+                string nextCursor = truncated && nextRawIndex.HasValue
+                    ? BuildCursor(nextRawIndex.Value, filterFingerprint)
+                    : null;
+                Dictionary<string, object> payload = new()
                 {
-                    cursor = resolvedCursor,
-                    pageSize = resolvedPageSize,
-                    nextCursor = nextCursor,
-                    truncated = truncated,
-                    total = totalMatches,
-                    items = formattedEntries,
+                    ["cursor"] = cursor ?? "0",
+                    ["pageSize"] = resolvedPageSize,
+                    ["nextCursor"] = nextCursor,
+                    ["truncated"] = truncated,
+                    ["items"] = formattedEntries,
                 };
+                if (includeTotal)
+                {
+                    payload["total"] = totalMatches;
+                }
 
                 return new SuccessResponse(
                     $"Retrieved {formattedEntries.Count} log entries.",
@@ -419,6 +452,67 @@ namespace MCPForUnity.Editor.Tools
                 $"Retrieved {formattedEntries.Count} log entries.",
                 formattedEntries
             );
+        }
+
+        private static bool TryResolveCursor(
+            string cursor,
+            string expectedFingerprint,
+            out int rawStartIndex,
+            out int legacyMatchOffset,
+            out string error)
+        {
+            rawStartIndex = 0;
+            legacyMatchOffset = 0;
+            error = null;
+            if (string.IsNullOrWhiteSpace(cursor))
+            {
+                return true;
+            }
+
+            if (int.TryParse(cursor, out int numericCursor))
+            {
+                legacyMatchOffset = Mathf.Max(0, numericCursor);
+                return true;
+            }
+
+            string[] parts = cursor.Split(':');
+            if (parts.Length != 3
+                || !string.Equals(parts[0], "v1", StringComparison.Ordinal)
+                || !int.TryParse(parts[1], out rawStartIndex)
+                || rawStartIndex < 0)
+            {
+                error = "Invalid console cursor. Use the opaque nextCursor returned by read_console.";
+                return false;
+            }
+
+            if (!string.Equals(parts[2], expectedFingerprint, StringComparison.Ordinal))
+            {
+                error = "Console cursor does not match the current types/filterText selection. Restart paging without a cursor.";
+                return false;
+            }
+            return true;
+        }
+
+        private static string BuildCursor(int rawStartIndex, string filterFingerprint)
+        {
+            return $"v1:{rawStartIndex}:{filterFingerprint}";
+        }
+
+        private static string BuildFilterFingerprint(List<string> types, string filterText)
+        {
+            const ulong offsetBasis = 14695981039346656037UL;
+            const ulong prime = 1099511628211UL;
+            string descriptor = string.Join(
+                ",",
+                (types ?? new List<string>()).OrderBy(value => value, StringComparer.Ordinal)
+            ) + "|" + (filterText ?? string.Empty).ToLowerInvariant();
+            ulong hash = offsetBasis;
+            foreach (char character in descriptor)
+            {
+                hash ^= character;
+                hash *= prime;
+            }
+            return hash.ToString("X16");
         }
 
         // --- Internal Helpers ---

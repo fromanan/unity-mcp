@@ -6,7 +6,7 @@ description: "MCP for Unity tools in the core group."
 
 # `core` tools
 
-Essential scene, script, asset & editor tools (always on by default)
+Essential scene, script, asset and editor tools
 
 - **[`apply_text_edits`](./apply_text_edits.md)** — Apply small text edits to a C# script identified by URI.
 - **[`batch_execute`](./batch_execute.md)** — Executes multiple MCP commands in a single batch for dramatically better performance.
@@ -32,7 +32,7 @@ Essential scene, script, asset & editor tools (always on by default)
 - **[`manage_scene`](./manage_scene.md)** — Performs CRUD operations on Unity scenes.
 - **[`manage_script`](./manage_script.md)** — Compatibility router for legacy script operations.
 - **[`manage_script_capabilities`](./manage_script_capabilities.md)** — Get manage_script capabilities (supported ops, limits, and guards).
-- **[`manage_tools`](./manage_tools.md)** — Manage which tool groups are visible in this session.
+- **[`manage_tools`](./manage_tools.md)** — Search and toggle per-session tool groups.
 - **[`read_console`](./read_console.md)** — Gets messages from or clears the Unity Editor console.
 - **[`refresh_unity`](./refresh_unity.md)** — Request a Unity asset database refresh and optionally a script compilation.
 - **[`script_apply_edits`](./script_apply_edits.md)** — Structured C# edits (methods/classes) with safer boundaries - prefer this over raw text.

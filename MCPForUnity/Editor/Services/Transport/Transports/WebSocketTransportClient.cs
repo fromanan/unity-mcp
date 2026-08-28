@@ -25,6 +25,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
     public class WebSocketTransportClient : IMcpTransportClient, IDisposable
     {
         private const string TransportDisplayName = "websocket";
+        private const int MaxIncomingMessageBytes = 16 * 1024 * 1024;
+        private const int MaxOutgoingMessageBytes = 16 * 1024 * 1024;
         private static readonly TimeSpan[] ReconnectSchedule =
         {
             TimeSpan.Zero,
@@ -444,8 +446,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             byte[] rentedBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(8192);
-            var buffer = new ArraySegment<byte>(rentedBuffer);
-            using var ms = new MemoryStream(8192);
+            ArraySegment<byte> buffer = new(rentedBuffer);
+            using MemoryStream ms = new(8192);
 
             try
             {
@@ -459,8 +461,26 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                         return null;
                     }
 
+                    if (result.MessageType != WebSocketMessageType.Text)
+                    {
+                        await _socket.CloseOutputAsync(
+                            WebSocketCloseStatus.InvalidMessageType,
+                            "Only text messages are supported",
+                            token).ConfigureAwait(false);
+                        throw new InvalidDataException("Received a non-text WebSocket message");
+                    }
+
                     if (result.Count > 0)
                     {
+                        if (ms.Length + result.Count > MaxIncomingMessageBytes)
+                        {
+                            await _socket.CloseOutputAsync(
+                                WebSocketCloseStatus.MessageTooBig,
+                                "Message exceeded server limit",
+                                token).ConfigureAwait(false);
+                            throw new InvalidDataException(
+                                $"WebSocket message exceeded {MaxIncomingMessageBytes} bytes");
+                        }
                         ms.Write(buffer.Array!, buffer.Offset, result.Count);
                     }
 
@@ -475,7 +495,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     return null;
                 }
 
-                return Encoding.UTF8.GetString(ms.ToArray());
+                return Encoding.UTF8.GetString(ms.GetBuffer(), 0, checked((int)ms.Length));
             }
             finally
             {
@@ -697,7 +717,8 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     ["requires_polling"] = tool.RequiresPolling,
                     ["poll_action"] = tool.PollAction ?? "status",
                     ["max_poll_seconds"] = tool.MaxPollSeconds,
-                    ["group"] = string.IsNullOrWhiteSpace(tool.Group) ? "core" : tool.Group
+                    ["group"] = string.IsNullOrWhiteSpace(tool.Group) ? "core" : tool.Group,
+                    ["is_built_in"] = tool.IsBuiltIn
                 };
 
                 var paramsArray = new JArray();
@@ -796,17 +817,37 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             JToken resultToken;
-            try
-            {
-                resultToken = JToken.Parse(responseJson);
-            }
-            catch
+            int responseBytes = responseJson == null
+                ? 0
+                : Encoding.UTF8.GetByteCount(responseJson);
+            if (responseBytes > MaxOutgoingMessageBytes)
             {
                 resultToken = new JObject
                 {
+                    ["success"] = false,
                     ["status"] = "error",
-                    ["error"] = "Invalid response payload"
+                    ["error"] = "Command result exceeded the WebSocket message limit",
+                    ["data"] = new JObject
+                    {
+                        ["resultBytes"] = responseBytes,
+                        ["maxResultBytes"] = MaxOutgoingMessageBytes,
+                    },
                 };
+            }
+            else
+            {
+                try
+                {
+                    resultToken = JToken.Parse(responseJson);
+                }
+                catch
+                {
+                    resultToken = new JObject
+                    {
+                        ["status"] = "error",
+                        ["error"] = "Invalid response payload"
+                    };
+                }
             }
 
             var responsePayload = new JObject
@@ -878,6 +919,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
 
             string json = payload.ToString(Formatting.None);
+            int byteCount = Encoding.UTF8.GetByteCount(json);
+            if (byteCount > MaxOutgoingMessageBytes)
+            {
+                throw new InvalidDataException(
+                    $"WebSocket message exceeded {MaxOutgoingMessageBytes} bytes");
+            }
             byte[] bytes = Encoding.UTF8.GetBytes(json);
             var buffer = new ArraySegment<byte>(bytes);
 

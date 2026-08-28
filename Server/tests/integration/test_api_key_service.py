@@ -141,6 +141,56 @@ class TestBasicValidation:
 
 class TestCaching:
     @pytest.mark.asyncio
+    async def test_distinct_key_singleflight_map_has_capacity_limit(self):
+        svc = _make_service(cache_ttl=300.0)
+        svc._max_inflight = 1
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_validation(_api_key):
+            started.set()
+            await release.wait()
+            return ValidationResult(valid=True, user_id="u1")
+
+        with patch.object(svc, "_validate_external", side_effect=delayed_validation):
+            first = asyncio.create_task(svc.validate("first-key"))
+            await started.wait()
+            rejected = await svc.validate("second-key")
+            release.set()
+            await first
+
+        assert rejected.valid is False
+        assert rejected.cacheable is False
+        assert "capacity" in rejected.error
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_does_not_leak_singleflight_entry(self):
+        svc = _make_service(cache_ttl=300.0)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_validation(_api_key):
+            started.set()
+            await release.wait()
+            return ValidationResult(valid=True, user_id="u1")
+
+        with patch.object(svc, "_validate_external", side_effect=delayed_validation):
+            waiter = asyncio.create_task(svc.validate("cancelled-waiter-key"))
+            await started.wait()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            release.set()
+            for _ in range(10):
+                if not svc._inflight:
+                    break
+                await asyncio.sleep(0)
+
+        assert svc._inflight == {}
+        assert svc._cache_key("cancelled-waiter-key") in svc._cache
+
+    @pytest.mark.asyncio
     async def test_cache_uses_digests_and_evicts_lru_entries(self):
         svc = _make_service(cache_ttl=300.0)
         svc._cache_max_entries = 2
@@ -238,7 +288,7 @@ class TestCaching:
             async with svc._cache_lock:
                 key = svc._cache_key("test-expiry-key-12345")
                 valid, user_id, metadata, _expires = svc._cache[key]
-                svc._cache[key] = (valid, user_id, metadata, time.time() - 1)
+                svc._cache[key] = (valid, user_id, metadata, time.monotonic() - 1)
 
             await svc.validate("test-expiry-key-12345")
             assert call_count == 2  # Had to re-validate

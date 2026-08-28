@@ -7,9 +7,15 @@ from typing import TypeVar
 
 from fastmcp import Context, FastMCP
 from core.telemetry_decorator import telemetry_tool
-from core.logging_decorator import log_execution
+from core.logging_decorator import log_execution, summarize_value
+from core.result_budget import enforce_result_budget
 from utils.module_discovery import discover_modules
-from services.registry import get_registered_tools, TOOL_GROUPS, DEFAULT_ENABLED_GROUPS
+from services.registry import (
+    DEFAULT_ENABLED_GROUPS,
+    DEFAULT_TOOL_PROFILE,
+    TOOL_GROUPS,
+    get_registered_tools,
+)
 
 logger = logging.getLogger("mcp-for-unity-server")
 
@@ -28,9 +34,10 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
     Any .py file in this directory or subdirectories with @mcp_for_unity_tool decorated
     functions will be automatically registered.
 
-    After registration, non-default tool groups are disabled at the server level
-    so that new sessions only see the *core* tools (plus always-visible meta-tools).
-    Clients can activate additional groups at any time via ``manage_tools``.
+    After registration, non-default tool groups are disabled at the server level.
+    The default bootstrap profile exposes only always-visible meta-tools; the
+    compatibility profile also exposes its configured groups. Clients can
+    activate additional groups at any time via ``manage_tools``.
     """
     logger.info("Auto-discovering MCP for Unity Server tools...")
     # Dynamic import of all modules in this directory
@@ -45,6 +52,11 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
         logger.warning("No MCP tools registered!")
         return
 
+    registered_count = 0
+    debug_tools_enabled = os.environ.get(
+        "UNITY_MCP_ENABLE_DEBUG_TOOLS", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
     for tool_info in tools:
         func = tool_info['func']
         tool_name = tool_info['name']
@@ -55,26 +67,38 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
             logger.info(
                 "Skipping execute_custom_tool registration (project-scoped tools disabled)")
             continue
+        if tool_name == "debug_request_context" and not debug_tools_enabled:
+            logger.debug(
+                "Skipping debug_request_context; set UNITY_MCP_ENABLE_DEBUG_TOOLS=1 to expose it"
+            )
+            continue
 
         # Apply decorators: logging -> telemetry -> mcp.tool
         # Note: Parameter normalization (camelCase -> snake_case) is handled by
         # ParamNormalizerMiddleware before FastMCP validation
-        wrapped = log_execution(tool_name, "Tool")(func)
+        wrapped = enforce_result_budget(tool_name)(func)
+        wrapped = log_execution(tool_name, "Tool")(wrapped)
         wrapped = telemetry_tool(tool_name)(wrapped)
         wrapped = mcp.tool(
             name=tool_name, description=description, **kwargs)(wrapped)
         tool_info['func'] = wrapped
+        registered_count += 1
         logger.debug(f"Registered tool: {tool_name} - {description}")
 
-    logger.info(f"Registered {len(tools)} MCP tools")
+    logger.info(f"Registered {registered_count} MCP tools")
 
-    # Keep the server registry as a stable superset. HTTP sessions are filtered
-    # per selected Unity instance by UnityInstanceMiddleware; mutating FastMCP's
-    # global transforms from the last plugin to connect contaminates other
-    # projects. Stdio visibility is synchronized explicitly by manage_tools.
+    disabled_tags = {
+        f"group:{group_name}"
+        for group_name in TOOL_GROUPS
+        if group_name not in DEFAULT_ENABLED_GROUPS
+    }
+    if disabled_tags:
+        mcp.disable(tags=disabled_tags, components={"tool"})
+
     logger.info(
-        "Registered stable tool superset; session middleware applies "
-        "per-Unity visibility."
+        "Applied '%s' startup tool profile (default groups: %s)",
+        DEFAULT_TOOL_PROFILE,
+        ", ".join(sorted(DEFAULT_ENABLED_GROUPS)) or "none",
     )
 
 
@@ -138,7 +162,7 @@ async def sync_tool_visibility_from_unity(
         if not tools or not isinstance(tools, list):
             logger.debug(
                 "sync_tool_visibility_from_unity: no tool data in Unity response: %s",
-                response,
+                summarize_value(response),
             )
             return {"error": "No tool data returned from Unity"}
 
@@ -151,7 +175,10 @@ async def sync_tool_visibility_from_unity(
             len(enabled_tools), len(tools),
         )
 
-        PluginHub._sync_server_tool_visibility(enabled_tools)
+        PluginHub._sync_server_tool_visibility(
+            enabled_tools,
+            enable_registered=notify,
+        )
 
         # Register custom (non-built-in) tools via CustomToolService.
         # The extended get_tool_states response includes is_built_in,
@@ -190,6 +217,8 @@ async def sync_tool_visibility_from_unity(
                                 requires_polling=td.get("requires_polling", False),
                                 poll_action=td.get("poll_action") or "status",
                                 max_poll_seconds=td.get("max_poll_seconds", 0),
+                                group=td.get("group"),
+                                is_built_in=td.get("is_built_in", False),
                                 parameters=params,
                             )
                         )

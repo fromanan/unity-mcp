@@ -680,3 +680,68 @@ def test_build_asset_search_terms():
     # (This won't be called since _should_search_assets returns False, but test the function)
     terms = _build_asset_search_terms("Physics.Raycast")
     assert len(terms) >= 1  # Still extracts terms, just won't be triggered
+
+
+def test_cancelled_docs_waiter_does_not_leak_singleflight_task():
+    async def scenario():
+        from services.tools import unity_docs as docs_module
+
+        await docs_module.close_unity_docs_http_client()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_fetch(url):
+            started.set()
+            await release.wait()
+            return 200, "body", url
+
+        with patch.object(docs_module, "_fetch_uncached", side_effect=delayed_fetch):
+            waiter = asyncio.create_task(
+                docs_module._fetch_url_full("https://docs.unity3d.com/test")
+            )
+            await started.wait()
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+
+            release.set()
+            for _ in range(10):
+                if not docs_module._http_inflight:
+                    break
+                await asyncio.sleep(0)
+            assert docs_module._http_inflight == {}
+
+        await docs_module.close_unity_docs_http_client()
+
+    asyncio.run(scenario())
+
+
+def test_docs_singleflight_map_has_capacity_limit():
+    async def scenario():
+        from services.tools import unity_docs as docs_module
+
+        await docs_module.close_unity_docs_http_client()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_fetch(url):
+            started.set()
+            await release.wait()
+            return 200, "body", url
+
+        with patch.object(docs_module, "_HTTP_MAX_INFLIGHT", 1), \
+             patch.object(docs_module, "_fetch_uncached", side_effect=delayed_fetch):
+            first = asyncio.create_task(
+                docs_module._fetch_url_full("https://docs.unity3d.com/first")
+            )
+            await started.wait()
+            with pytest.raises(ConnectionError, match="capacity"):
+                await docs_module._fetch_url_full(
+                    "https://docs.unity3d.com/second"
+                )
+            release.set()
+            await first
+
+        await docs_module.close_unity_docs_http_client()
+
+    asyncio.run(scenario())

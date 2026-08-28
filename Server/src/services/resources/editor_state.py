@@ -235,7 +235,15 @@ def _enrich_advice_and_staleness(
 @mcp_for_unity_resource(
     uri="mcpforunity://editor/state",
     name="editor_state",
-    description="Canonical editor readiness snapshot. Includes advice and server-computed staleness.\n\nURI: mcpforunity://editor/state",
+    description=(
+        "Canonical editor readiness snapshot. Unity proactively publishes changed "
+        "snapshots and a main-thread heartbeat after capability negotiation, while "
+        "the server serves a defensive per-instance cache. observed_at_unix_ms remains "
+        "the semantic snapshot time, served_at_unix_ms is the response time, and "
+        "staleness.basis identifies the freshness signal used. External-change status "
+        "comes from an event-driven background watcher with periodic reconciliation "
+        "rather than a recursive scan during this resource request."
+    ),
 )
 async def get_editor_state(ctx: Context) -> MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)

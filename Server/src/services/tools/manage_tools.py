@@ -25,13 +25,9 @@ from services.registry import (
     unity_target=None,
     group=None,
     description=(
-        "Manage which tool groups are visible in this session. "
-        "Actions: list_groups (show all groups and their status), "
-        "activate (enable a group), deactivate (disable a group), "
-        "sync (refresh visibility from Unity Editor's toggle states), "
-        "reset (restore defaults). "
-        "Activating a group makes its tools appear; deactivating hides them. "
-        "Use sync after toggling tools in the Unity Editor GUI."
+        "Search and toggle per-session tool groups. Actions: list_groups, search, "
+        "activate, deactivate, sync, reset. Search first and activate only the "
+        "group needed; sync imports Unity Editor toggle state."
     ),
     annotations=ToolAnnotations(
         title="Manage Tools",
@@ -41,17 +37,29 @@ from services.registry import (
 async def manage_tools(
     ctx: Context,
     action: Annotated[
-        Literal["list_groups", "activate", "deactivate", "sync", "reset"],
+        Literal["list_groups", "search", "activate", "deactivate", "sync", "reset"],
         "Action to perform."
     ],
     group: Annotated[
         str | None,
-        "Group name (required for activate / deactivate). "
-        "Valid groups: " + ", ".join(sorted(TOOL_GROUPS.keys()))
+        "Group name for activate or deactivate."
     ] = None,
+    query: Annotated[
+        str | None,
+        "Search text for action=search. Matches group names, descriptions, and tool names.",
+    ] = None,
+    include_tools: Annotated[
+        bool,
+        "Include tool names in list_groups. Defaults false for a compact response.",
+    ] = False,
 ) -> dict[str, Any]:
     if action == "list_groups":
-        return await _list_groups(ctx)
+        return await _list_groups(ctx, include_tools=include_tools)
+
+    if action == "search":
+        if not query or not query.strip():
+            return {"error": "query is required for search"}
+        return _search_tools(query)
 
     if action in ("activate", "deactivate"):
         if not group:
@@ -61,27 +69,36 @@ async def manage_tools(
             return {"error": f"Unknown group '{group}'. Valid: {', '.join(sorted(TOOL_GROUPS))}"}
 
     if action == "activate":
+        if await _is_group_enabled(ctx, group):
+            return {
+                "activated": group,
+                "unchanged": True,
+                "tool_count": len(get_group_tool_names().get(group, [])),
+            }
         tag = f"group:{group}"
-        await ctx.info(f"Activating tool group: {group}")
         await ctx.enable_components(tags={tag}, components={"tool"})
         return {
             "activated": group,
-            "tools": get_group_tool_names().get(group, []),
+            "tool_count": len(get_group_tool_names().get(group, [])),
             "message": f"Group '{group}' is now visible. Its tools will appear in tool listings.",
         }
 
     if action == "deactivate":
+        if not await _is_group_enabled(ctx, group):
+            return {
+                "deactivated": group,
+                "unchanged": True,
+                "tool_count": len(get_group_tool_names().get(group, [])),
+            }
         tag = f"group:{group}"
-        await ctx.info(f"Deactivating tool group: {group}")
         await ctx.disable_components(tags={tag}, components={"tool"})
         return {
             "deactivated": group,
-            "tools": get_group_tool_names().get(group, []),
+            "tool_count": len(get_group_tool_names().get(group, [])),
             "message": f"Group '{group}' is now hidden.",
         }
 
     if action == "sync":
-        await ctx.info("Syncing tool visibility from Unity Editor...")
         from services.tools import sync_tool_visibility_from_unity
         result = await sync_tool_visibility_from_unity(notify=True)
         if result.get("error"):
@@ -109,7 +126,6 @@ async def manage_tools(
         }
 
     if action == "reset":
-        await ctx.info("Resetting tool visibility to defaults")
         await ctx.reset_visibility()
         return {
             "reset": True,
@@ -120,12 +136,43 @@ async def manage_tools(
     return {"error": f"Unknown action '{action}'"}
 
 
-async def _list_groups(ctx: Context) -> dict[str, Any]:
+async def _list_groups(ctx: Context, *, include_tools: bool = False) -> dict[str, Any]:
     """Build the list_groups response with group metadata and tool names."""
     group_tools = get_group_tool_names()
+    session_enabled = await _session_group_overrides(ctx)
 
-    # Determine current session-enabled state for each group.
-    # Session rules accumulate; the last rule whose tags include "group:<name>" wins.
+    groups = []
+    for name in sorted(TOOL_GROUPS.keys()):
+        if name in session_enabled:
+            currently_enabled = session_enabled[name]
+        else:
+            currently_enabled = name in DEFAULT_ENABLED_GROUPS
+        item = {
+            "name": name,
+            "description": TOOL_GROUPS[name],
+            "enabled": currently_enabled,
+            "default_enabled": name in DEFAULT_ENABLED_GROUPS,
+            "tool_count": len(group_tools.get(name, [])),
+        }
+        if include_tools:
+            item["tools"] = group_tools.get(name, [])
+        groups.append(item)
+    return {
+        "groups": groups,
+        "note": (
+            "Use activate/deactivate to toggle groups for this session. "
+            "Tools with group=None (server meta-tools) are always visible."
+        ),
+    }
+
+
+async def _is_group_enabled(ctx: Context, group_name: str) -> bool:
+    overrides = await _session_group_overrides(ctx)
+    return overrides.get(group_name, group_name in DEFAULT_ENABLED_GROUPS)
+
+
+async def _session_group_overrides(ctx: Context) -> dict[str, bool]:
+    """Collapse accumulated visibility rules to their latest group states."""
     session_enabled: dict[str, bool] = {}
     try:
         rules = await ctx._get_visibility_rules()
@@ -134,29 +181,32 @@ async def _list_groups(ctx: Context) -> dict[str, Any]:
             enabled = rule.get("enabled", True)
             for tag in tags:
                 if isinstance(tag, str) and tag.startswith("group:"):
-                    group_name = tag[len("group:"):]
-                    session_enabled[group_name] = enabled
+                    session_enabled[tag[len("group:"):]] = enabled
     except Exception:
-        pass  # No active session or unsupported – fall back to defaults
+        pass
+    return session_enabled
 
-    groups = []
-    for name in sorted(TOOL_GROUPS.keys()):
-        if name in session_enabled:
-            currently_enabled = session_enabled[name]
-        else:
-            currently_enabled = name in DEFAULT_ENABLED_GROUPS
-        groups.append({
-            "name": name,
-            "description": TOOL_GROUPS[name],
-            "enabled": currently_enabled,
-            "default_enabled": name in DEFAULT_ENABLED_GROUPS,
-            "tools": group_tools.get(name, []),
-            "tool_count": len(group_tools.get(name, [])),
-        })
+
+def _search_tools(query: str) -> dict[str, Any]:
+    needle = query.strip().lower()
+    matches: list[dict[str, Any]] = []
+    for group_name, tool_names in get_group_tool_names().items():
+        group_description = TOOL_GROUPS[group_name]
+        matching_tools = [name for name in tool_names if needle in name.lower()]
+        if (
+            needle in group_name.lower()
+            or needle in group_description.lower()
+            or matching_tools
+        ):
+            matches.append({
+                "group": group_name,
+                "description": group_description,
+                "matching_tools": matching_tools[:12],
+                "matching_tool_count": len(matching_tools),
+            })
     return {
-        "groups": groups,
-        "note": (
-            "Use activate/deactivate to toggle groups for this session. "
-            "Tools with group=None (server meta-tools) are always visible."
-        ),
+        "query": query.strip(),
+        "matches": matches[:8],
+        "match_count": len(matches),
+        "message": "Activate a matching group to expose its tools.",
     }

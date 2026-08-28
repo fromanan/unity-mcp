@@ -1,9 +1,10 @@
 import asyncio
+from collections import OrderedDict
 import re
 from html.parser import HTMLParser
 from typing import Annotated, Any, Optional
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+import httpx
 
 from fastmcp import Context
 from mcp.types import ToolAnnotations
@@ -11,6 +12,24 @@ from mcp.types import ToolAnnotations
 from services.registry import mcp_for_unity_tool
 
 ALL_ACTIONS = ["get_doc", "get_manual", "get_package_doc", "lookup"]
+
+MAX_LOOKUP_QUERIES = 5
+MAX_ASSET_SEARCH_TERMS = 3
+MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
+_HTTP_CACHE_MAX_ENTRIES = 16
+_HTTP_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_HTTP_CACHE_TTL_SECONDS = 300.0
+_HTTP_CONCURRENCY = 4
+_HTTP_MAX_INFLIGHT = 32
+
+_http_client: httpx.AsyncClient | None = None
+_http_client_loop: asyncio.AbstractEventLoop | None = None
+_http_client_lock = asyncio.Lock()
+_http_semaphore = asyncio.Semaphore(_HTTP_CONCURRENCY)
+_http_cache_lock = asyncio.Lock()
+_http_cache: OrderedDict[str, tuple[float, int, int, str, str]] = OrderedDict()
+_http_cache_bytes = 0
+_http_inflight: dict[str, asyncio.Task[tuple[int, str, str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -84,22 +103,149 @@ async def _fetch_url(url: str) -> tuple[int, str]:
 async def _fetch_url_full(url: str) -> tuple[int, str, str]:
     """Fetch a URL and return (status_code, body_text, final_url).
 
-    Like _fetch_url but also returns the final URL after any redirects.
+    Like _fetch_url but also returns the final URL after redirects. Responses
+    are concurrency-limited, size-bounded, and cached in a small TTL/LRU.
     """
+    now = asyncio.get_running_loop().time()
+    async with _http_cache_lock:
+        _purge_http_cache_locked(now)
+        cached = _http_cache.get(url)
+        if cached is not None:
+            expires_at, status, _, body, final_url = cached
+            if expires_at > now:
+                _http_cache.move_to_end(url)
+                return status, body, final_url
+
+        task = _http_inflight.get(url)
+        if task is None:
+            if len(_http_inflight) >= _HTTP_MAX_INFLIGHT:
+                raise ConnectionError(
+                    "Documentation fetch capacity reached; retry shortly"
+                )
+            task = asyncio.create_task(
+                _fetch_and_cache(url),
+                name="unity-doc-fetch",
+            )
+            _http_inflight[url] = task
+
+    return await asyncio.shield(task)
+
+
+async def _fetch_and_cache(url: str) -> tuple[int, str, str]:
+    """Own one URL fetch so cancellation of every waiter cannot leak it."""
+    current_task = asyncio.current_task()
+    try:
+        result = await _fetch_uncached(url)
+        status, body, final_url = result
+        if status < 500:
+            await _cache_http_result(url, status, body, final_url)
+        return result
+    finally:
+        async with _http_cache_lock:
+            if _http_inflight.get(url) is current_task:
+                _http_inflight.pop(url, None)
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client, _http_client_loop
     loop = asyncio.get_running_loop()
+    if _http_client is not None and _http_client_loop is loop:
+        return _http_client
 
-    def _do_fetch() -> tuple[int, str, str]:
-        req = Request(url, headers={"User-Agent": "MCPForUnity/1.0"})
-        try:
-            with urlopen(req, timeout=10) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                return (resp.status, body, resp.url)
-        except HTTPError as e:
-            return (e.code, "", url)
-        except URLError as e:
-            raise ConnectionError(f"Cannot reach {url}: {e}") from e
+    async with _http_client_lock:
+        if _http_client is not None and _http_client_loop is not loop:
+            try:
+                await _http_client.aclose()
+            except Exception:
+                pass
+            _http_client = None
+        if _http_client is None:
+            _http_client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(10.0),
+                headers={"User-Agent": "MCPForUnity/1.0"},
+            )
+            _http_client_loop = loop
+        return _http_client
 
-    return await loop.run_in_executor(None, _do_fetch)
+
+async def _fetch_uncached(url: str) -> tuple[int, str, str]:
+    try:
+        client = await _get_http_client()
+        async with _http_semaphore:
+            async with client.stream("GET", url) as response:
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+                        raise ConnectionError(
+                            f"Documentation response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes"
+                        )
+                    body.extend(chunk)
+                return (
+                    response.status_code,
+                    body.decode(response.encoding or "utf-8", errors="replace"),
+                    str(response.url),
+                )
+    except httpx.HTTPError as exc:
+        raise ConnectionError(f"Cannot reach {url}: {exc}") from exc
+
+
+async def _cache_http_result(
+    url: str,
+    status: int,
+    body: str,
+    final_url: str,
+) -> None:
+    global _http_cache_bytes
+    size = len(body.encode("utf-8"))
+    if size > _HTTP_CACHE_MAX_BYTES:
+        return
+    now = asyncio.get_running_loop().time()
+    async with _http_cache_lock:
+        existing = _http_cache.pop(url, None)
+        if existing is not None:
+            _http_cache_bytes -= existing[2]
+        _http_cache[url] = (
+            now + _HTTP_CACHE_TTL_SECONDS,
+            status,
+            size,
+            body,
+            final_url,
+        )
+        _http_cache_bytes += size
+        while (
+            len(_http_cache) > _HTTP_CACHE_MAX_ENTRIES
+            or _http_cache_bytes > _HTTP_CACHE_MAX_BYTES
+        ):
+            _, evicted = _http_cache.popitem(last=False)
+            _http_cache_bytes -= evicted[2]
+
+
+def _purge_http_cache_locked(now: float) -> None:
+    global _http_cache_bytes
+    expired = [url for url, entry in _http_cache.items() if entry[0] <= now]
+    for url in expired:
+        entry = _http_cache.pop(url)
+        _http_cache_bytes -= entry[2]
+
+
+async def close_unity_docs_http_client() -> None:
+    """Close the shared docs client and clear bounded caches at shutdown."""
+    global _http_client, _http_client_loop, _http_cache_bytes
+    async with _http_cache_lock:
+        tasks = list(_http_inflight.values())
+        _http_inflight.clear()
+        _http_cache.clear()
+        _http_cache_bytes = 0
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    async with _http_client_lock:
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
+            _http_client_loop = None
 
 
 # ---------------------------------------------------------------------------
@@ -511,7 +657,7 @@ def _build_asset_search_terms(query: str) -> list[dict[str, str]]:
     if not searches and filter_type:
         searches.append({"filter_type": filter_type})
 
-    return searches
+    return searches[:MAX_ASSET_SEARCH_TERMS]
 
 
 async def _search_assets(ctx: Any, query: str) -> dict[str, Any] | None:
@@ -768,6 +914,14 @@ async def unity_docs(
             query_list = [query]
         else:
             return {"success": False, "message": "lookup requires query or queries."}
+        if len(query_list) > MAX_LOOKUP_QUERIES:
+            return {
+                "success": False,
+                "message": (
+                    f"lookup accepts at most {MAX_LOOKUP_QUERIES} queries per call; "
+                    f"received {len(query_list)}"
+                ),
+            }
         return await _lookup(query_list, version, package, pkg_version, ctx)
 
     return {"success": False, "message": "Unreachable"}

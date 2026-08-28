@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 from pydantic import BaseModel
+from core.result_budget import enforce_result_budget
 from core.telemetry_decorator import telemetry_resource
 from core.logging_decorator import log_execution
 
@@ -31,10 +32,14 @@ def _serialize_pydantic(func):
     async def wrapper(*args, **kwargs):
         result = await func(*args, **kwargs)
         if isinstance(result, BaseModel):
-            return result.model_dump_json()
+            return result.model_dump_json(exclude_none=True)
         if isinstance(result, dict):
             import json
-            return json.dumps(result)
+            return json.dumps(
+                result,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         return result
     return wrapper
 
@@ -76,7 +81,10 @@ def register_all_resources(mcp: FastMCP, *, project_scoped_tools: bool = True):
         has_query_params = '{?' in uri
 
         if has_query_params:
-            wrapped_template = _serialize_pydantic(func)
+            wrapped_template = enforce_result_budget(
+                f"resource:{resource_name}"
+            )(func)
+            wrapped_template = _serialize_pydantic(wrapped_template)
             wrapped_template = log_execution(resource_name, "Resource")(wrapped_template)
             wrapped_template = telemetry_resource(
                 resource_name)(wrapped_template)
@@ -91,7 +99,8 @@ def register_all_resources(mcp: FastMCP, *, project_scoped_tools: bool = True):
             registered_count += 1
             resource_info['func'] = wrapped_template
         else:
-            wrapped = _serialize_pydantic(func)
+            wrapped = enforce_result_budget(f"resource:{resource_name}")(func)
+            wrapped = _serialize_pydantic(wrapped)
             wrapped = log_execution(resource_name, "Resource")(wrapped)
             wrapped = telemetry_resource(resource_name)(wrapped)
             wrapped = mcp.resource(

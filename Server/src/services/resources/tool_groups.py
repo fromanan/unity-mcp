@@ -19,8 +19,8 @@ from services.registry import (
     uri="mcpforunity://tool-groups",
     name="tool_groups",
     description=(
-        "Available tool groups and their tools. "
-        "Use manage_tools to activate/deactivate groups per session.\n\n"
+        "Compact available tool-group catalog with counts. "
+        "Use manage_tools search or include_tools=true only when exact names are needed.\n\n"
         "URI: mcpforunity://tool-groups"
     ),
 )
@@ -33,12 +33,14 @@ async def get_tool_groups(ctx: Context) -> dict[str, Any]:
             "name": name,
             "description": TOOL_GROUPS[name],
             "default_enabled": name in DEFAULT_ENABLED_GROUPS,
-            "tools": tools,
             "tool_count": len(tools),
         })
     return {
         "groups": groups,
         "total_groups": len(groups),
         "default_enabled": sorted(DEFAULT_ENABLED_GROUPS),
-        "usage": "Call manage_tools(action='activate', group='<name>') to enable a group.",
+        "usage": (
+            "Call manage_tools(action='search', query='<need>') to find a group, "
+            "then activate it. Request include_tools=true only for exact names."
+        ),
     }

@@ -29,6 +29,8 @@ class ToolDefinitionModel(BaseModel):
     requires_polling: bool | None = False
     poll_action: str | None = Field(default="status", max_length=128)
     max_poll_seconds: int = Field(default=0, ge=0, le=3600)
+    group: str | None = Field(default=None, max_length=128)
+    is_built_in: bool = False
     parameters: list[ToolParameterModel] = Field(
         default_factory=list,
         max_length=128,

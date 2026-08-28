@@ -98,9 +98,15 @@ async def configured_plugin_hub(plugin_registry):
     PluginHub._lock = None
     PluginHub._loop = None
     PluginHub._connections.clear()
+    PluginHub._session_by_websocket_id.clear()
     PluginHub._pending.clear()
     PluginHub._command_gates.clear()
     PluginHub._command_waiters.clear()
+    PluginHub._command_waiter_bytes.clear()
+    PluginHub._last_pong.clear()
+    for task in PluginHub._ping_tasks.values():
+        task.cancel()
+    PluginHub._ping_tasks.clear()
 
 
 # ============================================================================
@@ -642,7 +648,7 @@ class TestUnityInstanceMiddlewareInjection:
         assert [tool.name for tool in filtered] == [tool.name for tool in original_tools]
 
     @pytest.mark.asyncio
-    async def test_list_tools_uses_union_of_enabled_tools_across_multiple_sessions(self, mock_context, monkeypatch):
+    async def test_list_tools_requires_selection_across_multiple_sessions(self, mock_context, monkeypatch):
         middleware = UnityInstanceMiddleware()
         middleware_ctx = Mock()
         middleware_ctx.fastmcp_context = mock_context
@@ -690,10 +696,8 @@ class TestUnityInstanceMiddlewareInjection:
 
                             filtered = await middleware.on_list_tools(middleware_ctx, call_next)
 
-        names = [tool.name for tool in filtered]
-        assert "manage_scene" in names
-        assert "manage_asset" in names
-        assert "manage_script" not in names
+        assert [tool.name for tool in filtered] == []
+        mock_get_tools.assert_not_awaited()
 
 
 # ============================================================================
@@ -810,6 +814,49 @@ class TestPluginRegistryFunctionality:
         assert session.project_name == "TestProject"
         assert session.project_hash == "hash123"
         assert session.unity_version == "2022.3"
+
+    @pytest.mark.asyncio
+    async def test_registry_enforces_global_session_limit_atomically(self, plugin_registry):
+        await plugin_registry.register(
+            session_id="sess-1",
+            project_name="Project1",
+            project_hash="hash-1",
+            unity_version="2022.3",
+            max_sessions=1,
+        )
+
+        with pytest.raises(OverflowError, match="session limit"):
+            await plugin_registry.register(
+                session_id="sess-2",
+                project_name="Project2",
+                project_hash="hash-2",
+                unity_version="2022.3",
+                max_sessions=1,
+            )
+
+        sessions = await plugin_registry.list_sessions()
+        assert list(sessions) == ["sess-1"]
+
+    @pytest.mark.asyncio
+    async def test_registry_allows_replacement_at_session_limit(self, plugin_registry):
+        await plugin_registry.register(
+            session_id="sess-old",
+            project_name="Project",
+            project_hash="same-hash",
+            unity_version="2022.3",
+            max_sessions=1,
+        )
+
+        session, evicted = await plugin_registry.register(
+            session_id="sess-new",
+            project_name="Project",
+            project_hash="same-hash",
+            unity_version="2022.3",
+            max_sessions=1,
+        )
+
+        assert session.session_id == "sess-new"
+        assert evicted == "sess-old"
 
     @pytest.mark.asyncio
     async def test_registry_lookup_by_hash(self, plugin_registry):
@@ -956,6 +1003,56 @@ class TestPluginRegistryFunctionality:
 
 class TestPluginHubMessageHandling:
     """Test PluginHub message parsing and registration flow."""
+
+    @pytest.mark.asyncio
+    async def test_websocket_reverse_index_resolves_without_connection_scan(
+        self,
+        configured_plugin_hub,
+        mock_websocket,
+    ):
+        PluginHub._session_by_websocket_id[id(mock_websocket)] = "session-indexed"
+
+        assert await PluginHub._session_id_for_websocket(mock_websocket) == "session-indexed"
+
+    @pytest.mark.asyncio
+    async def test_send_command_rejects_queue_byte_overflow_before_socket_lookup(
+        self,
+        configured_plugin_hub,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(PluginHub, "MAX_SESSION_QUEUE_BYTES", 32)
+
+        result = await PluginHub.send_command(
+            "session-byte-budget",
+            "large_tool",
+            {"payload": "x" * 128},
+        )
+
+        assert result["success"] is False
+        assert result["error"] == "busy"
+        assert result["data"]["reason"] == "session_command_queue_bytes_full"
+        assert "session-byte-budget" not in PluginHub._command_waiter_bytes
+
+    @pytest.mark.asyncio
+    async def test_on_receive_rejects_oversized_tool_snapshot(
+        self,
+        mock_websocket,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(PluginHub, "MAX_TOOL_REGISTRATION_BYTES", 128)
+        payload = {
+            "type": "register_tools",
+            "tools": [{
+                "name": "large_tool",
+                "description": "x" * 512,
+                "parameters": [],
+            }],
+        }
+
+        await PluginHub.on_receive(PluginHub, mock_websocket, payload)
+
+        mock_websocket.close.assert_awaited_once()
+        assert mock_websocket.close.await_args.kwargs["code"] == 1009
 
     def test_welcome_advertises_editor_state_push_capability(self):
         message = WelcomeMessage(

@@ -1,7 +1,9 @@
 import pytest
+from unittest.mock import AsyncMock
 
 from services.registry import get_registered_tools, mcp_for_unity_tool
 import services.registry.tool_registry as tool_registry_module
+from services.tools.manage_tools import manage_tools
 
 
 @pytest.fixture(autouse=True)
@@ -62,3 +64,16 @@ def test_tool_registry_rejects_invalid_unity_target_values():
         @mcp_for_unity_tool(unity_target=123)  # type: ignore[arg-type]
         def _invalid_non_string_target_tool():
             return None
+
+
+@pytest.mark.asyncio
+async def test_manage_tools_skips_duplicate_visibility_transform():
+    ctx = AsyncMock()
+    ctx._get_visibility_rules.return_value = [
+        {"tags": ["group:docs"], "enabled": True},
+    ]
+
+    result = await manage_tools(ctx, "activate", group="docs")
+
+    assert result["unchanged"] is True
+    ctx.enable_components.assert_not_awaited()

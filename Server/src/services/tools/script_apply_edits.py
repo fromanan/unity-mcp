@@ -540,26 +540,37 @@ def _find_best_closing_brace_match(matches, text: str):
     if not matches:
         return None
 
-    # Find the position of the '}' character within each match, filtering out
-    # braces inside strings/comments
-    brace_positions: dict[int, object] = {}  # brace_pos → match
+    # Collect candidate braces without rescanning C# lexical state per match.
+    # A regex span can contain an earlier brace inside a string/comment and a
+    # later real closing brace, so retain every candidate until the token scan.
+    match_candidates: list[tuple[object, list[int]]] = []
+    all_positions: set[int] = set()
     for m in matches:
+        candidates: list[int] = []
         for offset in range(m.start(), m.end()):
             if offset < len(text) and text[offset] == '}':
-                if not _is_in_string_context(text, offset):
-                    brace_positions[offset] = m
-                break
+                candidates.append(offset)
+                all_positions.add(offset)
+        if candidates:
+            match_candidates.append((m, candidates))
 
-    if not brace_positions:
+    if not all_positions:
         return None
 
-    depths = _brace_depth_at_positions(text, set(brace_positions.keys()))
+    depths = _brace_depth_at_positions(text, all_positions)
+    brace_positions: dict[int, object] = {}
+    for match, candidates in match_candidates:
+        first_code_brace = next((pos for pos in candidates if pos in depths), None)
+        if first_code_brace is not None:
+            brace_positions[first_code_brace] = match
 
     # Score: prefer shallowest depth (outermost brace), then latest position
     best_match = None
     best_key = (float('inf'), -1)  # (depth, -position) — lower is better
     for pos, m in brace_positions.items():
-        d = depths.get(pos, float('inf'))
+        if pos not in depths:
+            continue
+        d = depths[pos]
         key = (d, -pos)  # lower depth wins, then later position wins
         if key < best_key:
             best_key = key

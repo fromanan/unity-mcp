@@ -51,8 +51,8 @@ def mock_unity(monkeypatch):
     return calls
 
 
-def test_rendering_inspection_is_default_enabled_but_authoring_is_not():
-    assert "rendering_inspect" in DEFAULT_ENABLED_GROUPS
+def test_bootstrap_profile_keeps_rendering_groups_opt_in():
+    assert "rendering_inspect" not in DEFAULT_ENABLED_GROUPS
     assert "rendering_authoring" not in DEFAULT_ENABLED_GROUPS
 
 

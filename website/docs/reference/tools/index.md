@@ -25,7 +25,7 @@ AI asset generation – 3D model gen/import, 2D image gen & audio gen (bring-you
 - **[`import_model_file`](./asset_gen/import_model_file.md)** — Import a local 3D model file that already exists on disk (e.g. an FBX/OBJ/glTF exported from Blender or another DCC tool) into the Unity project.
 
 ## `core` &nbsp; (30 tools)
-Essential scene, script, asset & editor tools (always on by default)
+Essential scene, script, asset and editor tools
 - **[`apply_text_edits`](./core/apply_text_edits.md)** — Apply small text edits to a C# script identified by URI.
 - **[`batch_execute`](./core/batch_execute.md)** — Executes multiple MCP commands in a single batch for dramatically better performance.
 - **[`create_script`](./core/create_script.md)** — Create a new C# script at the given project path.
@@ -50,7 +50,7 @@ Essential scene, script, asset & editor tools (always on by default)
 - **[`manage_scene`](./core/manage_scene.md)** — Performs CRUD operations on Unity scenes.
 - **[`manage_script`](./core/manage_script.md)** — Compatibility router for legacy script operations.
 - **[`manage_script_capabilities`](./core/manage_script_capabilities.md)** — Get manage_script capabilities (supported ops, limits, and guards).
-- **[`manage_tools`](./core/manage_tools.md)** — Manage which tool groups are visible in this session.
+- **[`manage_tools`](./core/manage_tools.md)** — Search and toggle per-session tool groups.
 - **[`read_console`](./core/read_console.md)** — Gets messages from or clears the Unity Editor console.
 - **[`refresh_unity`](./core/refresh_unity.md)** — Request a Unity asset database refresh and optionally a script compilation.
 - **[`script_apply_edits`](./core/script_apply_edits.md)** — Structured C# edits (methods/classes) with safer boundaries - prefer this over raw text.
@@ -69,6 +69,21 @@ ProBuilder 3D modeling – requires com.unity.probuilder package
 ## `profiling` &nbsp; (1 tool)
 Unity Profiler session control, counters, memory snapshots & Frame Debugger
 - **[`manage_profiler`](./profiling/manage_profiler.md)** — Unity Profiler session control, counter reads, memory snapshots, and Frame Debugger.
+
+## `rendering_authoring` &nbsp; (1 tool)
+Opt-in transactional material, texture-importer & Shader Graph authoring
+- **[`manage_rendering_authoring`](./rendering_authoring/manage_rendering_authoring.md)** — Plan or apply a transactional material, texture-importer, or Shader Graph patch.
+
+## `rendering_inspect` &nbsp; (8 tools)
+Read-only renderer, material, texture, Shader Graph, render-contract & probe inspection
+- **[`inspect_material`](./rendering_inspect/inspect_material.md)** — Inspect one material by exact asset path, including path/GUID, shader identity and kind, typed current/default values, texture path/GUID and tiling, keywords, passes, queue/surface state, GI/instancing/SRP Batcher evidence, and paged liv…
+- **[`inspect_render_target`](./rendering_inspect/inspect_render_target.md)** — Inspect the actual render-owner closure for a scene object: renderers, submeshes, material slots, material property blocks, LOD membership, lightmap state, and package/asset ownership.
+- **[`inspect_shader_graph`](./rendering_inspect/inspect_shader_graph.md)** — Inspect a ShaderLab, Shader Graph, or Sub Graph asset by exact path.
+- **[`inspect_texture`](./rendering_inspect/inspect_texture.md)** — Inspect one texture by exact asset path.
+- **[`profile_render_target`](./rendering_inspect/profile_render_target.md)** — Profile one scene render target with static renderer/material/pass/mesh evidence and a paged Frame Debugger snapshot filtered to its renderer instance IDs when Frame Debugger data is available.
+- **[`render_probe`](./rendering_inspect/render_probe.md)** — Capture a deterministic color or wireframe render probe from an existing camera.
+- **[`sample_material`](./rendering_inspect/sample_material.md)** — Render one exact material in an isolated, deterministic Editor preview.
+- **[`validate_render_contract`](./rendering_inspect/validate_render_contract.md)** — Validate the renderer-material-shader-texture closure for an exact material or scene target.
 
 ## `scripting_ext` &nbsp; (2 tools)
 ScriptableObject management

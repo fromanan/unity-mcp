@@ -60,9 +60,7 @@ URI: mcpforunity://editor/selection
 
 **URI:** `mcpforunity://editor/state`
 
-Canonical editor readiness snapshot. Unity proactively publishes changed snapshots and a main-thread heartbeat after capability negotiation, while the server serves a defensive per-instance cache. `observed_at_unix_ms` remains the semantic snapshot time, `served_at_unix_ms` is the response time, and `staleness.basis` identifies the freshness signal used. External-change status comes from an event-driven background watcher with periodic reconciliation rather than a recursive scan during this resource request.
-
-URI: mcpforunity://editor/state
+Canonical editor readiness snapshot. Unity proactively publishes changed snapshots and a main-thread heartbeat after capability negotiation, while the server serves a defensive per-instance cache. observed_at_unix_ms remains the semantic snapshot time, served_at_unix_ms is the response time, and staleness.basis identifies the freshness signal used. External-change status comes from an event-driven background watcher with periodic reconciliation rather than a recursive scan during this resource request.
 
 
 ## `editor_windows`
@@ -233,11 +231,22 @@ Lists all URP renderer features on the active renderer with type, name, and acti
 Snapshot of rendering performance statistics (draw calls, batches, triangles, frame time, etc.).
 
 
+## `stored_result`
+
+**URI:** `mcpforunity://results/{result_id}/{offset}`
+
+Read one bounded page of an oversized tool result. Use the exact result_uri returned by the tool and follow next_uri until null.
+
+**Parameters:**
+
+- `result_id` (`str`, required) — Opaque result id from a tool's result_uri.
+- `offset` (`int`, required) — Character offset from the exact current or next_uri.
+
 ## `tool_groups`
 
 **URI:** `mcpforunity://tool-groups`
 
-Available tool groups and their tools. Use manage_tools to activate/deactivate groups per session.
+Compact available tool-group catalog with counts. Use manage_tools search or include_tools=true only when exact names are needed.
 
 URI: mcpforunity://tool-groups
 
@@ -256,4 +265,3 @@ URI: mcpforunity://instances
 **URI:** `mcpforunity://scene/volumes`
 
 Lists all Volume components in the active scene with their profiles, effects, and settings.
-

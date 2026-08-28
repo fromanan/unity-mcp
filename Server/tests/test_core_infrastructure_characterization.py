@@ -110,10 +110,9 @@ class TestLoggingDecoratorBasics:
         result = sync_function(1, 2)
 
         assert result == 3
-        # Should log entry with arguments
-        assert "TestType 'test_func' called with args=(1, 2) kwargs={}" in caplog_fixture.text
-        # Should log return value
-        assert "TestType 'test_func' returned: 3" in caplog_fixture.text
+        assert "TestType 'test_func' started:" in caplog_fixture.text
+        assert "'positional': [1, 2]" in caplog_fixture.text
+        assert "TestType 'test_func' completed in" in caplog_fixture.text
 
     def test_decorator_logs_function_call_async(self, caplog_fixture):
         """Verify decorator logs function entry with arguments (async)."""
@@ -126,10 +125,9 @@ class TestLoggingDecoratorBasics:
         result = asyncio.run(async_function(10, 20))
 
         assert result == 30
-        # Should log entry with arguments
-        assert "AsyncType 'async_func' called with args=(10, 20) kwargs={}" in caplog_fixture.text
-        # Should log return value
-        assert "AsyncType 'async_func' returned: 30" in caplog_fixture.text
+        assert "AsyncType 'async_func' started:" in caplog_fixture.text
+        assert "'positional': [10, 20]" in caplog_fixture.text
+        assert "AsyncType 'async_func' completed in" in caplog_fixture.text
 
     def test_decorator_logs_kwargs(self, caplog_fixture):
         """Verify decorator logs keyword arguments."""
@@ -146,6 +144,19 @@ class TestLoggingDecoratorBasics:
         assert "'b': 2" in caplog_fixture.text
         assert "'c': 3" in caplog_fixture.text
 
+    def test_decorator_logs_shapes_without_payload_contents(self, caplog_fixture):
+        caplog_fixture.clear()
+        secret = "api_key=do-not-log-123"
+
+        @log_execution("content_safe", "SafeType")
+        def echo(value):
+            return value
+
+        assert echo(secret) == secret
+        assert secret not in caplog_fixture.text
+        assert "do-not-log-123" not in caplog_fixture.text
+        assert "'chars': 22" in caplog_fixture.text
+
     def test_decorator_logs_exception(self, caplog_fixture):
         """Verify decorator logs exceptions and re-raises them."""
         caplog_fixture.clear()
@@ -158,7 +169,8 @@ class TestLoggingDecoratorBasics:
             func_that_raises()
 
         # Should log the failure
-        assert "ErrorType 'error_func' failed: Test error" in caplog_fixture.text
+        assert "ErrorType 'error_func' failed in" in caplog_fixture.text
+        assert "(ValueError): Test error" in caplog_fixture.text
 
     def test_decorator_preserves_function_metadata(self):
         """Verify @functools.wraps preserves original function metadata."""
@@ -322,8 +334,7 @@ class TestTelemetryDecoratorBasics:
         result = sync_tool("value")
 
         assert result == "result_value"
-        # Should log decorator application (first 10 times)
-        assert "telemetry_decorator sync: tool=test_tool" in caplog_fixture.text
+        assert "telemetry_decorator sync" not in caplog_fixture.text
 
     def test_telemetry_tool_decorator_async(self, caplog_fixture):
         """Verify telemetry_tool decorator works on async functions."""
@@ -336,7 +347,7 @@ class TestTelemetryDecoratorBasics:
         result = asyncio.run(async_tool("value"))
 
         assert result == "async_result_value"
-        assert "telemetry_decorator async: tool=async_tool" in caplog_fixture.text
+        assert "telemetry_decorator async" not in caplog_fixture.text
 
     def test_telemetry_resource_decorator_sync(self, caplog_fixture):
         """Verify telemetry_resource decorator works on sync functions."""
@@ -349,7 +360,7 @@ class TestTelemetryDecoratorBasics:
         result = sync_resource("data")
 
         assert result == "resource_data"
-        assert "telemetry_decorator sync: resource=test_resource" in caplog_fixture.text
+        assert "telemetry_decorator sync" not in caplog_fixture.text
 
     def test_telemetry_resource_decorator_async(self, caplog_fixture):
         """Verify telemetry_resource decorator works on async functions."""
@@ -362,7 +373,7 @@ class TestTelemetryDecoratorBasics:
         result = asyncio.run(async_resource("data"))
 
         assert result == "async_resource_data"
-        assert "telemetry_decorator async: resource=async_resource" in caplog_fixture.text
+        assert "telemetry_decorator async" not in caplog_fixture.text
 
 
 class TestTelemetryDecoratorDuplication:
@@ -395,9 +406,8 @@ class TestTelemetryDecoratorDuplication:
         assert sync_result == "sync_result"
         assert async_result == "async_result"
 
-        # Both should have logged decorator application
-        assert "telemetry_decorator sync:" in caplog_fixture.text
-        assert "telemetry_decorator async:" in caplog_fixture.text
+        assert "telemetry_decorator sync:" not in caplog_fixture.text
+        assert "telemetry_decorator async:" not in caplog_fixture.text
 
     def test_telemetry_resource_sync_and_async_identical_behavior(self, caplog_fixture):
         """Verify resource decorators have identical sync/async behavior.
@@ -419,14 +429,11 @@ class TestTelemetryDecoratorDuplication:
 
         assert sync_result == "sync"
         assert async_result == "async"
-        assert "resource=resource_dup" in caplog_fixture.text
-        assert "resource=resource_dup_async" in caplog_fixture.text
+        assert "resource=resource_dup" not in caplog_fixture.text
+        assert "resource=resource_dup_async" not in caplog_fixture.text
 
-    def test_decorator_log_count_limit(self, caplog_fixture):
-        """Verify decorator has a log count limit (max 10 entries).
-
-        Documents the global _decorator_log_count that limits logging to first 10.
-        """
+    def test_decorator_does_not_emit_per_call_diagnostic_noise(self, caplog_fixture):
+        """Telemetry recording remains silent on the hot path."""
         caplog_fixture.clear()
 
         @telemetry_tool("limited_logs")
@@ -437,11 +444,8 @@ class TestTelemetryDecoratorDuplication:
         for _ in range(15):
             func_limited()
 
-        # Count how many times the decorator logged
         log_count = caplog_fixture.text.count("telemetry_decorator sync: tool=limited_logs")
-
-        # Should only log first 10 times due to global counter
-        assert log_count <= 10
+        assert log_count == 0
 
 
 class TestTelemetryDecoratorExceptionHandling:
@@ -1234,6 +1238,8 @@ class TestTelemetryDisabled:
 
             # Queue should be empty (early return)
             assert collector._queue.empty()
+            assert collector._worker is None
+            assert collector._customer_uuid is None
 
     def test_is_telemetry_enabled_returns_false_when_disabled(self, mock_telemetry_config):
         """Verify is_telemetry_enabled returns False when disabled."""

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import threading
 import time
@@ -30,6 +31,7 @@ class EditorStateStore:
         self._lock = threading.RLock()
         self._records: dict[str, EditorStateRecord] = {}
         self._instance_by_session: dict[str, str] = {}
+        self._change_events: dict[str, asyncio.Event] = {}
 
     def begin_session(
         self,
@@ -50,6 +52,10 @@ class EditorStateStore:
                 last_message_received_unix_ms=now,
             )
             self._instance_by_session[session_id] = instance_id
+            previous_event = self._change_events.get(instance_id)
+            if previous_event is not None:
+                previous_event.set()
+            self._change_events[instance_id] = asyncio.Event()
 
     def end_session(self, session_id: str) -> str | None:
         with self._lock:
@@ -60,6 +66,9 @@ class EditorStateStore:
             record = self._records.get(instance_id)
             if record is not None and record.session_id == session_id:
                 self._records.pop(instance_id, None)
+                event = self._change_events.pop(instance_id, None)
+                if event is not None:
+                    event.set()
                 return instance_id
             return None
 
@@ -73,6 +82,10 @@ class EditorStateStore:
             record.state = copy.deepcopy(state)
             record.last_state_received_unix_ms = now
             record.last_message_received_unix_ms = now
+            event = self._change_events.get(record.instance_id)
+            if event is not None:
+                event.set()
+            self._change_events[record.instance_id] = asyncio.Event()
             return True
 
     def touch_editor_heartbeat(
@@ -104,10 +117,47 @@ class EditorStateStore:
             record = self._records.get(instance_id)
             return record.project_root if record is not None else None
 
+    def get_state_received_timestamp(self, instance_id: str) -> int | None:
+        with self._lock:
+            record = self._records.get(instance_id)
+            return record.last_state_received_unix_ms if record is not None else None
+
     def clear(self) -> None:
         with self._lock:
+            for event in self._change_events.values():
+                event.set()
             self._records.clear()
             self._instance_by_session.clear()
+            self._change_events.clear()
+
+    async def wait_for_state_change(
+        self,
+        instance_id: str,
+        since_unix_ms: int | None,
+        timeout: float,
+    ) -> bool:
+        """Wait without polling until a newer proactive state snapshot arrives."""
+        with self._lock:
+            record = self._records.get(instance_id)
+            if record is None:
+                return False
+            if (
+                record.last_state_received_unix_ms is not None
+                and record.last_state_received_unix_ms != since_unix_ms
+            ):
+                return True
+            event = self._change_events.setdefault(instance_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout))
+        except asyncio.TimeoutError:
+            return False
+        with self._lock:
+            record = self._records.get(instance_id)
+            return bool(
+                record is not None
+                and record.last_state_received_unix_ms is not None
+                and record.last_state_received_unix_ms != since_unix_ms
+            )
 
     def _record_for_session(self, session_id: str) -> EditorStateRecord | None:
         instance_id = self._instance_by_session.get(session_id)

@@ -9,6 +9,7 @@ The special group value ``None`` means the tool is *always visible* and
 cannot be disabled by the group system (used for server meta-tools like
 ``set_active_instance`` and ``manage_tools``).
 """
+import os
 from typing import Callable, Any
 
 # Global registry to collect decorated tools
@@ -16,7 +17,7 @@ _tool_registry: list[dict[str, Any]] = []
 
 # Valid group names. ``None`` is also accepted (always-visible meta-tools).
 TOOL_GROUPS: dict[str, str] = {
-    "core": "Essential scene, script, asset & editor tools (always on by default)",
+    "core": "Essential scene, script, asset and editor tools",
     "docs": "Unity API reflection and documentation lookup",
     "vfx": "Visual effects – VFX Graph, shaders, procedural textures",
     "animation": "Animator control & AnimationClip creation",
@@ -30,7 +31,25 @@ TOOL_GROUPS: dict[str, str] = {
     "asset_gen": "AI asset generation – 3D model gen/import, 2D image gen & audio gen (bring-your-own-key)",
 }
 
-DEFAULT_ENABLED_GROUPS: set[str] = {"core", "rendering_inspect", "testing"}
+COMPATIBILITY_ENABLED_GROUPS: frozenset[str] = frozenset({
+    "core",
+    "rendering_inspect",
+    "testing",
+})
+
+
+def get_default_tool_profile() -> str:
+    """Return the validated startup visibility profile."""
+    profile = os.environ.get("UNITY_MCP_DEFAULT_TOOL_PROFILE", "bootstrap")
+    return profile.strip().lower() if profile.strip().lower() in {"bootstrap", "compat"} else "bootstrap"
+
+
+DEFAULT_TOOL_PROFILE = get_default_tool_profile()
+DEFAULT_ENABLED_GROUPS: set[str] = (
+    set(COMPATIBILITY_ENABLED_GROUPS)
+    if DEFAULT_TOOL_PROFILE == "compat"
+    else set()
+)
 
 
 def mcp_for_unity_tool(

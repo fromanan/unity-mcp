@@ -22,8 +22,9 @@ namespace MCPForUnity.Editor.Services
 
             _cachedResources = new Dictionary<string, ResourceMetadata>();
 
-            var resourceTypes = TypeCache.GetTypesWithAttribute<McpForUnityResourceAttribute>();
-            foreach (var type in resourceTypes)
+            IReadOnlyList<Type> resourceTypes =
+                AttributedTypeCatalog.GetTypesWithAttribute<McpForUnityResourceAttribute>();
+            foreach (Type type in resourceTypes)
             {
                 McpForUnityResourceAttribute resourceAttr;
                 try
@@ -41,7 +42,7 @@ namespace MCPForUnity.Editor.Services
                     continue;
                 }
 
-                var metadata = ExtractResourceMetadata(type, resourceAttr);
+                ResourceMetadata metadata = ExtractResourceMetadata(type, resourceAttr);
                 if (metadata != null)
                 {
                     if (_cachedResources.ContainsKey(metadata.Name))
@@ -110,6 +111,7 @@ namespace MCPForUnity.Editor.Services
         public void InvalidateCache()
         {
             _cachedResources = null;
+            AttributedTypeCatalog.Clear();
         }
 
         private ResourceMetadata ExtractResourceMetadata(Type type, McpForUnityResourceAttribute resourceAttr)

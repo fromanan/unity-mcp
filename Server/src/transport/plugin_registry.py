@@ -55,6 +55,8 @@ class PluginRegistry:
         unity_version: str,
         project_path: str | None = None,
         user_id: str | None = None,
+        max_sessions: int | None = None,
+        max_sessions_per_user: int | None = None,
     ) -> tuple[PluginSession, str | None]:
         """Register (or replace) a plugin session.
 
@@ -70,6 +72,26 @@ class PluginRegistry:
             raise ValueError("user_id is required in remote-hosted mode")
 
         async with self._lock:
+            if user_id:
+                previous_session_id = self._user_hash_to_session.get(
+                    (user_id, project_hash)
+                )
+            else:
+                previous_session_id = self._hash_to_session.get(project_hash)
+
+            is_replacement = previous_session_id is not None
+            if not is_replacement:
+                if max_sessions is not None and len(self._sessions) >= max_sessions:
+                    raise OverflowError("Plugin session limit reached")
+                if user_id and max_sessions_per_user is not None:
+                    user_session_count = sum(
+                        1
+                        for existing in self._sessions.values()
+                        if existing.user_id == user_id
+                    )
+                    if user_session_count >= max_sessions_per_user:
+                        raise OverflowError("Per-user plugin session limit reached")
+
             now = datetime.now(timezone.utc)
             session = PluginSession(
                 session_id=session_id,
@@ -87,15 +109,12 @@ class PluginRegistry:
             if user_id:
                 # Remote-hosted mode: use composite key (user_id, project_hash)
                 composite_key = (user_id, project_hash)
-                previous_session_id = self._user_hash_to_session.get(
-                    composite_key)
                 if previous_session_id and previous_session_id != session_id:
                     self._sessions.pop(previous_session_id, None)
                     evicted_session_id = previous_session_id
                 self._user_hash_to_session[composite_key] = session_id
             else:
                 # Local mode: use project_hash only
-                previous_session_id = self._hash_to_session.get(project_hash)
                 if previous_session_id and previous_session_id != session_id:
                     self._sessions.pop(previous_session_id, None)
                     evicted_session_id = previous_session_id

@@ -23,9 +23,10 @@ Gets messages from or clears the Unity Editor console. Defaults to 10 most recen
 | `count` | `int \| str \| None` | — | Max messages to return in non-paging mode (accepts int or string, e.g., 5 or '5'). Ignored when paging with page_size/cursor. |
 | `filter_text` | `str \| None` | — | Text filter for messages |
 | `page_size` | `int \| str \| None` | — | Page size for paginated console reads. Defaults to 50 when omitted. |
-| `cursor` | `int \| str \| None` | — | Opaque cursor for paging (0-based offset). Defaults to 0. |
+| `cursor` | `int \| str \| None` | — | Opaque cursor returned by a prior page. Legacy numeric offsets remain supported. |
 | `format` | `Literal['plain', 'detailed', 'json'] \| None` | — | Output format |
 | `include_stacktrace` | `bool \| str \| None` | — | Include stack traces in output (accepts true/false or 'true'/'false') |
+| `include_total` | `bool \| str \| None` | — | Scan the full console to return an exact total. Defaults false for faster paging. |
 
 ## Returns
 

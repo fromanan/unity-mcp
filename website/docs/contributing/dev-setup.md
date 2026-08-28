@@ -108,8 +108,11 @@ Current server tool groups are:
 - `testing`
 - `probuilder`
 - `profiling`
+- `rendering_inspect`
+- `rendering_authoring`
+- `asset_gen`
 
-Tools with `group=None` are server meta-tools and are always visible. The default enabled group is `core`; other groups can be enabled through the Tools tab or `manage_tools`.
+Tools with `group=None` are server meta-tools and are always visible. The default `bootstrap` profile starts with no groups enabled; use `manage_tools` to activate only the groups needed by the current workflow. Set `UNITY_MCP_DEFAULT_TOOL_PROFILE=compat` to start with `core`, `rendering_inspect`, and `testing` enabled.
 
 When adding, removing, or renaming tools/resources, update the public docs and client metadata. Start with `tools/UPDATE_DOCS_PROMPT.md`, then review the changes manually.
 
@@ -134,14 +137,14 @@ Tool visibility changes work differently depending on the transport mode:
 **HTTP mode** (recommended):
 
 1. Toggling a tool calls `ReregisterToolsAsync()`, which sends the updated enabled tool list to the Python server over WebSocket.
-2. The server updates its internal tool visibility via `mcp.enable()`/`mcp.disable()` per group.
-3. The server sends a `tools/list_changed` MCP notification to all connected client sessions.
-4. Already-connected clients (Claude Desktop, VS Code, etc.) automatically receive the updated tool list.
+2. The server replaces that session's registered tool snapshot.
+3. Request middleware filters the catalog against the active Unity project and the MCP session's activated groups.
+4. The server sends `tools/list_changed`; already-connected clients can fetch the smaller current catalog.
 
 **Stdio mode**:
 
 1. Toggles are persisted locally but cannot be pushed to the server (no WebSocket connection).
-2. The server starts with all groups enabled. After changing toggles, ask the AI to run `manage_tools` with `action='sync'` — this pulls the current tool states from Unity and syncs server visibility.
+2. The server starts with the configured profile (`bootstrap` by default). After changing toggles, ask the AI to run `manage_tools` with `action='sync'` — this pulls the current tool states from Unity and syncs session visibility.
 3. Alternatively, restart the server to pick up changes.
 
 ### The `manage_tools` Meta-Tool
@@ -150,7 +153,8 @@ The server exposes a built-in `manage_tools` tool (always visible, not group-gat
 
 | Action | Description |
 |--------|-------------|
-| `list_groups` | Lists all tool groups with their tools and enable/disable status |
+| `list_groups` | Lists compact group status/counts; pass `include_tools=true` for names |
+| `search` | Finds matching groups and tools without returning the full catalog |
 | `activate` | Enables a tool group by name (e.g., `group="vfx"`) |
 | `deactivate` | Disables a tool group by name |
 | `sync` | Pulls current tool states from Unity and syncs server visibility (essential for stdio mode) |
@@ -346,4 +350,3 @@ To bypass for a single push: `git push --no-verify`.
 **Bumping the matrix**
 
 Edit `tools/unity-versions.json` and update CI + local scripts both in one commit. The file is the single source of truth.
-

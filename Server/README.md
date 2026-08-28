@@ -151,6 +151,24 @@ These options apply to the `mcp-for-unity` command (whether run via `uvx`, Docke
 - `UNITY_MCP_SKIP_STARTUP_CONNECT=1` - Skip initial Unity connection attempt on startup
 - `UNITY_MCP_LOG_DIR` - Override the rotating server log directory. Default: `%LOCALAPPDATA%\UnityMCP\Logs` (Windows), `~/Library/Application Support/UnityMCP/Logs` (macOS), `$XDG_STATE_HOME/UnityMCP/Logs` (Linux/BSD, defaults to `~/.local/state/UnityMCP/Logs`).
 
+Tool visibility and response budgets:
+
+- `UNITY_MCP_DEFAULT_TOOL_PROFILE` - Startup catalog profile: `bootstrap` (default) exposes only routing/meta-tools; `compat` also enables `core`, `rendering_inspect`, and `testing`. Activate other groups with `manage_tools` only when needed.
+- `UNITY_MCP_ENABLE_DEBUG_TOOLS=1` - Expose diagnostic-only tools such as `debug_request_context` (hidden by default).
+- `UNITY_MCP_INLINE_RESULT_MAX_BYTES` - Maximum inline tool/resource result size (default: `262144`; clamped to 16 KiB–4 MiB). Larger results return a session-scoped `mcpforunity://results/...` URI with bounded pages.
+
+HTTP/WebSocket capacity limits:
+
+- `UNITY_MCP_MAX_COMMAND_BYTES` - Maximum serialized command size sent to Unity (default: 4 MiB; clamped to 16 KiB–32 MiB).
+- `UNITY_MCP_MAX_TOOL_REGISTRATION_BYTES` - Maximum Unity WebSocket tool-catalog snapshot (default: 1 MiB; clamped to 64 KiB–16 MiB).
+- `UNITY_MCP_MAX_EDITOR_STATE_BYTES` - Maximum proactive editor-state snapshot (default: 2 MiB; clamped to 64 KiB–16 MiB).
+- `UNITY_MCP_MAX_SESSION_QUEUE_BYTES` - Per-Unity-instance queued command budget (default: 8 MiB; clamped to 64 KiB–64 MiB). Queue depth is also capped at 32 commands.
+- `UNITY_MCP_MAX_PENDING_COMMANDS` - Global in-flight Unity command cap (default: `64`; clamped to 1–1024).
+- `UNITY_MCP_MAX_PLUGIN_SESSIONS` - Global connected Unity plugin cap (default: `16`; clamped to 1–256).
+- `UNITY_MCP_MAX_PLUGIN_SESSIONS_PER_USER` - Remote-hosted per-user plugin cap (default: `8`; clamped to 1–64).
+- `UNITY_MCP_MAX_AUTH_INFLIGHT` - Distinct API-key validations admitted at once (default: `128`; clamped to 1–4096).
+- `UNITY_MCP_MAX_AUTH_CONCURRENCY` - Concurrent outbound auth requests (default: `16`; clamped to 1–256).
+
 API key authentication (remote-hosted mode):
 
 - `UNITY_MCP_API_KEY_VALIDATION_URL` - External endpoint to validate API keys

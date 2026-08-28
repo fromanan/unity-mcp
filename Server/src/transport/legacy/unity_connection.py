@@ -14,6 +14,8 @@ import threading
 import time
 from typing import Any
 
+from core.capacity import COMMAND_MAX_BYTES
+from core.result_budget import bounded_json_size
 from models.models import MCPResponse, UnityInstanceInfo
 from transport.legacy.stdio_port_registry import stdio_port_registry
 
@@ -25,6 +27,7 @@ _connection_lock = threading.Lock()
 
 # Maximum allowed framed payload size (64 MiB)
 FRAMED_MAX = 64 * 1024 * 1024
+_SOCKET_READ_CHUNK = 64 * 1024
 
 
 @dataclass
@@ -160,17 +163,17 @@ class UnityConnection:
             if self.sock and orig_blocking is not None:
                 self.sock.setblocking(orig_blocking)
 
-    def _read_exact(self, sock: socket.socket, count: int) -> bytes:
+    def _read_exact(self, sock: socket.socket, count: int) -> bytearray:
         data = bytearray()
         while len(data) < count:
-            chunk = sock.recv(count - len(data))
+            chunk = sock.recv(min(count - len(data), _SOCKET_READ_CHUNK))
             if not chunk:
                 raise ConnectionError(
                     "Connection closed before reading expected bytes")
             data.extend(chunk)
-        return bytes(data)
+        return data
 
-    def receive_full_response(self, sock, buffer_size=config.buffer_size) -> bytes:
+    def receive_full_response(self, sock, buffer_size=config.buffer_size) -> bytes | bytearray:
         """Receive a complete response from Unity, handling chunked data."""
         if self.use_framing:
             # Heartbeat semantics: the Unity editor emits zero-length frames while
@@ -210,61 +213,64 @@ class UnityConnection:
                 logger.error(f"Error during framed receive: {exc}")
                 raise
 
-        chunks = []
+        data = bytearray()
+        read_size = min(max(1024, int(buffer_size)), _SOCKET_READ_CHUNK)
+        started = False
+        depth = 0
+        in_string = False
+        escaped = False
         # Respect the socket's currently configured timeout
         try:
             while True:
-                chunk = sock.recv(buffer_size)
+                chunk = sock.recv(read_size)
                 if not chunk:
-                    if not chunks:
-                        raise Exception(
+                    if not data:
+                        raise ConnectionError(
                             "Connection closed before receiving data")
-                    break
-                chunks.append(chunk)
+                    raise ConnectionError(
+                        "Connection closed before receiving a complete JSON response")
+                if len(data) + len(chunk) > FRAMED_MAX:
+                    raise ValueError(
+                        f"Legacy response exceeded {FRAMED_MAX} bytes")
+                data.extend(chunk)
 
-                # Process the data received so far
-                data = b''.join(chunks)
-                decoded_data = data.decode('utf-8')
+                for byte in chunk:
+                    if not started:
+                        if byte in b" \t\r\n":
+                            continue
+                        if byte not in (ord('{'), ord('[')):
+                            raise ValueError(
+                                "Legacy response must start with a JSON object or array")
+                        started = True
+                        depth = 1
+                        continue
 
-                # Check if we've received a complete response
-                try:
-                    # Special case for ping-pong
-                    if decoded_data.strip().startswith('{"status":"success","result":{"message":"pong"'):
-                        logger.debug("Received ping response")
-                        return data
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif byte == ord('\\'):
+                            escaped = True
+                        elif byte == ord('"'):
+                            in_string = False
+                        continue
 
-                    # Handle escaped quotes in the content
-                    if '"content":' in decoded_data:
-                        # Find the content field and its value
-                        content_start = decoded_data.find('"content":') + 9
-                        content_end = decoded_data.rfind('"', content_start)
-                        if content_end > content_start:
-                            # Replace escaped quotes in content with regular quotes
-                            content = decoded_data[content_start:content_end]
-                            content = content.replace('\\"', '"')
-                            decoded_data = decoded_data[:content_start] + \
-                                content + decoded_data[content_end:]
-
-                    # Validate JSON format
-                    json.loads(decoded_data)
-
-                    # If we get here, we have valid JSON
-                    logger.info(
-                        f"Received complete response ({len(data)} bytes)")
-                    return data
-                except json.JSONDecodeError:
-                    # We haven't received a complete valid JSON response yet
-                    continue
-                except Exception as e:
-                    logger.warning(
-                        f"Error processing response chunk: {str(e)}")
-                    # Continue reading more chunks as this might not be the complete response
-                    continue
-        except socket.timeout:
+                    if byte == ord('"'):
+                        in_string = True
+                    elif byte in (ord('{'), ord('[')):
+                        depth += 1
+                    elif byte in (ord('}'), ord(']')):
+                        depth -= 1
+                        if depth == 0:
+                            logger.debug(
+                                "Received complete legacy response (%d bytes)",
+                                len(data),
+                            )
+                            return data
+        except socket.timeout as exc:
             logger.warning("Socket timeout during receive")
-            raise Exception("Timeout receiving Unity response")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
+            raise TimeoutError("Timeout receiving Unity response") from exc
+        except Exception as exc:
+            logger.error("Error during receive: %s", exc)
             raise
 
     def _cap_to_deadline(self, timeout: float, deadline: float | None, floor: float = 0.05) -> float:
@@ -287,6 +293,25 @@ class UnityConnection:
             raise ValueError("MCP call missing command_type")
         if params is None:
             return MCPResponse(success=False, error="MCP call received with no parameters (client placeholder?)")
+        if command_type == 'ping':
+            payload = b'ping'
+            request_payload = None
+        else:
+            request_payload = {'type': command_type, 'params': params}
+            request_bytes, within_limit = bounded_json_size(
+                request_payload,
+                ceiling=COMMAND_MAX_BYTES,
+            )
+            if not within_limit:
+                return MCPResponse(
+                    success=False,
+                    error="command_payload_too_large",
+                    data={
+                        "payload_bytes": request_bytes,
+                        "max_payload_bytes": COMMAND_MAX_BYTES,
+                    },
+                )
+            payload = None
         attempts = max(config.max_retries,
                        5) if max_attempts is None else max_attempts
         base_backoff = max(0.5, config.retry_delay)
@@ -351,6 +376,13 @@ class UnityConnection:
         except Exception as exc:
             logger.debug(f"Preflight status check failed: {exc}")
 
+        if payload is None:
+            payload = json.dumps(
+                request_payload,
+                ensure_ascii=False,
+                separators=(',', ':'),
+            ).encode('utf-8')
+
         for attempt in range(attempts + 1):
             if deadline is not None and time.monotonic() >= deadline:
                 logger.warning(
@@ -364,34 +396,23 @@ class UnityConnection:
                 # so we reconnect instead of writing to a dead connection.
                 self._ensure_live_connection()
                 # Ensure connected (handshake occurs within connect())
-                t_conn_start = time.time()
+                t_conn_start = time.perf_counter()
                 if not self.sock and not self.connect(self._cap_to_deadline(config.connection_timeout, deadline)):
                     raise ConnectionError("Could not connect to Unity")
-                logger.info("[TIMING-STDIO] connect took %.3fs command=%s", time.time() - t_conn_start, command_type)
-
-                # Build payload
-                if command_type == 'ping':
-                    payload = b'ping'
-                else:
-                    payload = json.dumps({
-                        'type': command_type,
-                        'params': params,
-                    }).encode('utf-8')
+                logger.debug("[TIMING-STDIO] connect took %.3fs command=%s", time.perf_counter() - t_conn_start, command_type)
 
                 # Send/receive are serialized to protect the shared socket
                 with self._io_lock:
                     mode = 'framed' if self.use_framing else 'legacy'
-                    with contextlib.suppress(Exception):
-                        logger.debug(
-                            f"send {len(payload)} bytes; mode={mode}; head={payload[:32].decode('utf-8', 'ignore')}")
-                    t_send_start = time.time()
+                    logger.debug("send %d bytes; mode=%s", len(payload), mode)
+                    t_send_start = time.perf_counter()
                     if self.use_framing:
                         header = struct.pack('>Q', len(payload))
                         self.sock.sendall(header)
                         self.sock.sendall(payload)
                     else:
                         self.sock.sendall(payload)
-                    logger.info("[TIMING-STDIO] sendall took %.3fs command=%s", time.time() - t_send_start, command_type)
+                    logger.debug("[TIMING-STDIO] sendall took %.3fs command=%s", time.perf_counter() - t_send_start, command_type)
 
                     # Cap the receive timeout to the remaining command budget (and use a
                     # short timeout during retry bursts) so a wedged socket can't block
@@ -405,9 +426,9 @@ class UnityConnection:
                         restore_timeout = self.sock.gettimeout()
                         self.sock.settimeout(recv_timeout)
                     try:
-                        t_recv_start = time.time()
+                        t_recv_start = time.perf_counter()
                         response_data = self.receive_full_response(self.sock)
-                        logger.info("[TIMING-STDIO] receive took %.3fs command=%s len=%d", time.time() - t_recv_start, command_type, len(response_data))
+                        logger.debug("[TIMING-STDIO] receive took %.3fs command=%s len=%d", time.perf_counter() - t_recv_start, command_type, len(response_data))
                         with contextlib.suppress(Exception):
                             logger.debug(
                                 f"recv {len(response_data)} bytes; mode={mode}")
@@ -836,11 +857,11 @@ def send_command_with_retry(
     Uses config.reload_retry_ms and config.reload_max_retries by default. Preserves the
     structured failure if retries are exhausted.
     """
-    t_retry_start = time.time()
-    logger.info("[TIMING-STDIO] send_command_with_retry START command=%s", command_type)
-    t_get_conn = time.time()
+    t_retry_start = time.perf_counter()
+    logger.debug("[TIMING-STDIO] send_command_with_retry START command=%s", command_type)
+    t_get_conn = time.perf_counter()
     conn = get_unity_connection(instance_id)
-    logger.info("[TIMING-STDIO] get_unity_connection took %.3fs command=%s", time.time() - t_get_conn, command_type)
+    logger.debug("[TIMING-STDIO] get_unity_connection took %.3fs command=%s", time.perf_counter() - t_get_conn, command_type)
     if max_retries is None:
         max_retries = getattr(config, "reload_max_retries", 40)
     if retry_ms is None:
@@ -939,7 +960,7 @@ def send_command_with_retry(
             instance_id or "default",
             waited,
         )
-    logger.info("[TIMING-STDIO] send_command_with_retry DONE total=%.3fs command=%s", time.time() - t_retry_start, command_type)
+    logger.debug("[TIMING-STDIO] send_command_with_retry DONE total=%.3fs command=%s", time.perf_counter() - t_retry_start, command_type)
     return response
 
 

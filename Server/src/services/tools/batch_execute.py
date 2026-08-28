@@ -99,11 +99,11 @@ async def batch_execute(
     ctx: Context,
     commands: Annotated[list[dict[str, Any]], "List of commands with 'tool' and 'params' keys."],
     parallel: Annotated[bool | None,
-                        "Attempt to run read-only commands in parallel"] = None,
+                        "Deprecated compatibility field. Unity executes batches serially on its main thread."] = None,
     fail_fast: Annotated[bool | None,
                          "Stop processing after the first failure"] = None,
     max_parallelism: Annotated[int | None,
-                               "Hint for the maximum number of parallel workers"] = None,
+                               "Deprecated compatibility field. It has no execution effect."] = None,
 ) -> dict[str, Any]:
     """Proxy the batch_execute tool to the Unity Editor transporter."""
     unity_instance = await get_unity_instance_from_context(ctx)
@@ -163,9 +163,16 @@ async def batch_execute(
     if max_parallelism is not None:
         payload["maxParallelism"] = int(max_parallelism)
 
-    return await send_with_unity_instance(
+    result = await send_with_unity_instance(
         async_send_command_with_retry,
         unity_instance,
         "batch_execute",
         payload,
     )
+    if isinstance(result, dict) and (parallel is not None or max_parallelism is not None):
+        warnings = result.setdefault("warnings", [])
+        if isinstance(warnings, list):
+            warnings.append(
+                "parallel and max_parallelism are deprecated; Unity executes batch commands serially."
+            )
+    return result

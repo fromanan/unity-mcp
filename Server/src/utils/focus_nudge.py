@@ -17,6 +17,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+from core.logging_decorator import bounded_diagnostic_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,7 +292,11 @@ tell application id bundleID to activate
                     timeout=5,
                 )
                 if result.returncode != 0:
-                    logger.debug(f"Failed to activate Unity PID {pid}: {result.stderr}")
+                    logger.debug(
+                        "Failed to activate Unity PID %s: %s",
+                        pid,
+                        bounded_diagnostic_text(result.stderr),
+                    )
                     return False
                 logger.info(f"Activated Unity instance with PID {pid} for project {unity_project_path}")
                 return True
@@ -314,7 +320,8 @@ tell application id bundleID to activate
                 logger.debug(
                     "Bundle ID activation failed for %s, falling back to name: %s",
                     bundle_id,
-                    result.stderr.strip() if result.stderr else "(no stderr)",
+                    bounded_diagnostic_text(result.stderr.strip())
+                    if result.stderr else "(no stderr)",
                 )
 
             # Fallback to name-based activation
@@ -347,7 +354,10 @@ end tell
             timeout=5,
         )
         if result.returncode != 0:
-            logger.debug(f"Failed to activate Unity via System Events: {result.stderr}")
+            logger.debug(
+                "Failed to activate Unity via System Events: %s",
+                bounded_diagnostic_text(result.stderr),
+            )
             return False
         return True
     except Exception as e:

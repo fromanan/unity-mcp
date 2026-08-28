@@ -29,6 +29,19 @@ namespace MCPForUnity.Editor.Tools
         private const int DefaultSearchPageSize = 50;
         private const int MaxSearchPageSize = 100;
         private const int MaxPreviewSearchPageSize = 10;
+        private const int MaxSearchCacheEntries = 8;
+        private const int MaxCachedSearchGuids = 50000;
+        private const int MaxGuidsPerCachedSearch = 25000;
+        private const double SearchCacheTtlSeconds = 5.0;
+        private static readonly object SearchCacheLock = new();
+        private static readonly Dictionary<string, LinkedListNode<SearchCacheEntry>> SearchCache = new();
+        private static readonly LinkedList<SearchCacheEntry> SearchCacheLru = new();
+        private static int _cachedSearchGuidCount;
+
+        static ManageAsset()
+        {
+            EditorApplication.projectChanged += ClearSearchCache;
+        }
 
         private static string GetProjectAbsolutePath(string projectRelativePath)
         {
@@ -703,10 +716,8 @@ namespace MCPForUnity.Editor.Tools
 
             try
             {
-                string[] guids = AssetDatabase.FindAssets(
-                    string.Join(" ", searchFilters),
-                    folderScope
-                );
+                string searchFilter = string.Join(" ", searchFilters);
+                string[] guids = GetCachedSearchGuids(searchFilter, folderScope);
                 List<string> pagePaths = new(pageSize);
                 int totalFound = 0;
 
@@ -760,6 +771,92 @@ namespace MCPForUnity.Editor.Tools
             {
                 return new ErrorResponse($"Error searching assets: {e.Message}");
             }
+        }
+
+        private static string[] GetCachedSearchGuids(string searchFilter, string[] folderScope)
+        {
+            string cacheKey = searchFilter + "\u001f" + string.Join("\u001f", folderScope ?? Array.Empty<string>());
+            double now = EditorApplication.timeSinceStartup;
+            lock (SearchCacheLock)
+            {
+                if (SearchCache.TryGetValue(cacheKey, out LinkedListNode<SearchCacheEntry> cachedNode))
+                {
+                    if (cachedNode.Value.ExpiresAt > now)
+                    {
+                        SearchCacheLru.Remove(cachedNode);
+                        SearchCacheLru.AddLast(cachedNode);
+                        return cachedNode.Value.Guids;
+                    }
+                    RemoveSearchCacheNode(cachedNode);
+                }
+            }
+
+            string[] guids = AssetDatabase.FindAssets(searchFilter, folderScope);
+            if (guids.Length > MaxGuidsPerCachedSearch)
+            {
+                return guids;
+            }
+
+            lock (SearchCacheLock)
+            {
+                now = EditorApplication.timeSinceStartup;
+                if (SearchCache.TryGetValue(cacheKey, out LinkedListNode<SearchCacheEntry> existing))
+                {
+                    if (existing.Value.ExpiresAt > now)
+                    {
+                        SearchCacheLru.Remove(existing);
+                        SearchCacheLru.AddLast(existing);
+                        return existing.Value.Guids;
+                    }
+                    RemoveSearchCacheNode(existing);
+                }
+
+                SearchCacheEntry entry = new(cacheKey, guids, now + SearchCacheTtlSeconds);
+                LinkedListNode<SearchCacheEntry> node = SearchCacheLru.AddLast(entry);
+                SearchCache[cacheKey] = node;
+                _cachedSearchGuidCount += guids.Length;
+                while (
+                    SearchCache.Count > MaxSearchCacheEntries
+                    || _cachedSearchGuidCount > MaxCachedSearchGuids)
+                {
+                    LinkedListNode<SearchCacheEntry> oldest = SearchCacheLru.First;
+                    if (oldest == null)
+                        break;
+                    RemoveSearchCacheNode(oldest);
+                }
+            }
+            return guids;
+        }
+
+        private static void ClearSearchCache()
+        {
+            lock (SearchCacheLock)
+            {
+                SearchCache.Clear();
+                SearchCacheLru.Clear();
+                _cachedSearchGuidCount = 0;
+            }
+        }
+
+        private static void RemoveSearchCacheNode(LinkedListNode<SearchCacheEntry> node)
+        {
+            SearchCache.Remove(node.Value.Key);
+            SearchCacheLru.Remove(node);
+            _cachedSearchGuidCount -= node.Value.Guids.Length;
+        }
+
+        private sealed class SearchCacheEntry
+        {
+            public SearchCacheEntry(string key, string[] guids, double expiresAt)
+            {
+                Key = key;
+                Guids = guids;
+                ExpiresAt = expiresAt;
+            }
+
+            public string Key { get; }
+            public string[] Guids { get; }
+            public double ExpiresAt { get; }
         }
 
         private static object GetAssetInfo(string path, bool generatePreview)

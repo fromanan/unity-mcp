@@ -19,9 +19,9 @@ Executes multiple MCP commands in a single batch for dramatically better perform
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `commands` | `list[dict[str, Any]]` | yes | List of commands with 'tool' and 'params' keys. |
-| `parallel` | `bool \| None` | — | Attempt to run read-only commands in parallel |
+| `parallel` | `bool \| None` | — | Deprecated compatibility field. Unity executes batches serially on its main thread. |
 | `fail_fast` | `bool \| None` | — | Stop processing after the first failure |
-| `max_parallelism` | `int \| None` | — | Hint for the maximum number of parallel workers |
+| `max_parallelism` | `int \| None` | — | Deprecated compatibility field. It has no execution effect. |
 
 ## Returns
 
@@ -89,9 +89,9 @@ A batch can mix any tools, as long as ordering inside the batch doesn't depend o
 
 Set `fail_fast: true` (default) to abort the rest on the first failed step. Pass `fail_fast: false` to attempt every operation and collect per-step results, useful for "best-effort cleanup" patterns.
 
-### Parallel reads
+### Serial execution
 
-Pass `parallel: true` to let the server run **read-only** commands concurrently. Mutating ops still serialize for safety. Tune with `max_parallelism`.
+Unity executes every batch serially on its main thread so command ordering and Editor state remain deterministic. `parallel` and `max_parallelism` are accepted only for backward compatibility and return a deprecation warning when supplied.
 
 ### Limits
 

@@ -96,6 +96,13 @@ async def preflight(
 
     # Compilation: optionally wait for a bounded time.
     if wait_for_no_compile:
+        get_state = getattr(ctx, "get_state", None)
+        instance_id = None
+        if callable(get_state):
+            try:
+                instance_id = await get_state("unity_instance")
+            except Exception:
+                instance_id = None
         deadline = time.monotonic() + float(max_wait_s)
         while True:
             compilation = data.get("compilation") if isinstance(
@@ -108,7 +115,22 @@ async def preflight(
                 break
             if time.monotonic() >= deadline:
                 return _busy("compiling", 500)
-            await asyncio.sleep(0.25)
+            remaining = max(0.0, deadline - time.monotonic())
+            waited_for_push = False
+            if isinstance(instance_id, str) and instance_id:
+                from services.state.editor_state_store import editor_state_store
+                since_unix_ms = editor_state_store.get_state_received_timestamp(
+                    instance_id
+                )
+                if since_unix_ms is not None:
+                    waited_for_push = True
+                    await editor_state_store.wait_for_state_change(
+                        instance_id,
+                        since_unix_ms,
+                        min(remaining, 1.0),
+                    )
+            if not waited_for_push:
+                await asyncio.sleep(min(0.25, remaining))
 
             # Refresh state for the next loop iteration.
             try:

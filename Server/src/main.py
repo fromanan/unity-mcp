@@ -6,7 +6,7 @@ from transport.unity_instance_middleware import (
 from services.api_key_service import ApiKeyService
 from transport.legacy.unity_connection import get_unity_connection_pool, UnityConnectionPool
 from services.tools import register_all_tools
-from core.telemetry import record_milestone, record_telemetry, MilestoneType, RecordType, get_package_version
+from core.telemetry import record_milestone, record_telemetry, MilestoneType, RecordType, get_package_version, shutdown_telemetry
 from services.resources import register_all_resources
 from transport.plugin_registry import PluginRegistry
 from transport.plugin_hub import PluginHub
@@ -278,6 +278,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
         if deferred_tasks:
             await asyncio.gather(*deferred_tasks, return_exceptions=True)
         await PluginHub.shutdown()
+        await ApiKeyService.close_instance()
+        from services.tools.unity_docs import close_unity_docs_http_client
+        await close_unity_docs_http_client()
+        from services.state.result_store import result_store
+        result_store.clear()
+        shutdown_telemetry()
         _plugin_registry = None
         if _unity_connection_pool:
             _unity_connection_pool.disconnect_all()
@@ -285,89 +291,23 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
 
 
 def _build_instructions(project_scoped_tools: bool) -> str:
-    if project_scoped_tools:
-        custom_tools_note = (
-            "I have a dynamic tool system. Always check the mcpforunity://custom-tools resource first "
-            "to see what special capabilities are available for the current project."
-        )
-    else:
-        custom_tools_note = (
-            "Custom tools are registered as standard tools when Unity connects. "
-            "No project-scoped custom tools resource is available."
-        )
-
-    return f"""
-This server provides tools to interact with the Unity Game Engine Editor.
-
+    custom_tools_note = (
+        "Read mcpforunity://custom-tools for active-project extensions."
+        if project_scoped_tools
+        else "Connected custom tools may appear as standard tools."
+    )
+    return f"""Control the Unity Editor through resources (read state) and tools (act).
 {custom_tools_note}
 
-Targeting Unity instances:
-- Use the resource mcpforunity://instances to list active Unity sessions (Name@hash).
-- When multiple instances are connected, call set_active_instance with the exact Name@hash before using tools/resources to pin routing for the whole session. The server will error if multiple are connected and no active instance is set.
-- Alternatively, pass unity_instance as a parameter on any individual tool call to route just that call (e.g. unity_instance="MyGame@abc123", unity_instance="abc" for a hash prefix, or unity_instance="6401" for a port number in stdio mode). This does not change the session default.
-
-Important Workflows:
-
-Resources vs Tools:
-- Use RESOURCES to read editor state (editor_state, project_info, project_tags, tests, etc)
-- Use TOOLS to perform actions and mutations (manage_editor for play mode control, tag/layer management, etc)
-- Always check related resources before modifying the engine state with tools
-
-Reading resources (read this before using ANY resource named below):
-- Resources are addressed by URI, never by name. A resource's name and URI are NOT interchangeable: names use underscores (e.g. editor_state) while URIs use slashes (e.g. mcpforunity://editor/state). Do NOT build a URI by swapping separators in the name — you will 404.
-- Always read the exact URI from your MCP client's resource listing (resources/list). Where these instructions mention a resource by name, look up its URI in that listing rather than guessing it.
-- Resource payloads are wrapped: the content lives under a top-level `data` object, so field paths are `data.<section>.<field>` (e.g. `data.advice.ready_for_tools`), not bare top-level fields.
-
-Script Management:
-- After creating or modifying scripts (by your own tools or the `manage_script` tool) use `read_console` to check for compilation errors before proceeding
-- Only after successful compilation can new components/types be used
-- You can poll the `editor_state` resource's `isCompiling` field to check if the domain reload is complete
-
-Scene Setup:
-- Always include a Camera and main Light (Directional Light) in new scenes
-- Create prefabs with `manage_asset` for reusable GameObjects
-- Use `manage_scene` to load, save, and query scene information
-
-Path Conventions:
-- Unless specified otherwise, all paths are relative to the project's `Assets/` folder
-- Use forward slashes (/) in paths for cross-platform compatibility
-
-Console Monitoring:
-- Check `read_console` regularly to catch errors, warnings, and compilation status
-- Filter by log type (Error, Warning, Log) to focus on specific issues
-
-Menu Items:
-- Use `execute_menu_item` when you have read the menu items resource
-- This lets you interact with Unity's menu system and third-party tools
-
-Unity API Verification (requires 'docs' tool group):
-- When the 'docs' tool group is active, use `unity_reflect` and `unity_docs` to verify Unity API details before answering questions or writing C# code. LLM training data frequently contains incorrect, outdated, or hallucinated Unity APIs.
-- BEFORE answering Unity API questions: search the project's assets (`manage_asset`) and reflect the API (`unity_reflect`) to verify. Do NOT rely on training data alone.
-- Common hallucination areas: shaders and materials (always search assets for actual shader names), package-specific APIs (Input System, Cinemachine, ProBuilder, NavMesh, URP/HDRP), and APIs that changed between Unity versions.
-- Workflow: `unity_reflect search` → `unity_reflect get_type` → `unity_reflect get_member` → `unity_docs get_doc` (if you need examples/caveats).
-- For shader/material questions: use `manage_asset(action="search", filter_type="Shader")` to find actual shaders in the project before recommending one.
-
-Rendering workflow (inspection is default-enabled; authoring is opt-in):
-- Prove the active owner closure before proposing a visual fix: `inspect_render_target` → `inspect_material` → `inspect_texture` and `inspect_shader_graph` → `validate_render_contract`.
-- Use exact asset paths and GUIDs from inspection results. Do not infer texture semantics from a filename alone when the semantic contract is unknown.
-- Treat serialized Shader Graph properties without a property-to-output trace as inert, even when a Material Inspector displays a value.
-- Use `sample_material` for a fast isolated canonical preview, clone-only property experiments, or locked material-to-material A/B. Treat `requires_scene_probe=true` as a hard boundary and follow with `render_probe` on the actual owner when scene lighting, terrain/vegetation integration, camera textures, decals, probes, or renderer features matter.
-- Use `render_probe` with a locked camera, resolution, quality level, scope, channel, and warmup count for visual A/B evidence. A changed camera/framing invalidates the comparison.
-- Use `profile_render_target` for static renderer/pass evidence and current Frame Debugger events; never present Editor/static evidence as Player or target-GPU proof.
-- Before any material, texture-importer, or Shader Graph mutation, enable the `rendering_authoring` group and call `manage_rendering_authoring` with dry_run=true. Apply only with the returned current SHA-256, an exact operation list, and any required project-owned copy path.
-- Vendor/package/generated assets fail the ownership guard unless a project successor is supplied or the caller explicitly authorizes direct owner mutation. Unknown render-contract proof fails strict validation.
-
-Payload sizing & paging (important):
-- Many Unity queries can return very large JSON. Prefer **paged + summary-first** calls.
-- `manage_scene(action="get_hierarchy")`:
-  - Use `page_size` + `cursor` and follow `next_cursor` until null.
-  - `page_size` is **items per page**; recommended starting point: **50**.
-- `manage_gameobject(action="get_components")`:
-  - Start with `include_properties=false` (metadata-only) and small `page_size` (e.g. **10-25**).
-  - Only request `include_properties=true` when needed; keep `page_size` small (e.g. **3-10**) to bound payloads.
-- `manage_asset(action="search")`:
-  - Use paging (`page_size`, `page_number`) and keep `page_size` modest (e.g. **25-50**) to avoid token-heavy responses.
-  - Keep `generate_preview=false` unless you explicitly need thumbnails (previews may include large base64 payloads).
+- Start with the small bootstrap catalog. Use manage_tools(search) then activate only the group needed.
+- Read exact resource URIs from resources/list; payload fields are under data.
+- If multiple Editors are connected, read mcpforunity://instances and call set_active_instance(Name@hash). A per-call unity_instance overrides routing without changing the session default.
+- Use project-relative Assets/... paths with forward slashes.
+- Prefer summary-first, paged calls. Follow returned cursors/URIs; avoid previews, stack traces, component properties, or exact totals until needed.
+- After script changes, wait for compilation/domain reload and read filtered console errors before using new types.
+- For API uncertainty, activate docs and verify with unity_reflect, then unity_docs.
+- Rendering: inspect the real owner/material/texture/shader contract first. Activate rendering_authoring only for an authorized mutation and dry-run it before apply.
+- Oversized results return a paged mcpforunity://results/... URI instead of bloating tool context.
 """
 
 

@@ -39,11 +39,13 @@ async def read_console(
     page_size: Annotated[int | str,
                          "Page size for paginated console reads. Defaults to 50 when omitted."] | None = None,
     cursor: Annotated[int | str,
-                      "Opaque cursor for paging (0-based offset). Defaults to 0."] | None = None,
+                      "Opaque cursor returned by a prior page. Legacy numeric offsets remain supported."] | None = None,
     format: Annotated[Literal['plain', 'detailed',
                               'json'], "Output format"] | None = None,
     include_stacktrace: Annotated[bool | str,
                                   "Include stack traces in output (accepts true/false or 'true'/'false')"] | None = None,
+    include_total: Annotated[bool | str,
+                             "Scan the full console to return an exact total. Defaults false for faster paging."] | None = None,
 ) -> dict[str, Any]:
     # Get active instance from session state
     # Removed session_state import
@@ -90,8 +92,12 @@ async def read_console(
     # Coerce booleans defensively (strings like 'true'/'false')
 
     include_stacktrace = coerce_bool(include_stacktrace, default=False)
+    include_total = coerce_bool(include_total, default=False)
     coerced_page_size = coerce_int(page_size, default=None)
-    coerced_cursor = coerce_int(cursor, default=None)
+    if isinstance(cursor, str) and cursor.startswith("v1:"):
+        coerced_cursor: int | str | None = cursor
+    else:
+        coerced_cursor = coerce_int(cursor, default=None)
 
     # Normalize action if it's a string
     if isinstance(action, str):
@@ -119,7 +125,8 @@ async def read_console(
         "pageSize": coerced_page_size,
         "cursor": coerced_cursor,
         "format": format.lower() if isinstance(format, str) else format,
-        "includeStacktrace": include_stacktrace
+        "includeStacktrace": include_stacktrace,
+        "includeTotal": include_total,
     }
 
     # Remove None values unless it's 'count' (as None might mean 'all')

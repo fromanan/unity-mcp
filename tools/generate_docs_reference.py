@@ -431,7 +431,7 @@ def render_resources_catalog(resources: list[dict[str, Any]]) -> str:
             f"{param_block}\n"
         )
 
-    return front_matter + "\n" + head + "\n".join(items) + "\n"
+    return (front_matter + "\n" + head + "\n".join(items)).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +464,13 @@ def _resolve_group_blurbs() -> dict[str, str]:
 def _write(path: Path, content: str) -> bool:
     """Write only if content differs. Return True if a write happened."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.read_text(encoding="utf-8") == content:
+    encoded = content.encode("utf-8")
+    if path.exists() and path.read_bytes() == encoded:
         return False
-    path.write_text(content, encoding="utf-8")
+    # Keep generated output byte-stable on every host. Text-mode writes on
+    # Windows translate LF to CRLF, making --check report false drift against
+    # unchanged LF files even when their decoded content is identical.
+    path.write_bytes(encoded)
     return True
 
 

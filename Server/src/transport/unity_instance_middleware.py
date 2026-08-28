@@ -5,13 +5,14 @@ This middleware intercepts all tool calls and injects the active Unity instance
 into the request-scoped state, allowing tools to access it via ctx.get_state("unity_instance").
 """
 from threading import RLock
+import json
 import logging
 import time
 
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from core.config import config
-from services.registry import get_registered_tools
+from services.registry import DEFAULT_ENABLED_GROUPS, get_registered_tools
 from transport.plugin_hub import PluginHub
 
 logger = logging.getLogger("mcp-for-unity-server")
@@ -421,6 +422,7 @@ class UnityInstanceMiddleware(Middleware):
             )
 
         tools = await call_next(context)
+        tools = await self._adapt_custom_tool_schemas(context, tools)
 
         tool_names_from_fastmcp = sorted(getattr(t, "name", "?") for t in tools)
         _diag.debug(
@@ -450,6 +452,133 @@ class UnityInstanceMiddleware(Middleware):
             len(filtered), len(tools), sorted(enabled_tool_names),
         )
         return filtered
+
+    async def _adapt_custom_tool_schemas(
+        self,
+        context: MiddlewareContext,
+        tools: list,
+    ) -> list:
+        """Expose only active-project custom tools with their exact project schema."""
+        try:
+            from services.custom_tool_service import (
+                CustomToolService,
+                resolve_project_id_for_unity_instance,
+            )
+
+            service = CustomToolService.get_instance()
+            custom_names = service.get_global_tool_names()
+        except RuntimeError:
+            return tools
+        if not custom_names:
+            return tools
+
+        ctx = context.fastmcp_context
+        active_instance = await ctx.get_state("unity_instance")
+        project_id = resolve_project_id_for_unity_instance(active_instance)
+        user_id = (await ctx.get_state("user_id")) if config.http_remote_hosted else None
+
+        adapted = []
+        for tool in tools:
+            tool_name = getattr(tool, "name", None)
+            if tool_name not in custom_names:
+                adapted.append(tool)
+                continue
+            if not project_id:
+                continue
+
+            definition = await service.get_tool_definition(
+                project_id,
+                tool_name,
+                user_id=user_id,
+            )
+            if definition is None:
+                continue
+            if not await self._is_group_enabled_for_context(
+                ctx,
+                definition.group or "core",
+            ):
+                continue
+            adapted.append(self._copy_tool_with_definition(tool, definition))
+        return adapted
+
+    @staticmethod
+    async def _is_group_enabled_for_context(ctx, group_name: str) -> bool:
+        enabled = group_name in DEFAULT_ENABLED_GROUPS
+        try:
+            rules = await ctx._get_visibility_rules()
+        except Exception:
+            return enabled
+        tag = f"group:{group_name}"
+        for rule in rules:
+            if tag in (rule.get("tags") or []):
+                enabled = rule.get("enabled", True)
+        return enabled
+
+    @staticmethod
+    def _copy_tool_with_definition(tool, definition):
+        properties: dict[str, dict] = {}
+        required: list[str] = []
+        type_map = {
+            "integer": "integer",
+            "int": "integer",
+            "number": "number",
+            "float": "number",
+            "double": "number",
+            "bool": "boolean",
+            "boolean": "boolean",
+            "array": "array",
+            "list": "array",
+            "object": "object",
+            "dict": "object",
+            "string": "string",
+        }
+        for parameter in definition.parameters:
+            schema: dict[str, object] = {}
+            normalized_type = (parameter.type or "string").lower()
+            json_type = type_map.get(normalized_type)
+            if json_type:
+                schema["type"] = json_type
+            if parameter.description:
+                schema["description"] = parameter.description
+            if parameter.default_value is not None:
+                schema["default"] = UnityInstanceMiddleware._coerce_schema_default(
+                    parameter.default_value,
+                    normalized_type,
+                )
+            properties[parameter.name] = schema
+            if parameter.required:
+                required.append(parameter.name)
+
+        parameters: dict[str, object] = {
+            "type": "object",
+            "properties": properties,
+            "additionalProperties": False,
+        }
+        if required:
+            parameters["required"] = required
+        return tool.model_copy(update={
+            "description": definition.description,
+            "parameters": parameters,
+        })
+
+    @staticmethod
+    def _coerce_schema_default(value: str, parameter_type: str) -> object:
+        try:
+            if parameter_type in {"integer", "int"}:
+                return int(value)
+            if parameter_type in {"number", "float", "double"}:
+                return float(value)
+            if parameter_type in {"bool", "boolean"}:
+                normalized = value.strip().lower()
+                if normalized in {"true", "1", "yes", "on"}:
+                    return True
+                if normalized in {"false", "0", "no", "off"}:
+                    return False
+            if parameter_type in {"array", "list", "object", "dict", "json"}:
+                return json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return value
 
     def _should_filter_tool_listing(self) -> bool:
         transport = (config.transport_mode or "stdio").lower()
@@ -496,9 +625,10 @@ class UnityInstanceMiddleware(Middleware):
                 if only_hash:
                     project_hashes = [only_hash]
             else:
-                # Multiple sessions without explicit selection: use a union so we don't
-                # hide tools that are valid in at least one visible Unity instance.
-                project_hashes = [hash_value for hash_value in session_hashes if hash_value]
+                # A union creates a misleading catalog and may route a call to an
+                # instance that does not implement the advertised tool. Keep only
+                # bootstrap/server tools visible until the caller selects a target.
+                return set()
 
         if not project_hashes:
             return None

@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using UnityEngine;
@@ -121,6 +123,62 @@ namespace MCPForUnityTests.Editor.Tools
             Assert.IsNotNull(message, "Multi-line log entry was not found.");
             StringAssert.Contains($"{firstLine}\n\n{secondLine}", message);
             StringAssert.DoesNotContain("UnityEngine.Debug", message);
+        }
+
+        [Test]
+        public void OpaqueCursor_RoundTripsRawIndexAndRejectsFilterMismatch()
+        {
+            MethodInfo buildFingerprint = typeof(ReadConsole).GetMethod(
+                "BuildFilterFingerprint",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo buildCursor = typeof(ReadConsole).GetMethod(
+                "BuildCursor",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            MethodInfo tryResolve = typeof(ReadConsole).GetMethod(
+                "TryResolveCursor",
+                BindingFlags.NonPublic | BindingFlags.Static);
+
+            Assert.IsNotNull(buildFingerprint);
+            Assert.IsNotNull(buildCursor);
+            Assert.IsNotNull(tryResolve);
+
+            string fingerprint = (string)buildFingerprint.Invoke(
+                null,
+                new object[] { new List<string> { "warning", "error" }, "needle" });
+            string cursor = (string)buildCursor.Invoke(
+                null,
+                new object[] { 123, fingerprint });
+            object[] matchingArgs = { cursor, fingerprint, 0, 0, null };
+
+            bool resolved = (bool)tryResolve.Invoke(null, matchingArgs);
+
+            Assert.IsTrue(resolved);
+            Assert.AreEqual(123, matchingArgs[2]);
+            Assert.AreEqual(0, matchingArgs[3]);
+            Assert.IsNull(matchingArgs[4]);
+
+            object[] mismatchArgs = { cursor, "DIFFERENT", 0, 0, null };
+            bool mismatchResolved = (bool)tryResolve.Invoke(null, mismatchArgs);
+            Assert.IsFalse(mismatchResolved);
+            StringAssert.Contains("does not match", mismatchArgs[4]?.ToString());
+        }
+
+        [Test]
+        public void FilterFingerprint_IsStableAcrossTypeOrderingAndFilterCase()
+        {
+            MethodInfo buildFingerprint = typeof(ReadConsole).GetMethod(
+                "BuildFilterFingerprint",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.IsNotNull(buildFingerprint);
+
+            string first = (string)buildFingerprint.Invoke(
+                null,
+                new object[] { new List<string> { "warning", "error" }, "Needle" });
+            string second = (string)buildFingerprint.Invoke(
+                null,
+                new object[] { new List<string> { "error", "warning" }, "needle" });
+
+            Assert.AreEqual(first, second);
         }
     }
 }

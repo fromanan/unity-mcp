@@ -30,7 +30,7 @@ TOOL_GROUPS: dict[str, str] = {
     "asset_gen": "AI asset generation – 3D model gen/import, 2D image gen & audio gen (bring-your-own-key)",
 }
 
-DEFAULT_ENABLED_GROUPS: set[str] = {"core", "rendering_inspect"}
+DEFAULT_ENABLED_GROUPS: set[str] = {"core", "rendering_inspect", "testing"}
 
 
 def mcp_for_unity_tool(

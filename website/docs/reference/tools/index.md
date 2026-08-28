@@ -75,9 +75,10 @@ ScriptableObject management
 - **[`execute_code`](./scripting_ext/execute_code.md)** — Execute arbitrary C# code inside the Unity Editor.
 - **[`manage_scriptable_object`](./scripting_ext/manage_scriptable_object.md)** — Creates and modifies ScriptableObject assets using Unity SerializedObject property paths.
 
-## `testing` &nbsp; (2 tools)
+## `testing` &nbsp; (3 tools)
 Test runner & async test jobs
 - **[`get_test_job`](./testing/get_test_job.md)** — Polls an async Unity test job by job_id.
+- **[`manage_validation`](./testing/manage_validation.md)** — Creates and records durable validation runs.
 - **[`run_tests`](./testing/run_tests.md)** — Starts a Unity test run asynchronously and returns a job_id immediately.
 
 ## `ui` &nbsp; (1 tool)

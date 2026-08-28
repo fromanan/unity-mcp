@@ -586,8 +586,14 @@ namespace MCPForUnity.Editor.Services
                         ? new EditorStateLastRun
                         {
                             FinishedUnixMs = TestRunStatus.FinishedUnixMs,
-                            Result = "unknown",
-                            Counts = null
+                            Result = TestRunStatus.LastResultState,
+                            Counts = new
+                            {
+                                total = TestRunStatus.LastTotal,
+                                passed = TestRunStatus.LastPassed,
+                                failed = TestRunStatus.LastFailed,
+                                skipped = TestRunStatus.LastSkipped
+                            }
                         }
                         : null
                 },

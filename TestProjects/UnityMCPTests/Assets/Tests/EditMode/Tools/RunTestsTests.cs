@@ -61,5 +61,29 @@ namespace MCPForUnityTests.Editor.Tools
             Assert.AreEqual(false, err.Success);
             Assert.IsTrue(err.Error.Contains("Unknown test mode", StringComparison.OrdinalIgnoreCase));
         }
+
+        [Test]
+        public void HandleCommand_WithZeroMinimumTests_ReturnsError()
+        {
+            var resultObj = MCPForUnity.Editor.Tools.RunTests.HandleCommand(new JObject
+            {
+                ["minimum_tests"] = 0
+            }).GetAwaiter().GetResult();
+
+            Assert.IsInstanceOf<ErrorResponse>(resultObj);
+            StringAssert.Contains("at least 1", ((ErrorResponse)resultObj).Error);
+        }
+
+        [Test]
+        public void HandleCommand_WithUnknownFidelity_ReturnsError()
+        {
+            var resultObj = MCPForUnity.Editor.Tools.RunTests.HandleCommand(new JObject
+            {
+                ["fidelity"] = "approximate"
+            }).GetAwaiter().GetResult();
+
+            Assert.IsInstanceOf<ErrorResponse>(resultObj);
+            StringAssert.Contains("fidelity", ((ErrorResponse)resultObj).Error);
+        }
     }
 }

@@ -102,6 +102,9 @@ class RunTestsStartData(BaseModel):
     mode: str | None = None
     include_details: bool | None = None
     include_failed_tests: bool | None = None
+    fidelity: str | None = None
+    allow_scene_save: bool | None = None
+    coverage: dict[str, Any] | None = None
 
 
 class RunTestsStartResponse(MCPResponse):
@@ -110,10 +113,15 @@ class RunTestsStartResponse(MCPResponse):
 
 class TestJobFailure(BaseModel):
     full_name: str | None = None
+    state: str | None = None
     message: str | None = None
+    stack_trace: str | None = None
+    output: str | None = None
 
 
 class TestJobProgress(BaseModel):
+    selected: int | None = None
+    started: int | None = None
     completed: int | None = None
     total: int | None = None
     current_test_full_name: str | None = None
@@ -130,6 +138,9 @@ class TestJobProgress(BaseModel):
 class GetTestJobData(BaseModel):
     job_id: str
     status: str
+    outcome: str | None = None
+    validation_passed: bool | None = None
+    transport_success: bool | None = None
     mode: str | None = None
     started_unix_ms: int | None = None
     finished_unix_ms: int | None = None
@@ -137,6 +148,10 @@ class GetTestJobData(BaseModel):
     progress: TestJobProgress | None = None
     error: str | None = None
     result: RunTestsResult | None = None
+    fidelity: str | None = None
+    allow_scene_save: bool | None = None
+    coverage: dict[str, Any] | None = None
+    artifacts: dict[str, Any] | None = None
 
 
 class GetTestJobResponse(MCPResponse):
@@ -164,7 +179,7 @@ async def run_tests(
     assembly_names: Annotated[list[str] | str,
                               "Assembly names to filter tests by"] | None = None,
     include_failed_tests: Annotated[bool,
-                                    "Include details for failed/skipped tests only (default: false)"] = False,
+                                    "Include details for failed/skipped tests (default: true)"] = True,
     include_details: Annotated[bool,
                                "Include details for all tests (default: false)"] = False,
     init_timeout: Annotated[int | None,
@@ -173,6 +188,16 @@ async def run_tests(
     clear_stuck: Annotated[bool,
                            "Clear an orphaned running job instead of starting a run. Use when a job "
                            "was lost to a domain reload and is blocking every subsequent run."] = False,
+    minimum_tests: Annotated[int,
+                             "Minimum selected and executed test count required for a pass."] = 1,
+    expected_tests: Annotated[list[str] | str,
+                              "Exact full test names that must appear in the selected-test manifest."] | None = None,
+    fail_on_skipped: Annotated[bool,
+                               "Treat skipped or inconclusive tests as a non-passing outcome."] = True,
+    fidelity: Annotated[Literal["native", "bridge_preserving"],
+                        "native preserves Unity's normal Play Mode behavior; bridge_preserving disables domain reload."] = "native",
+    allow_scene_save: Annotated[bool,
+                                "Explicitly allow Unity to save already-saved dirty scenes before the run."] = False,
 ) -> RunTestsStartResponse | MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)
 
@@ -192,6 +217,8 @@ async def run_tests(
 
     if init_timeout is not None and init_timeout <= 0:
         return MCPResponse(success=False, error="init_timeout must be a positive integer (milliseconds) or None")
+    if minimum_tests < 1:
+        return MCPResponse(success=False, error="minimum_tests must be at least 1")
 
     gate = await preflight(ctx, requires_no_tests=True, wait_for_no_compile=True, refresh_if_dirty=True)
     if isinstance(gate, MCPResponse):
@@ -207,7 +234,15 @@ async def run_tests(
             return result if result else None
         return None
 
-    params: dict[str, Any] = {"mode": mode}
+    params: dict[str, Any] = {
+        "mode": mode,
+        "includeFailedTests": include_failed_tests,
+        "includeDetails": include_details,
+        "minimumTests": minimum_tests,
+        "failOnSkipped": fail_on_skipped,
+        "fidelity": fidelity,
+        "allowSceneSave": allow_scene_save,
+    }
     if (t := _coerce_string_list(test_names)):
         params["testNames"] = t
     if (g := _coerce_string_list(group_names)):
@@ -216,10 +251,8 @@ async def run_tests(
         params["categoryNames"] = c
     if (a := _coerce_string_list(assembly_names)):
         params["assemblyNames"] = a
-    if include_failed_tests:
-        params["includeFailedTests"] = True
-    if include_details:
-        params["includeDetails"] = True
+    if (expected := _coerce_string_list(expected_tests)):
+        params["expectedTests"] = expected
     if init_timeout is not None and init_timeout > 0:
         params["initTimeout"] = init_timeout
 
@@ -249,21 +282,21 @@ async def get_test_job(
     ctx: Context,
     job_id: Annotated[str, "Job id returned by run_tests"],
     include_failed_tests: Annotated[bool,
-                                    "Include details for failed/skipped tests only (default: false)"] = False,
+                                    "Include details for failed/skipped tests (default: true)"] = True,
     include_details: Annotated[bool,
                                "Include details for all tests (default: false)"] = False,
     wait_timeout: Annotated[int | None,
                             "If set, wait up to this many seconds for tests to complete before returning. "
                             "Reduces polling frequency and avoids client-side loop detection. "
                             "Recommended: 30-60 seconds. Returns immediately if tests complete sooner."] = None,
+    allow_focus_nudge: Annotated[bool,
+                                 "Allow OS focus changes when an unfocused Editor appears stalled."] = False,
 ) -> GetTestJobResponse | MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)
 
     params: dict[str, Any] = {"job_id": job_id}
-    if include_failed_tests:
-        params["includeFailedTests"] = True
-    if include_details:
-        params["includeDetails"] = True
+    params["includeFailedTests"] = include_failed_tests
+    params["includeDetails"] = include_details
 
     async def _fetch_status() -> dict[str, Any]:
         return await unity_transport.send_with_unity_instance(
@@ -279,8 +312,7 @@ async def get_test_job(
         poll_interval = 2.0  # Poll Unity every 2 seconds
         prev_last_update_unix_ms = None
 
-        # Get project path once for focus nudging (multi-instance support)
-        project_path = await _get_unity_project_path(unity_instance)
+        project_path = None
 
         while True:
             response = await _fetch_status()
@@ -294,8 +326,11 @@ async def get_test_job(
             # Check if tests are done
             data = response.get("data", {})
             status = data.get("status", "")
-            if status in ("succeeded", "failed", "cancelled"):
-                return GetTestJobResponse(**response)
+            if status in {
+                "passed", "failed", "blocked", "infrastructure_error", "no_tests",
+                "skipped", "aborted", "cancelled",
+            }:
+                return GetTestJobResponse(**response) if response.get("success", True) else MCPResponse(**response)
 
             # Detect progress and reset exponential backoff
             last_update_unix_ms = data.get("last_update_unix_ms")
@@ -313,7 +348,7 @@ async def get_test_job(
             editor_is_focused = progress.get("editor_is_focused", True)
             current_time_ms = int(time.time() * 1000)
 
-            if should_nudge(
+            if allow_focus_nudge and should_nudge(
                 status=status,
                 editor_is_focused=editor_is_focused,
                 last_update_unix_ms=last_update_unix_ms,
@@ -350,7 +385,7 @@ async def get_test_job(
     # detected regardless of polling style.
     data = response.get("data", {})
     status = data.get("status", "")
-    if status == "running":
+    if allow_focus_nudge and status == "running":
         progress = data.get("progress") or {}
         editor_is_focused = progress.get("editor_is_focused", True)
         last_update_unix_ms = data.get("last_update_unix_ms")

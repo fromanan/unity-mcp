@@ -163,18 +163,15 @@ namespace MCPForUnity.Editor.Services
             await _operationLock.WaitAsync().ConfigureAwait(true);
             try
             {
-                var modes = mode.HasValue ? new[] { mode.Value } : AllModes;
+                TestMode[] modes = mode.HasValue ? new[] { mode.Value } : AllModes;
 
-                var results = new List<Dictionary<string, string>>();
-                var seen = new HashSet<string>(StringComparer.Ordinal);
+                List<Dictionary<string, string>> results = new();
+                HashSet<string> seen = new(StringComparer.Ordinal);
 
-                foreach (var m in modes)
+                foreach (TestMode selectedMode in modes)
                 {
-                    var root = await RetrieveTestRootAsync(m).ConfigureAwait(true);
-                    if (root != null)
-                    {
-                        CollectFromNode(root, m, results, seen, new List<string>());
-                    }
+                    ITestAdaptor root = await RetrieveTestRootAsync(selectedMode).ConfigureAwait(true);
+                    CollectFromNode(root, selectedMode, results, seen, new List<string>());
                 }
 
                 return results;
@@ -185,8 +182,12 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
-        public async Task<TestRunResult> RunTestsAsync(TestMode mode, TestFilterOptions filterOptions = null)
+        public async Task<TestRunResult> RunTestsAsync(
+            TestMode mode,
+            TestFilterOptions filterOptions = null,
+            TestExecutionOptions executionOptions = null)
         {
+            executionOptions ??= new TestExecutionOptions();
             await _operationLock.WaitAsync().ConfigureAwait(true);
             Task<TestRunResult> runTask;
             bool adjustedPlayModeOptions = false;
@@ -204,26 +205,22 @@ namespace MCPForUnity.Editor.Services
                     throw new InvalidOperationException("Cannot start a test run while the Editor is in or entering Play Mode. Stop Play Mode and try again.");
                 }
 
-                if (mode == TestMode.PlayMode)
+                if (mode == TestMode.PlayMode &&
+                    executionOptions.Fidelity == TestExecutionFidelity.BridgePreserving)
                 {
-                    // PlayMode runs transition the editor into play across multiple update ticks. Unity's
-                    // built-in pipeline schedules SaveModifiedSceneTask early, but that task uses
-                    // EditorSceneManager.SaveCurrentModifiedScenesIfUserWantsTo which throws once play mode is
-                    // active. To minimize that window we pre-save dirty scenes and disable domain reload (so the
-                    // MCP bridge stays alive). We do NOT force runSynchronously here because that can freeze the
-                    // editor in some projects. If the TestRunner still hits the save task after entering play, the
-                    // run can fail; in that case, rerun from a clean Edit Mode state.
                     adjustedPlayModeOptions = EnsurePlayModeRunsWithoutDomainReload(
                         out originalEnterPlayModeOptionsEnabled,
                         out originalEnterPlayModeOptions);
                 }
+
+                HandleDirtyScenes(executionOptions.AllowSceneSave);
 
                 _leafResults.Clear();
                 _runCompletionSource = new TaskCompletionSource<TestRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
                 // Mark running immediately so readiness snapshots reflect the busy state even before callbacks fire.
                 TestRunStatus.MarkStarted(mode);
 
-                var filter = new Filter
+                Filter filter = new()
                 {
                     testMode = mode,
                     testNames = filterOptions?.TestNames,
@@ -231,17 +228,10 @@ namespace MCPForUnity.Editor.Services
                     categoryNames = filterOptions?.CategoryNames,
                     assemblyNames = filterOptions?.AssemblyNames
                 };
-                var settings = new ExecutionSettings(filter);
+                ExecutionSettings settings = new(filter);
 
-                // Save dirty scenes for all test modes to prevent modal dialogs blocking MCP
-                // (Issue #525: EditMode tests were blocked by save dialog)
-                SaveDirtyScenesIfNeeded();
-
-                // Apply no-throttling preemptively for PlayMode tests. This ensures Unity
-                // isn't throttled during the Play mode transition (which requires multiple
-                // editor frames). Without this, unfocused Unity may never reach RunStarted
-                // where throttling would normally be disabled.
-                if (mode == TestMode.PlayMode)
+                if (mode == TestMode.PlayMode &&
+                    executionOptions.Fidelity == TestExecutionFidelity.BridgePreserving)
                 {
                     TestRunnerNoThrottle.ApplyNoThrottlingPreemptive();
                 }
@@ -304,13 +294,9 @@ namespace MCPForUnity.Editor.Services
             _leafResults.Clear();
             try
             {
-                // Best-effort progress info for async polling (avoid heavy payloads).
-                int? total = null;
-                if (testsToRun != null)
-                {
-                    total = CountLeafTests(testsToRun);
-                }
-                TestJobManager.OnRunStarted(total);
+                List<string> selectedTests = new();
+                CollectLeafTestNames(testsToRun, selectedTests);
+                TestJobManager.OnRunStarted(selectedTests);
             }
             catch
             {
@@ -324,13 +310,17 @@ namespace MCPForUnity.Editor.Services
             // This handles domain reload scenarios (e.g., PlayMode tests) where the TestRunnerService
             // is recreated and _runCompletionSource is lost, but TestJobManager state persists via
             // SessionState and the Test Runner still delivers the RunFinished callback.
-            var payload = TestRunResult.Create(result, _leafResults);
+            TestRunResult payload = TestRunResult.Create(result, _leafResults);
 
             // Clean up state regardless of _runCompletionSource - these methods safely handle
             // the case where no MCP job exists (e.g., manual test runs via Unity UI).
-            TestRunStatus.MarkFinished();
             TestJobManager.OnRunFinished();
-            TestJobManager.FinalizeCurrentJobFromRunFinished(payload);
+            TestJobStatus? validatedOutcome = TestJobManager.FinalizeCurrentJobFromRunFinished(payload);
+            TestRunStatus.MarkFinished(
+                payload,
+                validatedOutcome.HasValue
+                    ? TestJobManager.ToOutcomeString(validatedOutcome.Value)
+                    : null);
 
             // If a domain reload destroyed the original RunTestsAsync caller, the finally block
             // that would normally restore EditorSettings never ran. Restore from SessionState.
@@ -358,7 +348,8 @@ namespace MCPForUnity.Editor.Services
                 {
                     fullName = test?.Name;
                 }
-                TestJobManager.OnTestStarted(fullName);
+                bool isLeaf = test != null && !test.HasChildren;
+                TestJobManager.OnTestStarted(fullName, isLeaf);
             }
             catch
             {
@@ -392,8 +383,8 @@ namespace MCPForUnity.Editor.Services
                         string outcome = result.ResultState;
                         if (!string.IsNullOrWhiteSpace(outcome))
                         {
-                            var o = outcome.Trim().ToLowerInvariant();
-                            isFailure = o.Contains("failed") || o.Contains("error");
+                            string normalizedOutcome = outcome.Trim().ToLowerInvariant();
+                            isFailure = normalizedOutcome.Contains("failed") || normalizedOutcome.Contains("error");
                         }
                         message = result.Message;
                     }
@@ -402,7 +393,13 @@ namespace MCPForUnity.Editor.Services
                         // ignore adaptor quirks
                     }
 
-                    TestJobManager.OnLeafTestFinished(fullName, isFailure, message);
+                    TestJobManager.OnLeafTestFinished(
+                        fullName,
+                        result.ResultState,
+                        isFailure,
+                        message,
+                        result.StackTrace,
+                        result.Output);
                 }
                 catch
                 {
@@ -442,6 +439,34 @@ namespace MCPForUnity.Editor.Services
             return total;
         }
 
+        private static void CollectLeafTestNames(ITestAdaptor node, List<string> output)
+        {
+            if (node == null)
+            {
+                return;
+            }
+
+            if (!node.HasChildren)
+            {
+                string fullName = string.IsNullOrWhiteSpace(node.FullName) ? node.Name : node.FullName;
+                if (!string.IsNullOrWhiteSpace(fullName))
+                {
+                    output.Add(fullName);
+                }
+                return;
+            }
+
+            if (node.Children == null)
+            {
+                return;
+            }
+
+            foreach (ITestAdaptor child in node.Children)
+            {
+                CollectLeafTestNames(child, output);
+            }
+        }
+
         private static bool EnsurePlayModeRunsWithoutDomainReload(
             out bool originalEnterPlayModeOptionsEnabled,
             out EnterPlayModeOptions originalEnterPlayModeOptions)
@@ -476,27 +501,43 @@ namespace MCPForUnity.Editor.Services
             PlayModeOptionsGuard.Clear();
         }
 
-        private static void SaveDirtyScenesIfNeeded()
+        private static void HandleDirtyScenes(bool allowSceneSave)
         {
+            List<Scene> dirtyScenes = new();
             int sceneCount = SceneManager.sceneCount;
             for (int i = 0; i < sceneCount; i++)
             {
-                var scene = SceneManager.GetSceneAt(i);
+                Scene scene = SceneManager.GetSceneAt(i);
                 if (scene.isDirty)
                 {
-                    if (string.IsNullOrEmpty(scene.path))
-                    {
-                        McpLog.Warn($"[TestRunnerService] Skipping unsaved scene '{scene.name}': save it manually before running tests.");
-                        continue;
-                    }
-                    try
-                    {
-                        EditorSceneManager.SaveScene(scene);
-                    }
-                    catch (Exception ex)
-                    {
-                        McpLog.Warn($"[TestRunnerService] Failed to save dirty scene '{scene.name}': {ex.Message}");
-                    }
+                    dirtyScenes.Add(scene);
+                }
+            }
+
+            if (dirtyScenes.Count == 0)
+            {
+                return;
+            }
+
+            string dirtySceneNames = string.Join(", ", dirtyScenes.Select(scene =>
+                string.IsNullOrWhiteSpace(scene.path) ? $"{scene.name} (unsaved)" : scene.path));
+            if (!allowSceneSave)
+            {
+                throw new TestRunBlockedException(
+                    $"dirty_scenes: {dirtySceneNames}. Save them explicitly or rerun with allow_scene_save=true.");
+            }
+
+            foreach (Scene scene in dirtyScenes)
+            {
+                if (string.IsNullOrWhiteSpace(scene.path))
+                {
+                    throw new TestRunBlockedException(
+                        $"unsaved_scene: {scene.name}. Save it explicitly before running tests.");
+                }
+
+                if (!EditorSceneManager.SaveScene(scene))
+                {
+                    throw new TestRunBlockedException($"scene_save_failed: {scene.path}");
                 }
             }
         }
@@ -518,8 +559,7 @@ namespace MCPForUnity.Editor.Services
             var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(30))).ConfigureAwait(true);
             if (completed != tcs.Task)
             {
-                McpLog.Warn($"[TestRunnerService] Timeout waiting for test retrieval callback for {mode}");
-                return null;
+                throw new TimeoutException($"Timed out waiting for Unity test discovery in {mode} mode.");
             }
 
             try
@@ -528,8 +568,8 @@ namespace MCPForUnity.Editor.Services
             }
             catch (Exception ex)
             {
-                McpLog.Error($"[TestRunnerService] Error retrieving tests for {mode}: {ex.Message}\n{ex.StackTrace}");
-                return null;
+                throw new InvalidOperationException(
+                    $"Unity test discovery failed in {mode} mode: {ex.Message}", ex);
             }
         }
 

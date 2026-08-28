@@ -129,6 +129,8 @@ class PluginHub(WebSocketEndpoint):
     # Timeout (seconds) for fast-fail commands like ping/read_console/get_editor_state.
     # Keep short so MCP clients aren't blocked during Unity compilation/reload/unfocused throttling.
     FAST_FAIL_TIMEOUT = 2.0
+    SESSION_QUEUE_TIMEOUT = 30.0
+    MAX_SESSION_QUEUE = 32
     # Fast-path commands should never block the client for long; return a retry hint instead.
     # This helps avoid the Cursor-side ~30s tool-call timeout when Unity is compiling/reloading
     # or is throttled while unfocused.
@@ -141,6 +143,8 @@ class PluginHub(WebSocketEndpoint):
     _connections: dict[str, WebSocket] = {}
     # command_id -> {"future": Future, "session_id": str}
     _pending: dict[str, dict[str, Any]] = {}
+    _command_gates: ClassVar[dict[str, asyncio.Lock]] = {}
+    _command_waiters: ClassVar[dict[str, int]] = {}
     _lock: asyncio.Lock | None = None
     _loop: asyncio.AbstractEventLoop | None = None
     # session_id -> last pong timestamp (monotonic)
@@ -160,6 +164,8 @@ class PluginHub(WebSocketEndpoint):
         cls._loop = loop or asyncio.get_running_loop()
         # Ensure coordination primitives are bound to the configured loop
         cls._lock = asyncio.Lock()
+        cls._command_gates = {}
+        cls._command_waiters = {}
         # Start tracking MCP client sessions for tool-change notifications
         if mcp is not None:
             _install_session_tracking()
@@ -185,6 +191,8 @@ class PluginHub(WebSocketEndpoint):
             cls._ping_tasks.clear()
             cls._last_pong.clear()
             cls._pending.clear()
+            cls._command_gates.clear()
+            cls._command_waiters.clear()
         for task in ping_tasks:
             if not task.done():
                 task.cancel()
@@ -345,6 +353,71 @@ class PluginHub(WebSocketEndpoint):
     # ------------------------------------------------------------------
     @classmethod
     async def send_command(cls, session_id: str, command_type: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Queue commands per Unity instance so only one reaches its main thread at a time."""
+        lock = cls._lock
+        if lock is None:
+            raise RuntimeError("PluginHub not configured")
+
+        queue_wait_s = (
+            float(cls.FAST_FAIL_TIMEOUT)
+            if command_type in cls._FAST_FAIL_COMMANDS
+            else float(cls.SESSION_QUEUE_TIMEOUT)
+        )
+        async with lock:
+            gate = cls._command_gates.setdefault(session_id, asyncio.Lock())
+            queue_depth = cls._command_waiters.get(session_id, 0)
+            if queue_depth >= cls.MAX_SESSION_QUEUE:
+                return MCPResponse(
+                    success=False,
+                    error="busy",
+                    message="Unity command queue is full for this instance.",
+                    hint="retry",
+                    data={
+                        "reason": "session_command_queue_full",
+                        "queue_depth": queue_depth,
+                        "retry_after_ms": 250,
+                    },
+                ).model_dump()
+            cls._command_waiters[session_id] = queue_depth + 1
+
+        try:
+            await asyncio.wait_for(gate.acquire(), timeout=queue_wait_s)
+        except asyncio.TimeoutError:
+            async with lock:
+                remaining = max(0, cls._command_waiters.get(session_id, 1) - 1)
+                if remaining:
+                    cls._command_waiters[session_id] = remaining
+                else:
+                    cls._command_waiters.pop(session_id, None)
+            return MCPResponse(
+                success=False,
+                error="busy",
+                message="Timed out waiting for this Unity instance's command queue.",
+                hint="retry",
+                data={
+                    "reason": "session_command_queue_timeout",
+                    "queue_depth": queue_depth,
+                    "retry_after_ms": 250,
+                },
+            ).model_dump()
+
+        async with lock:
+            remaining = max(0, cls._command_waiters.get(session_id, 1) - 1)
+            if remaining:
+                cls._command_waiters[session_id] = remaining
+            else:
+                cls._command_waiters.pop(session_id, None)
+
+        try:
+            return await cls._send_command_unqueued(session_id, command_type, params)
+        finally:
+            gate.release()
+            async with lock:
+                if not gate.locked() and cls._command_waiters.get(session_id, 0) == 0:
+                    cls._command_gates.pop(session_id, None)
+
+    @classmethod
+    async def _send_command_unqueued(cls, session_id: str, command_type: str, params: dict[str, Any]) -> dict[str, Any]:
         websocket = await cls._get_connection(session_id)
         command_id = str(uuid.uuid4())
         future: asyncio.Future = asyncio.get_running_loop().create_future()

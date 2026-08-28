@@ -3,6 +3,9 @@ using System.Collections.Generic;
 using System.Reflection;
 using NUnit.Framework;
 using MCPForUnity.Editor.Services;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
 
 namespace MCPForUnityTests.Editor.Services
 {
@@ -120,9 +123,9 @@ namespace MCPForUnityTests.Editor.Services
             // Act: GetJob should auto-fail because 20s > 15s default
             var result = _getJobMethod.Invoke(null, new object[] { "test-init-timeout-default" });
 
-            // Assert: job should be failed
+            // Assert: an initialization timeout is infrastructure failure, not a test assertion failure.
             var status = (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result);
-            Assert.AreEqual(TestJobStatus.Failed, status,
+            Assert.AreEqual(TestJobStatus.InfrastructureError, status,
                 "Job with default timeout should auto-fail after 20s");
         }
 
@@ -163,6 +166,121 @@ namespace MCPForUnityTests.Editor.Services
             var restoredTimeout = (long)_testJobType.GetProperty("InitTimeoutMs").GetValue(restoredJob);
             Assert.AreEqual(90_000L, restoredTimeout,
                 "InitTimeoutMs should survive persist/restore cycle");
+        }
+    }
+
+    public class TestJobManagerOutcomeTests
+    {
+        private static TestRunResult Result(
+            int total,
+            int passed,
+            int failed,
+            int skipped,
+            string state)
+        {
+            return new TestRunResult(
+                new TestRunSummary(total, passed, failed, skipped, 0.1, state),
+                Array.Empty<TestRunTestResult>());
+        }
+
+        private static TestJob Job(int selected, int completed)
+        {
+            return new TestJob
+            {
+                TotalTests = selected,
+                CompletedTests = completed,
+                MinimumExpectedTests = 1,
+                FailOnSkipped = true,
+                SelectedTestNames = new List<string> { "Suite.Test" },
+                ExpectedTestNames = new List<string>()
+            };
+        }
+
+        [Test]
+        public void EvaluateOutcome_ZeroTests_IsNoTests()
+        {
+            TestJobStatus status = TestJobManager.EvaluateOutcome(
+                Job(0, 0), Result(0, 0, 0, 0, "Passed"), out _, out _);
+
+            Assert.AreEqual(TestJobStatus.NoTests, status);
+        }
+
+        [Test]
+        public void EvaluateOutcome_SkippedTests_IsSkipped()
+        {
+            TestJobStatus status = TestJobManager.EvaluateOutcome(
+                Job(1, 1), Result(1, 0, 0, 1, "Skipped"), out _, out _);
+
+            Assert.AreEqual(TestJobStatus.Skipped, status);
+        }
+
+        [Test]
+        public void EvaluateOutcome_IncompleteRun_IsAborted()
+        {
+            TestJobStatus status = TestJobManager.EvaluateOutcome(
+                Job(2, 1), Result(1, 1, 0, 0, "Passed"), out _, out _);
+
+            Assert.AreEqual(TestJobStatus.Aborted, status);
+        }
+
+        [Test]
+        public void EvaluateOutcome_MissingExpectedTest_IsBlocked()
+        {
+            TestJob job = Job(1, 1);
+            job.ExpectedTestNames = new List<string> { "Suite.Required" };
+
+            TestJobStatus status = TestJobManager.EvaluateOutcome(
+                job, Result(1, 1, 0, 0, "Passed"), out _, out List<string> missing);
+
+            Assert.AreEqual(TestJobStatus.Blocked, status);
+            CollectionAssert.AreEqual(new[] { "Suite.Required" }, missing);
+        }
+
+        [Test]
+        public void EvaluateOutcome_CompletePassingRun_IsPassed()
+        {
+            TestJobStatus status = TestJobManager.EvaluateOutcome(
+                Job(1, 1), Result(1, 1, 0, 0, "Passed"), out string error, out _);
+
+            Assert.AreEqual(TestJobStatus.Passed, status);
+            Assert.IsNull(error);
+        }
+    }
+
+    public class TestRunnerServiceDirtySceneTests
+    {
+        [Test]
+        public void HandleDirtyScenes_WithoutExplicitPermission_BlocksAndDoesNotSave()
+        {
+            Scene originalScene = SceneManager.GetActiveScene();
+            Assert.IsFalse(originalScene.isDirty, "This test will not replace a dirty user scene.");
+            string originalPath = originalScene.path;
+            string temporaryPath = $"Assets/MCPForUnity_DirtySceneGuard_{Guid.NewGuid():N}.unity";
+            Scene scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            Assert.IsTrue(EditorSceneManager.SaveScene(scene, temporaryPath));
+            EditorSceneManager.MarkSceneDirty(scene);
+            MethodInfo handleDirtyScenes = typeof(TestRunnerService).GetMethod(
+                "HandleDirtyScenes",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            Assert.NotNull(handleDirtyScenes);
+
+            try
+            {
+                TargetInvocationException invocation = Assert.Throws<TargetInvocationException>(
+                    () => handleDirtyScenes.Invoke(null, new object[] { false }));
+                Assert.IsInstanceOf<TestRunBlockedException>(invocation.InnerException);
+                Assert.IsTrue(scene.isDirty, "The guard must not save or clear the dirty scene.");
+                Assert.AreEqual(temporaryPath, scene.path);
+            }
+            finally
+            {
+                EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                AssetDatabase.DeleteAsset(temporaryPath);
+                if (!string.IsNullOrWhiteSpace(originalPath))
+                {
+                    EditorSceneManager.OpenScene(originalPath, OpenSceneMode.Single);
+                }
+            }
         }
     }
 }

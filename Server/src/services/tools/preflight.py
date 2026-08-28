@@ -20,7 +20,27 @@ def _busy(reason: str, retry_after_ms: int) -> MCPResponse:
         error="busy",
         message=reason,
         hint="retry",
-        data={"reason": reason, "retry_after_ms": int(retry_after_ms)},
+        data={
+            "reason": reason,
+            "retry_after_ms": int(retry_after_ms),
+            "outcome": "blocked",
+            "validation_passed": False,
+        },
+    )
+
+
+def _infrastructure_error(reason: str, retry_after_ms: int = 500) -> MCPResponse:
+    return MCPResponse(
+        success=False,
+        error="infrastructure_error",
+        message=reason,
+        hint="retry",
+        data={
+            "reason": reason,
+            "retry_after_ms": int(retry_after_ms),
+            "outcome": "infrastructure_error",
+            "validation_passed": False,
+        },
     )
 
 
@@ -49,16 +69,14 @@ async def preflight(
         state = state_resp.model_dump() if hasattr(
             state_resp, "model_dump") else state_resp
     except Exception:
-        # If we cannot determine readiness, fall back to proceeding (tools already contain retry logic).
-        return None
+        return _infrastructure_error("editor_state_unavailable")
 
     if not isinstance(state, dict) or not state.get("success", False):
-        # Unknown state; proceed rather than blocking (avoids false positives when Unity is reachable but status isn't).
-        return None
+        return _infrastructure_error("editor_state_unavailable")
 
     data = state.get("data")
     if not isinstance(data, dict):
-        return None
+        return _infrastructure_error("invalid_editor_state")
 
     # Optional refresh-if-dirty
     if refresh_if_dirty:
@@ -68,8 +86,7 @@ async def preflight(
                 from services.tools.refresh_unity import refresh_unity
                 await refresh_unity(ctx, mode="if_dirty", scope="all", compile="request", wait_for_ready=True)
             except Exception:
-                # Best-effort only; fall through to normal tool dispatch.
-                pass
+                return _infrastructure_error("asset_refresh_failed", 1000)
 
     # Tests running: fail fast for tools that require exclusivity.
     if requires_no_tests:
@@ -101,10 +118,14 @@ async def preflight(
                     state_resp, "model_dump") else state_resp
                 data = state.get("data") if isinstance(state, dict) else None
                 if not isinstance(data, dict):
-                    return None
+                    return _infrastructure_error("invalid_editor_state")
             except Exception:
-                return None
+                return _infrastructure_error("editor_state_unavailable")
 
-    # Staleness: if the snapshot is stale, proceed (tools will still run), but callers that read resources can back off.
-    # In future we may make this strict for some tools.
+    advice = data.get("advice")
+    if isinstance(advice, dict):
+        blocking_reasons = advice.get("blocking_reasons")
+        if isinstance(blocking_reasons, list) and "stale_status" in blocking_reasons:
+            return _infrastructure_error("stale_editor_state")
+
     return None

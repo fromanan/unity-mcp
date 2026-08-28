@@ -42,11 +42,46 @@ namespace MCPForUnity.Editor.Tools
 
                 var p = new ToolParams(@params);
                 bool includeDetails = p.GetBool("includeDetails");
-                bool includeFailedTests = p.GetBool("includeFailedTests");
+                bool includeFailedTests = p.GetBool("includeFailedTests", true);
+                int minimumExpectedTests = p.GetInt("minimumTests", 1) ?? 1;
+                if (minimumExpectedTests < 1)
+                {
+                    return Task.FromResult<object>(new ErrorResponse("minimum_tests must be at least 1."));
+                }
 
-                var filterOptions = GetFilterOptions(@params);
+                string fidelityValue = p.Get("fidelity", "native");
+                TestExecutionFidelity fidelity;
+                if (string.Equals(fidelityValue, "native", StringComparison.OrdinalIgnoreCase))
+                {
+                    fidelity = TestExecutionFidelity.Native;
+                }
+                else if (string.Equals(fidelityValue, "bridge_preserving", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(fidelityValue, "bridge-preserving", StringComparison.OrdinalIgnoreCase))
+                {
+                    fidelity = TestExecutionFidelity.BridgePreserving;
+                }
+                else
+                {
+                    return Task.FromResult<object>(new ErrorResponse(
+                        "fidelity must be either 'native' or 'bridge_preserving'."));
+                }
+
+                TestFilterOptions filterOptions = GetFilterOptions(@params);
                 long initTimeoutMs = p.GetInt("initTimeout") ?? 0;
-                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, initTimeoutMs);
+                TestJobOptions options = new()
+                {
+                    IncludeDetails = includeDetails,
+                    IncludeFailedTests = includeFailedTests,
+                    MinimumExpectedTests = minimumExpectedTests,
+                    ExpectedTestNames = p.GetStringArray("expectedTests"),
+                    FailOnSkipped = p.GetBool("failOnSkipped", true),
+                    Execution = new TestExecutionOptions
+                    {
+                        Fidelity = fidelity,
+                        AllowSceneSave = p.GetBool("allowSceneSave", false)
+                    }
+                };
+                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, initTimeoutMs, options);
 
                 return Task.FromResult<object>(new SuccessResponse("Test job started.", new
                 {
@@ -54,7 +89,15 @@ namespace MCPForUnity.Editor.Tools
                     status = "running",
                     mode = parsedMode.Value.ToString(),
                     include_details = includeDetails,
-                    include_failed_tests = includeFailedTests
+                    include_failed_tests = includeFailedTests,
+                    fidelity = fidelity == TestExecutionFidelity.Native ? "native" : "bridge_preserving",
+                    allow_scene_save = options.Execution.AllowSceneSave,
+                    coverage = new
+                    {
+                        minimum_expected_tests = minimumExpectedTests,
+                        expected_test_names = options.ExpectedTestNames,
+                        fail_on_skipped = options.FailOnSkipped
+                    }
                 }));
             }
             catch (Exception ex)

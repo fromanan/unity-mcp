@@ -4,6 +4,26 @@ using UnityEditor.TestTools.TestRunner.Api;
 
 namespace MCPForUnity.Editor.Services
 {
+    public enum TestExecutionFidelity
+    {
+        Native,
+        BridgePreserving
+    }
+
+    public sealed class TestExecutionOptions
+    {
+        public TestExecutionFidelity Fidelity { get; set; } = TestExecutionFidelity.Native;
+        public bool AllowSceneSave { get; set; }
+    }
+
+    public sealed class TestRunBlockedException : System.Exception
+    {
+        public TestRunBlockedException(string reason)
+            : base(reason)
+        {
+        }
+    }
+
     /// <summary>
     /// Options for filtering which tests to run.
     /// All properties are optional - null or empty arrays are ignored.
@@ -47,6 +67,9 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         /// <param name="mode">The test mode (EditMode or PlayMode).</param>
         /// <param name="filterOptions">Optional filter options to run specific tests. Pass null to run all tests.</param>
-        Task<TestRunResult> RunTestsAsync(TestMode mode, TestFilterOptions filterOptions = null);
+        Task<TestRunResult> RunTestsAsync(
+            TestMode mode,
+            TestFilterOptions filterOptions = null,
+            TestExecutionOptions executionOptions = null);
     }
 }

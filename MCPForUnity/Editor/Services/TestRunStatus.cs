@@ -17,6 +17,11 @@ namespace MCPForUnity.Editor.Services
         private static TestMode? _mode;
         private static long? _startedUnixMs;
         private static long? _finishedUnixMs;
+        private static string _lastResultState;
+        private static int? _lastTotal;
+        private static int? _lastPassed;
+        private static int? _lastFailed;
+        private static int? _lastSkipped;
 
         public static bool IsRunning
         {
@@ -38,6 +43,31 @@ namespace MCPForUnity.Editor.Services
             get { lock (LockObj) return _finishedUnixMs; }
         }
 
+        public static string LastResultState
+        {
+            get { lock (LockObj) return _lastResultState; }
+        }
+
+        public static int? LastTotal
+        {
+            get { lock (LockObj) return _lastTotal; }
+        }
+
+        public static int? LastPassed
+        {
+            get { lock (LockObj) return _lastPassed; }
+        }
+
+        public static int? LastFailed
+        {
+            get { lock (LockObj) return _lastFailed; }
+        }
+
+        public static int? LastSkipped
+        {
+            get { lock (LockObj) return _lastSkipped; }
+        }
+
         public static void MarkStarted(TestMode mode)
         {
             lock (LockObj)
@@ -46,18 +76,31 @@ namespace MCPForUnity.Editor.Services
                 _mode = mode;
                 _startedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _finishedUnixMs = null;
+                _lastResultState = null;
+                _lastTotal = null;
+                _lastPassed = null;
+                _lastFailed = null;
+                _lastSkipped = null;
             }
 
             NotifyStateChanged();
         }
 
-        public static void MarkFinished()
+        public static void MarkFinished(TestRunResult result = null, string validatedOutcome = null)
         {
             lock (LockObj)
             {
                 _isRunning = false;
                 _finishedUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                 _mode = null;
+                if (result != null)
+                {
+                    _lastResultState = validatedOutcome ?? result.Summary.ResultState;
+                    _lastTotal = result.Total;
+                    _lastPassed = result.Passed;
+                    _lastFailed = result.Failed;
+                    _lastSkipped = result.Skipped;
+                }
             }
 
             NotifyStateChanged();

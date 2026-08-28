@@ -99,6 +99,8 @@ async def configured_plugin_hub(plugin_registry):
     PluginHub._loop = None
     PluginHub._connections.clear()
     PluginHub._pending.clear()
+    PluginHub._command_gates.clear()
+    PluginHub._command_waiters.clear()
 
 
 # ============================================================================
@@ -1082,6 +1084,61 @@ class TestPluginHubCommandRouting:
         # unity_timeout_s = max(30, 100) = 100
         # server_wait_s = max(30, 100 + 5) = 105
         assert True  # This is implicit in send_command implementation
+
+    @pytest.mark.asyncio
+    async def test_send_command_serializes_commands_per_session(
+        self, configured_plugin_hub, monkeypatch
+    ):
+        active = 0
+        maximum_active = 0
+
+        async def fake_unqueued(cls, session_id, command_type, params):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"status": "success", "result": {"name": command_type}}
+
+        monkeypatch.setattr(
+            PluginHub,
+            "_send_command_unqueued",
+            classmethod(fake_unqueued),
+        )
+        results = await asyncio.gather(
+            PluginHub.send_command("session-a", "one", {}),
+            PluginHub.send_command("session-a", "two", {}),
+            PluginHub.send_command("session-a", "three", {}),
+        )
+
+        assert maximum_active == 1
+        assert [result["result"]["name"] for result in results] == ["one", "two", "three"]
+
+    @pytest.mark.asyncio
+    async def test_send_command_allows_parallelism_across_sessions(
+        self, configured_plugin_hub, monkeypatch
+    ):
+        entered = set()
+        both_entered = asyncio.Event()
+
+        async def fake_unqueued(cls, session_id, command_type, params):
+            entered.add(session_id)
+            if len(entered) == 2:
+                both_entered.set()
+            await asyncio.wait_for(both_entered.wait(), timeout=0.2)
+            return {"status": "success", "result": {"session": session_id}}
+
+        monkeypatch.setattr(
+            PluginHub,
+            "_send_command_unqueued",
+            classmethod(fake_unqueued),
+        )
+        await asyncio.gather(
+            PluginHub.send_command("session-a", "one", {}),
+            PluginHub.send_command("session-b", "two", {}),
+        )
+
+        assert entered == {"session-a", "session-b"}
 
 
 # ============================================================================

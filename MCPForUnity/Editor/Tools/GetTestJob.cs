@@ -21,7 +21,7 @@ namespace MCPForUnity.Editor.Tools
 
             var p = new ToolParams(@params);
             bool includeDetails = p.GetBool("includeDetails");
-            bool includeFailedTests = p.GetBool("includeFailedTests");
+            bool includeFailedTests = p.GetBool("includeFailedTests", true);
 
             var job = TestJobManager.GetJob(jobId);
             if (job == null)
@@ -29,7 +29,11 @@ namespace MCPForUnity.Editor.Tools
                 return new ErrorResponse("Unknown job_id.");
             }
 
-            var payload = TestJobManager.ToSerializable(job, includeDetails, includeFailedTests);
+            object payload = TestJobManager.ToSerializable(job, includeDetails, includeFailedTests);
+            if (job.Status != TestJobStatus.Running && job.Status != TestJobStatus.Passed)
+            {
+                return new ErrorResponse("validation_failed", payload);
+            }
             return new SuccessResponse("Test job status retrieved.", payload);
         }
     }

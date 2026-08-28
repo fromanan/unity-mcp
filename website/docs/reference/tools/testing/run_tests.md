@@ -23,10 +23,15 @@ Starts a Unity test run asynchronously and returns a job_id immediately. Poll wi
 | `group_names` | `list[str] \| str \| None` | — | Same as test_names, except it allows for Regex |
 | `category_names` | `list[str] \| str \| None` | — | NUnit category names to filter by |
 | `assembly_names` | `list[str] \| str \| None` | — | Assembly names to filter tests by |
-| `include_failed_tests` | `bool` | — | Include details for failed/skipped tests only (default: false) |
+| `include_failed_tests` | `bool` | — | Include details for failed/skipped tests (default: true) |
 | `include_details` | `bool` | — | Include details for all tests (default: false) |
 | `init_timeout` | `int \| None` | — | Initialization timeout in milliseconds. PlayMode tests may need longer due to domain reload (default: 15000). Recommended: 120000 for PlayMode. |
 | `clear_stuck` | `bool` | — | Clear an orphaned running job instead of starting a run. Use when a job was lost to a domain reload and is blocking every subsequent run. |
+| `minimum_tests` | `int` | — | Minimum selected and executed test count required for a pass. |
+| `expected_tests` | `list[str] \| str \| None` | — | Exact full test names that must appear in the selected-test manifest. |
+| `fail_on_skipped` | `bool` | — | Treat skipped or inconclusive tests as a non-passing outcome. |
+| `fidelity` | `Literal['native', 'bridge_preserving']` | — | native preserves Unity's normal Play Mode behavior; bridge_preserving disables domain reload. |
+| `allow_scene_save` | `bool` | — | Explicitly allow Unity to save already-saved dirty scenes before the run. |
 
 ## Returns
 

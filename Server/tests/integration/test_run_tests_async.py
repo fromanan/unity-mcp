@@ -28,6 +28,11 @@ async def test_run_tests_async_forwards_params(monkeypatch):
     assert captured["params"]["mode"] == "EditMode"
     assert captured["params"]["testNames"] == ["MyNamespace.MyTests.TestA"]
     assert captured["params"]["includeDetails"] is True
+    assert captured["params"]["includeFailedTests"] is True
+    assert captured["params"]["minimumTests"] == 1
+    assert captured["params"]["failOnSkipped"] is True
+    assert captured["params"]["fidelity"] == "native"
+    assert captured["params"]["allowSceneSave"] is False
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "abc123"
@@ -91,6 +96,15 @@ async def test_run_tests_rejects_zero_init_timeout():
     resp = await run_tests(DummyContext(), mode="EditMode", init_timeout=0)
     assert resp.success is False
     assert "init_timeout" in resp.error
+
+
+@pytest.mark.asyncio
+async def test_run_tests_rejects_zero_minimum_tests():
+    from services.tools.run_tests import run_tests
+
+    resp = await run_tests(DummyContext(), minimum_tests=0)
+    assert resp.success is False
+    assert "minimum_tests" in resp.error
 
 
 @pytest.mark.asyncio
@@ -195,6 +209,35 @@ async def test_get_test_job_forwards_job_id(monkeypatch):
     resp = await get_test_job(DummyContext(), job_id="job-1")
     assert captured["command_type"] == "get_test_job"
     assert captured["params"]["job_id"] == "job-1"
+    assert captured["params"]["includeFailedTests"] is True
+    assert captured["params"]["includeDetails"] is False
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_does_not_nudge_focus_without_opt_in(monkeypatch):
+    from services.tools.run_tests import get_test_job
+    import services.tools.run_tests as mod
+
+    async def fake_send_with_unity_instance(*args, **kwargs):
+        return {
+            "success": True,
+            "data": {
+                "job_id": "job-1",
+                "status": "running",
+                "last_update_unix_ms": 1,
+                "progress": {"editor_is_focused": False},
+            },
+        }
+
+    async def unexpected_nudge(*args, **kwargs):
+        raise AssertionError("focus nudge must be explicitly enabled")
+
+    monkeypatch.setattr(mod.unity_transport, "send_with_unity_instance", fake_send_with_unity_instance)
+    monkeypatch.setattr(mod, "should_nudge", lambda **kwargs: True)
+    monkeypatch.setattr(mod, "nudge_unity_focus", unexpected_nudge)
+
+    resp = await get_test_job(DummyContext(), job_id="job-1")
+    assert resp.success is True

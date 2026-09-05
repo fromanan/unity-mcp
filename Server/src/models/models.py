@@ -5,9 +5,11 @@ from pydantic import BaseModel, Field
 
 class MCPResponse(BaseModel):
     success: bool
+    code: str | None = None
     message: str | None = None
     error: str | None = None
     data: Any | None = None
+    warnings: Any | None = None
     # Optional hint for clients about how to handle the response.
     # Supported values:
     #   - "retry": Unity is temporarily reloading; call should be retried politely.

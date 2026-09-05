@@ -51,9 +51,6 @@ async def wait_for_editor_ready(ctx: Context, timeout_s: float = 30.0) -> tuple[
             if isinstance(advice, dict):
                 if advice.get("ready_for_tools") is True:
                     return (True, time.monotonic() - start)
-                blocking = set(advice.get("blocking_reasons") or [])
-                if not (blocking & _REAL_BLOCKING_REASONS):
-                    return (True, time.monotonic() - start)
         except Exception:
             pass  # not ready yet — keep polling
         await asyncio.sleep(0.25)

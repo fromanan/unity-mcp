@@ -30,7 +30,8 @@ from transport.models import (
     EditorStateMessage,
     EditorHeartbeatMessage,
     CommandResultMessage,
-    PongMessage,
+    PluginReadyMessage,
+    ClientLifecycleMessage,
     SessionList,
     SessionDetails,
 )
@@ -99,14 +100,16 @@ async def configured_plugin_hub(plugin_registry):
     PluginHub._loop = None
     PluginHub._connections.clear()
     PluginHub._session_by_websocket_id.clear()
+    PluginHub._connection_id_by_session.clear()
     PluginHub._pending.clear()
     PluginHub._command_gates.clear()
     PluginHub._command_waiters.clear()
     PluginHub._command_waiter_bytes.clear()
-    PluginHub._last_pong.clear()
-    for task in PluginHub._ping_tasks.values():
+    PluginHub._pending_registrations.clear()
+    for task in PluginHub._registration_timeout_tasks.values():
         task.cancel()
-    PluginHub._ping_tasks.clear()
+    PluginHub._registration_timeout_tasks.clear()
+    PluginHub._reloading_sessions.clear()
 
 
 # ============================================================================
@@ -1058,10 +1061,10 @@ class TestPluginHubMessageHandling:
         message = WelcomeMessage(
             serverTimeout=30,
             keepAliveInterval=10,
-            capabilities=["editor_state_push_v1"],
+            capabilities=["editor_state_push_v1", "plugin_ready_ack_v1"],
         )
 
-        assert message.capabilities == ["editor_state_push_v1"]
+        assert message.capabilities == ["editor_state_push_v1", "plugin_ready_ack_v1"]
 
     def test_editor_state_publication_messages_parse(self):
         state_message = EditorStateMessage(
@@ -1137,16 +1140,19 @@ class TestPluginHubMessageHandling:
         assert result_msg.id == "cmd-123"
         assert result_msg.result["success"] is True
 
-    def test_pong_message_parsing(self):
-        """
-        Current behavior: PongMessage can include optional session_id.
-        """
-        pong_msg = PongMessage(
-            type="pong",
-            session_id="sess-123"
+    def test_ready_and_lifecycle_messages_parse(self):
+        ready_message = PluginReadyMessage(
+            session_id="sess-123",
+            connection_id="connection-1",
+        )
+        lifecycle_message = ClientLifecycleMessage(
+            state="reloading",
+            session_id="sess-123",
+            connection_id="connection-1",
         )
 
-        assert pong_msg.session_id == "sess-123"
+        assert ready_message.connection_id == "connection-1"
+        assert lifecycle_message.state == "reloading"
 
 
 # ============================================================================
@@ -1691,7 +1697,7 @@ class TestTransportEdgeCases:
         """
         Current behavior: PluginHub defines standard timeout constants.
         """
-        assert PluginHub.KEEP_ALIVE_INTERVAL == 15
+        assert PluginHub.KEEP_ALIVE_INTERVAL == 20
         assert PluginHub.SERVER_TIMEOUT == 30
         assert PluginHub.COMMAND_TIMEOUT == 30
         assert PluginHub.FAST_FAIL_TIMEOUT == 2.0

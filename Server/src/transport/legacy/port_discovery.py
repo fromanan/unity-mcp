@@ -107,10 +107,10 @@ class PortDiscovery:
                         return False
                     return b'"message":"pong"' in response
                 except Exception as e:
-                    logger.debug(f"Port probe failed for {port}: {e}")
+                    logger.debug("Port probe failed for %s: %s", port, e)
                     return False
         except Exception as e:
-            logger.debug(f"Connection failed for port {port}: {e}")
+            logger.debug("Connection failed for port %s: %s", port, e)
             return False
 
     @staticmethod
@@ -145,7 +145,7 @@ class PortDiscovery:
         if status:
             port = status.get('unity_port')
             if isinstance(port, int) and PortDiscovery._try_probe_unity_mcp(port):
-                logger.info(f"Using Unity port from status: {port}")
+                logger.info("Using Unity port from status: %s", port)
                 return port
 
         candidates = PortDiscovery.list_candidate_files()
@@ -165,7 +165,7 @@ class PortDiscovery:
                             f"Using Unity port from {path.name}: {unity_port}")
                         return unity_port
             except Exception as e:
-                logger.warning(f"Could not read port registry {path}: {e}")
+                logger.warning("Could not read port registry %s: %s", path, e)
 
         if first_seen_port is not None:
             logger.info(

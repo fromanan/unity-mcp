@@ -25,10 +25,18 @@ namespace MCPForUnity.Editor.Helpers
         [JsonIgnore]
         public object data => Data;
 
-        public SuccessResponse(string message, object data = null)
+        /// <summary>Gets optional non-fatal diagnostics captured while processing the request.</summary>
+        [JsonProperty("warnings", NullValueHandling = NullValueHandling.Ignore)]
+        public object Warnings { get; }
+
+        [JsonIgnore]
+        public object warnings => Warnings;
+
+        public SuccessResponse(string message, object data = null, object warnings = null)
         {
             Message = message;
             Data = data;
+            Warnings = warnings;
         }
     }
 
@@ -52,6 +60,20 @@ namespace MCPForUnity.Editor.Helpers
         [JsonIgnore]
         public string error => Error;
 
+        /// <summary>Gets the human-readable failure description.</summary>
+        [JsonProperty("message", NullValueHandling = NullValueHandling.Ignore)]
+        public string Message { get; }
+
+        [JsonIgnore]
+        public string message => Message;
+
+        /// <summary>Gets optional client guidance for resolving the failure.</summary>
+        [JsonProperty("hint", NullValueHandling = NullValueHandling.Ignore)]
+        public string Hint { get; }
+
+        [JsonIgnore]
+        public string hint => Hint;
+
         [JsonProperty("data", NullValueHandling = NullValueHandling.Ignore)]
         public object Data { get; }
 
@@ -62,7 +84,23 @@ namespace MCPForUnity.Editor.Helpers
         {
             Code = messageOrCode;
             Error = messageOrCode;
+            Message = messageOrCode;
             Data = data;
+        }
+
+        private ErrorResponse(string code, string message, object data, string hint)
+        {
+            Code = code;
+            Error = code;
+            Message = message;
+            Data = data;
+            Hint = hint;
+        }
+
+        /// <summary>Creates an error response with a stable code and separate human-readable details.</summary>
+        public static ErrorResponse Structured(string code, string message, object data = null, string hint = null)
+        {
+            return new ErrorResponse(code, message, data, hint);
         }
     }
 

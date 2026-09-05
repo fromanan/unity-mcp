@@ -280,6 +280,19 @@ namespace MCPForUnityTests.Editor.Services.Characterization
             Assert.Pass($"Snapshot includes sections: {string.Join(", ", sections)}");
         }
 
+        [Test]
+        public void EditorStateCache_SnapshotIdentifiesCurrentProject()
+        {
+            JObject snapshot = EditorStateCache.GetSnapshot();
+            JObject unity = snapshot["unity"] as JObject;
+            Assert.IsNotNull(unity);
+
+            string projectName = MCPForUnity.Editor.Helpers.ProjectIdentityUtility.GetProjectName();
+            string projectHash = MCPForUnity.Editor.Helpers.ProjectIdentityUtility.GetProjectHash();
+            Assert.AreEqual(projectHash, unity.Value<string>("project_id"));
+            Assert.AreEqual($"{projectName}@{projectHash}", unity.Value<string>("instance_id"));
+        }
+
         /// <summary>
         /// Current behavior: EditorStateCache uses lock object for thread safety.
         /// </summary>

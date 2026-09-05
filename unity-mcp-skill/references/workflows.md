@@ -26,17 +26,21 @@ Common workflows and patterns for effective Unity-MCP usage.
 ### Initial Connection Verification
 
 ```python
-# 1. Check editor state
+# 1. List available instances and select the target when needed
+# Read mcpforunity://instances, then set_active_instance(instance="Project@hash")
+
+# 2. Check editor state
 # Read mcpforunity://editor/state
 
-# 2. Verify ready_for_tools == true
-# If false, wait for recommended_retry_after_ms
+# 3. Verify advice.ready_for_tools == true and staleness.is_stale == false
+# If false, inspect advice.blocking_reasons and wait advice.recommended_retry_after_ms
 
-# 3. Check active scene
+# 4. Search and activate the narrow tool group
+manage_tools(action="search", query="scene")
+manage_tools(action="activate", group="core")
+
+# 5. Check active scene
 # Read mcpforunity://editor/state → active_scene
-
-# 4. List available instances (multi-instance)
-# Read mcpforunity://instances
 ```
 
 ### Before Any Operation
@@ -45,12 +49,12 @@ Common workflows and patterns for effective Unity-MCP usage.
 # Quick readiness check pattern:
 editor_state = read_resource("mcpforunity://editor/state")
 
-if not editor_state["ready_for_tools"]:
-    # Check blocking_reasons
-    # Wait recommended_retry_after_ms
+if not editor_state["advice"]["ready_for_tools"] or editor_state["staleness"]["is_stale"]:
+    # Check advice.blocking_reasons
+    # Wait advice.recommended_retry_after_ms
     pass
 
-if editor_state["is_compiling"]:
+if editor_state["compilation"]["is_compiling"]:
     # Wait for compilation to complete
     pass
 ```
@@ -73,6 +77,22 @@ manage_scene(action="create", name="MyGeneratedScene", path="Assets/Scenes/")
 # Phase 3: Materials
 # etc.
 ```
+
+### Inspect Recovery or Backup Scenes Safely
+
+Use an isolated preview lease for recovery content. Never additively load recovery assets or Unity's `Temp/__Backupscenes/*.backup` files into the authored scene set.
+
+```python
+preview = manage_scene(action="load_preview", path="Assets/_Recovery/Recovered.unity")
+# Inspect the returned preview scene without saving or entering Play Mode.
+manage_scene(action="close_preview_scene", lease_id=preview["data"]["lease"]["leaseId"])
+
+backup = manage_scene(action="load_preview", path="Temp/__Backupscenes/0.backup")
+# The bridge owns a temporary .unity shadow and deletes it through lease cleanup.
+manage_scene(action="close_preview_scene", lease_id=backup["data"]["lease"]["leaseId"])
+```
+
+Ordinary additive loads default to `scene_intent="temporary_inspection"`; their lease blocks MCP save and Play Mode until closed. Use `scene_intent="authoring"` only for a deliberate multi-scene composition. In a multi-scene setup, save with an explicit `scene_name` or `scene_path`; save and MCP Play fail closed on cross-scene references.
 
 ### Wiring Object References Between Components
 
@@ -184,7 +204,7 @@ for x in range(5):
         })
 
 # Execute in batches of 25
-batch_execute(commands=commands[:25], parallel=True)
+batch_execute(commands=commands[:25])
 ```
 
 ### Clone and Arrange Objects
@@ -431,7 +451,8 @@ manage_gameobject(
     name="Enemy_1",
     prefab_path="Assets/Prefabs/Enemy.prefab",
     position=[5, 0, 3],
-    parent="Enemies"
+    parent="Enemies",
+    instance_policy="always_create"
 )
 
 # Smart lookup — just the prefab name works too
@@ -448,6 +469,8 @@ batch_execute(commands=[
 ```
 
 > **Note:** `manage_prefabs` is for headless prefab editing (inspect, modify contents, create from GameObject). To *instantiate* a prefab into the scene, always use `manage_gameobject(action="create", prefab_path="...")`.
+
+Prefab creation is fail-closed in Play Mode unless `allow_play_mode_create=True` is explicit. For singleton/bootstrap prefabs, prefer `instance_policy="fail_if_same_prefab"` or `"reuse_same_prefab"` rather than creating an accidental duplicate. Treat `play_mode_create_blocked`, `prefab_instance_exists`, and `prefab_instance_destroyed` as stable lifecycle codes; inspect `hint`, `data`, and `warnings` before diagnosing corruption. A successful response can also carry bounded lifecycle warnings.
 
 ---
 
@@ -591,6 +614,10 @@ for item in hierarchy["data"]["items"]:
 # 3. Visual verification
 manage_camera(action="screenshot")
 ```
+
+### Interpret Omitted Component Properties
+
+Component resources can return `serialization.omittedProperties` and `serialization.truncated`. Obsolete members, unsafe/unbounded values, and state-invalid getters are deliberately skipped before invocation. Do not infer that an omitted API is missing or null; use live reflection or a targeted state-safe read when the value is required. `AudioSource.time`/`timeSamples` need a real `AudioClip`, and guarded `NavMeshAgent` values remain unavailable while off-mesh.
 
 ---
 
@@ -1881,8 +1908,9 @@ Use `deploy_package` to copy your local MCPForUnity source into the project's in
 # 2. Deploy the updated package (copies source → installed package, creates backup)
 manage_editor(action="deploy_package")
 
-# 3. Wait for recompilation to finish
-refresh_unity(mode="force", compile="request", wait_for_ready=True)
+# 3. The deploy already requests an AssetDatabase refresh. Poll editor state
+# until compilation/domain reload finishes and advice.ready_for_tools is true.
+# Read mcpforunity://editor/state
 
 # 4. Check for compilation errors
 read_console(types=["error"], count=10, include_stacktrace=True)
@@ -1890,6 +1918,8 @@ read_console(types=["error"], count=10, include_stacktrace=True)
 # 5. Test the changes
 run_tests(mode="EditMode")
 ```
+
+C# package activation is proven by a successful Unity compile/domain reload. Installed Python server files are a separate boundary and become active only after the MCP server process restarts; do not claim Python behavior is live merely because deployed hashes match. Package-cache and installed-runtime copies are generated mirrors and can be overwritten by package resolution or runtime reinstall.
 
 ### Rollback After Failed Deploy
 
@@ -2017,7 +2047,7 @@ for enemy_id in enemies["ids"]:
 
 # Execute in batches
 for i in range(0, len(commands), 25):
-    batch_execute(commands=commands[i:i+25], parallel=True)
+    batch_execute(commands=commands[i:i+25])
 ```
 
 ### Mass Object Creation with Variations
@@ -2038,8 +2068,10 @@ for i in range(20):
         }
     })
 
-batch_execute(commands=commands, parallel=True)
+batch_execute(commands=commands)
 ```
+
+`batch_execute` reduces MCP round trips but still runs Unity commands sequentially on the main thread. The deprecated `parallel` and `max_parallelism` inputs have no execution effect, and earlier successful commands are not rolled back after a later failure.
 
 ### Cleanup Pattern
 
@@ -2084,7 +2116,8 @@ max_retries = 5
 for attempt in range(max_retries):
     try:
         editor_state = read_resource("mcpforunity://editor/state")
-        if editor_state["ready_for_tools"]:
+        if (editor_state["advice"]["ready_for_tools"]
+                and not editor_state["staleness"]["is_stale"]):
             break
     except:
         time.sleep(2 ** attempt)  # Exponential backoff

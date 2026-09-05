@@ -32,7 +32,9 @@ Performs CRUD operations on GameObjects. Actions: create, modify, delete, duplic
 | `save_as_prefab` | `bool \| str \| None` | — | If True, saves the created GameObject as a prefab (accepts true/false or 'true'/'false') |
 | `prefab_path` | `str \| None` | — | Path for prefab creation |
 | `prefab_folder` | `str \| None` | — | Folder for prefab creation |
-| `set_active` | `bool \| str \| None` | — | If True, sets the GameObject active (accepts true/false or 'true'/'false') |
+| `allow_play_mode_create` | `bool \| str \| None` | — | Explicit safety opt-in for prefab creation while Unity is in Play Mode. Defaults to false. Use only when Awake/OnEnable and singleton side effects are intentional. |
+| `instance_policy` | `Literal['always_create', 'fail_if_same_prefab', 'reuse_same_prefab'] \| None` | — | Prefab duplicate policy for 'create'. always_create preserves normal prefab semantics; fail_if_same_prefab returns a non-mutating error when a matching root instance exists; reuse_same_prefab returns the first matching loaded root instance. |
+| `set_active` | `bool \| str \| None` | — | Sets the GameObject active state during 'create' or 'modify' (accepts true/false or 'true'/'false') |
 | `layer` | `str \| None` | — | Layer name |
 | `is_static` | `bool \| str \| None` | — | Set the GameObject's static flag. true = all StaticEditorFlags, false = none (accepts true/false or 'true'/'false') |
 | `components_to_remove` | `list[str] \| str \| None` | — | List of component names to remove |

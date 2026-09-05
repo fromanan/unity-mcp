@@ -10,6 +10,27 @@ import services.tools.find_gameobjects as find_go_mod
 
 
 @pytest.mark.asyncio
+async def test_find_gameobjects_does_not_request_implicit_refresh(monkeypatch):
+    captured = {}
+
+    async def fake_preflight(_ctx, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    async def fake_send(_cmd, _params, **_kwargs):
+        return {"success": True, "data": {"instanceIDs": []}}
+
+    monkeypatch.setattr(find_go_mod, "preflight", fake_preflight)
+    monkeypatch.setattr(find_go_mod, "async_send_command_with_retry", fake_send)
+
+    result = await find_go_mod.find_gameobjects(DummyContext(), "Player")
+
+    assert result["success"] is True
+    assert captured["wait_for_no_compile"] is True
+    assert "refresh_if_dirty" not in captured
+
+
+@pytest.mark.asyncio
 async def test_find_gameobjects_basic_search(monkeypatch):
     """Test basic search returns instance IDs."""
     captured = {}
@@ -197,4 +218,3 @@ async def test_find_gameobjects_by_path(monkeypatch):
     assert resp.get("success") is True
     assert captured["params"]["searchMethod"] == "by_path"
     assert captured["params"]["searchTerm"] == "Canvas/Panel/Button"
-

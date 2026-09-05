@@ -35,6 +35,21 @@ def _exit_command(code: int) -> list[str]:
     return [sys.executable, "-c", f"raise SystemExit({code})"]
 
 
+def _output_command() -> list[str]:
+    if os.name == "nt":
+        return [
+            os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+            "/d",
+            "/c",
+            "(echo server-stdout)&(echo server-stderr 1>&2)",
+        ]
+    return [
+        sys.executable,
+        "-c",
+        "import sys; print('server-stdout'); print('server-stderr', file=sys.stderr)",
+    ]
+
+
 def test_memory_limit_exit_is_recognizable():
     assert classify_server_exit(1000, 949) == "server_exited"
     assert classify_server_exit(1000, 950) == "memory_limit_exceeded"
@@ -108,6 +123,46 @@ def test_normal_server_exit_stops_supervisor(tmp_path):
         state = read_state(state_path)
         assert state.exit_reason == "server_exited"
         assert state.server_exit_code == 7
+    finally:
+        if supervisor.poll() is None:
+            supervisor.kill()
+        if parent.poll() is None:
+            parent.kill()
+
+
+def test_log_file_captures_supervisor_events_and_server_output(tmp_path):
+    parent = subprocess.Popen(_sleep_command(20))
+    state_path = tmp_path / "state.json"
+    log_path = tmp_path / "supervisor.log"
+    supervisor = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "process_supervisor.main",
+            "--parent-pid",
+            str(parent.pid),
+            "--port",
+            "58995",
+            "--state-file",
+            str(state_path),
+            "--instance-token",
+            "test-token",
+            "--log-file",
+            str(log_path),
+            "--",
+            *_output_command(),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert supervisor.wait(timeout=10) == 0
+        contents = log_path.read_text(encoding="utf-8")
+        assert '"event": "server_started"' in contents
+        assert '"event": "server_exited"' in contents
+        assert "server-stdout" in contents
+        assert "server-stderr" in contents
     finally:
         if supervisor.poll() is None:
             supervisor.kill()

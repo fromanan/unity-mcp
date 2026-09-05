@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import uuid
+from typing import TextIO
 
 from process_supervisor.state import LaunchState, write_state
 
@@ -47,13 +48,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-version", default="unknown")
     parser.add_argument("--soft-memory-limit-mb", type=int, default=512)
     parser.add_argument("--hard-memory-limit-mb", type=int, default=0)
+    parser.add_argument("--log-file")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(message)s")
     args = build_parser().parse_args()
+    log_stream = None
+    if args.log_file:
+        log_directory = os.path.dirname(os.path.abspath(args.log_file))
+        os.makedirs(log_directory, exist_ok=True)
+        log_stream = open(args.log_file, "a", encoding="utf-8", buffering=1)
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=log_stream or sys.stderr,
+        format="%(message)s",
+    )
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
@@ -64,7 +75,7 @@ def main() -> int:
         logger.error("Invalid Unity parent PID")
         return 2
     if os.name != "nt":
-        return _run_posix(args, command)
+        return _run_posix(args, command, log_stream)
 
     from process_supervisor.windows_job import (
         WindowsJob,
@@ -82,7 +93,21 @@ def main() -> int:
 
     try:
         with WindowsJob(job_name, hard_bytes) as job:
-            server_pid = job.launch_suspended(command)
+            output_handle = None
+            if log_stream is not None:
+                import msvcrt
+
+                output_handle = msvcrt.get_osfhandle(log_stream.fileno())
+                os.set_handle_inheritable(output_handle, True)
+            try:
+                server_pid = job.launch_suspended(
+                    command,
+                    stdout_handle=output_handle,
+                    stderr_handle=output_handle,
+                )
+            finally:
+                if output_handle is not None:
+                    os.set_handle_inheritable(output_handle, False)
             state = LaunchState(
                 schema_version=1,
                 supervisor_pid=os.getpid(),
@@ -167,7 +192,11 @@ def main() -> int:
         close_handle(parent_handle)
 
 
-def _run_posix(args: argparse.Namespace, command: list[str]) -> int:
+def _run_posix(
+    args: argparse.Namespace,
+    command: list[str],
+    log_stream: TextIO | None = None,
+) -> int:
     """Supervise a POSIX process group and enforce tree-wide RSS limits."""
     import psutil
 
@@ -178,6 +207,8 @@ def _run_posix(args: argparse.Namespace, command: list[str]) -> int:
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
+        stdout=log_stream,
+        stderr=log_stream,
         start_new_session=True,
     )
     state = LaunchState(

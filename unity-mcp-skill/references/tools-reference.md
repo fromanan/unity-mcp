@@ -1,6 +1,6 @@
 # Unity-MCP Tools Reference
 
-Complete reference for all MCP tools. Each tool includes parameters, types, and usage examples.
+Curated operational reference for common MCP tools. Use the live schema exposed after group activation for the complete current parameter contract.
 
 > **Template warning:** Examples in this file are skill templates and may be inaccurate for some Unity versions, packages, or project setups. Validate parameters and payload shapes against your active tool schema and runtime behavior.
 
@@ -57,9 +57,40 @@ Read `mcpforunity://project/info` to detect project capabilities before making a
 
 ## Infrastructure Tools
 
+### manage_tools
+
+The default bootstrap profile keeps the advertised catalog to `manage_tools`, `set_active_instance`, `execute_custom_tool`, and `manage_script_capabilities`. Search for the capability you need and activate only its group for the current session.
+
+```python
+manage_tools(action="list_groups")
+manage_tools(action="search", query="shader graph")
+manage_tools(action="activate", group="rendering_inspect")
+manage_tools(action="deactivate", group="rendering_inspect")
+manage_tools(action="sync")               # Import Unity Editor toggle state
+manage_tools(action="reset")              # Restore server defaults
+```
+
+`list_groups` is compact by default; pass `include_tools=True` only when exact names are needed. `search` matches group names, descriptions, and tools without activating them. The current groups are `core`, `docs`, `vfx`, `animation`, `ui`, `scripting_ext`, `testing`, `probuilder`, `profiling`, `rendering_inspect`, `rendering_authoring`, and `asset_gen`.
+
+Use `mcpforunity://tool-groups` for the read-only group catalog. The compatibility profile may start with `core`, `rendering_inspect`, and `testing`, but agents should not assume those groups are already visible.
+
+### Structured responses and oversized results
+
+Unity responses preserve stable `code`, human-readable `message`, optional `hint`, structured `data`, and optional `warnings`; legacy `error` may also be present. Inspect these fields instead of flattening the response into a single string. A success can still carry warnings.
+
+Results above the inline budget return a `result_uri`:
+
+```python
+# Read the exact URI returned by the tool, for example:
+# mcpforunity://results/{result_id}/0
+# Then follow next_uri until it is null.
+```
+
+Stored result pages are short-lived and caller-owned. If the result is no longer available, rerun a narrower or explicitly paged query rather than broadening it.
+
 ### batch_execute
 
-Execute multiple MCP commands in a single batch (10-100x faster).
+Execute multiple ordered MCP commands in one round trip.
 
 ```python
 batch_execute(
@@ -67,13 +98,13 @@ batch_execute(
         {"tool": "tool_name", "params": {...}},
         ...
     ],
-    parallel=False,              # bool, optional - advisory only (Unity may still run sequentially)
+    parallel=False,              # deprecated compatibility input; no execution effect
     fail_fast=False,             # bool, optional - stop on first failure
-    max_parallelism=None         # int, optional - max parallel workers
+    max_parallelism=None         # deprecated compatibility input; no execution effect
 )
 ```
 
-`batch_execute` is not transactional: earlier commands are not rolled back if a later command fails.
+Unity executes a batch sequentially on its main thread. `batch_execute` is not rollback-transactional: earlier commands are not rolled back if a later command fails.
 
 ### set_active_instance
 
@@ -176,8 +207,26 @@ manage_scene(action="get_active")        # Current scene info
 manage_scene(action="get_build_settings") # Build settings
 manage_scene(action="create", name="NewScene", path="Assets/Scenes/")
 manage_scene(action="load", path="Assets/Scenes/Main.unity")
-manage_scene(action="save")
+manage_scene(action="save")              # Requires scene_name/scene_path when multiple scenes are loaded
+
+# Recovery/backup inspection uses an isolated preview scene
+preview = manage_scene(action="load_preview", path="Assets/_Recovery/Recovered.unity")
+manage_scene(action="close_preview_scene", lease_id=preview["data"]["lease"]["leaseId"])
+
+# Unity Temp backups are shadowed to a lease-owned .unity file for preview loading
+backup = manage_scene(action="load_preview", path="Temp/__Backupscenes/0.backup")
+manage_scene(action="close_preview_scene", lease_id=backup["data"]["lease"]["leaseId"])
+
+# Intentional authored multi-scene setup (temporary_inspection is the safer default)
+manage_scene(
+    action="load",
+    path="Assets/Scenes/Lighting.unity",
+    additive=True,
+    scene_intent="authoring"
+)
 ```
+
+Never load recovery or Unity backup scenes additively. Temporary backup shadows live only under `Temp/MCPForUnity/PreviewScenes` and are deleted with their preview lease. Temporary additive-scene leases block saves and Play Mode until closed, and scene saves fail closed when Unity detects cross-scene references.
 
 ### find_gameobjects
 
@@ -222,7 +271,9 @@ manage_gameobject(
     name="Enemy_1",
     prefab_path="Assets/Prefabs/Enemy.prefab",
     position=[5, 0, 3],
-    parent="Enemies"                # optional parent GameObject
+    parent="Enemies",               # optional parent GameObject
+    allow_play_mode_create=False,    # default; explicit opt-in is required in Play Mode
+    instance_policy="always_create" # or fail_if_same_prefab / reuse_same_prefab
 )
 # Smart lookup — just the prefab name works too:
 manage_gameobject(action="create", name="Enemy_2", prefab_path="Enemy", position=[10, 0, 3])
@@ -276,6 +327,10 @@ manage_gameobject(
     look_at_up=[0, 1, 0]        # optional up vector, default [0,1,0]
 )
 ```
+
+Prefab creation in Play Mode fails with `play_mode_create_blocked` unless `allow_play_mode_create=True` is explicit. Use that opt-in only when runtime lifecycle effects are intentional. `always_create` remains the ordinary duplicate policy; prefer `fail_if_same_prefab` or `reuse_same_prefab` for singleton/bootstrap prefabs.
+
+If creation returns `prefab_instance_destroyed`, the new object was destroyed during a lifecycle phase such as instantiation, parenting, component addition, activation, prefab save/connect, or final serialization. Inspect `hint`, `data`, and bounded `warnings`; do not diagnose the prefab as corrupt from that code alone. `prefab_instance_exists` is the non-mutating duplicate rejection.
 
 ### manage_components
 
@@ -335,6 +390,8 @@ manage_components(
 # - "ObjectName"               → String shorthand for scene name lookup
 # - 12345                      → Integer shorthand for instanceID
 ```
+
+Read-side component serialization may omit obsolete members, unsafe/unbounded values, or state-invalid getters before invocation. Check `serialization.omittedProperties` and `serialization.truncated` in component data. `AudioSource.time`/`timeSamples` require a real `AudioClip`; guarded `NavMeshAgent` values remain unavailable while the agent is off its NavMesh.
 
 ---
 
@@ -721,6 +778,8 @@ Control Unity Editor state.
 manage_editor(action="play")               # Enter play mode
 manage_editor(action="pause")              # Pause play mode
 manage_editor(action="stop")               # Exit play mode
+manage_editor(action="undo")               # Undo the current Unity group
+manage_editor(action="redo")               # Redo the next Unity group
 
 manage_editor(action="set_active_tool", tool_name="Move")  # Move/Rotate/Scale/etc.
 
@@ -739,7 +798,9 @@ manage_editor(action="deploy_package")     # Copy configured MCPForUnity source 
 manage_editor(action="restore_package")    # Revert to pre-deployment backup
 ```
 
-**Deploy workflow:** Set the source path in MCP for Unity Advanced Settings first. `deploy_package` copies the source into the project's package location, creates a backup, and triggers `AssetDatabase.Refresh`. Follow with `refresh_unity(wait_for_ready=True)` to wait for recompilation.
+MCP Play fails closed while a temporary additive-scene lease or cross-scene reference exists. Play/pause/stop and scene-changing `manage_scene` operations append bounded correlation and before/after scene fingerprints to `Library/MCPForUnity/CommandJournal/scene-commands.jsonl`.
+
+**Deploy workflow:** Set the source path in MCP for Unity Advanced Settings first. `deploy_package` copies the source into the project's package location, creates a backup, and triggers `AssetDatabase.Refresh`. Poll `mcpforunity://editor/state` for the ensuing compile/domain reload, then inspect filtered console errors. C# activation after reload and Python server-module activation are separate boundaries; installed Python changes require a later server restart and must not be claimed active merely because the files match.
 
 ### execute_menu_item
 

@@ -38,33 +38,96 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         };
         private static readonly TimeSpan ReconnectTailInterval = TimeSpan.FromSeconds(30);
 
-        private static readonly TimeSpan DefaultKeepAliveInterval = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan DefaultCommandTimeout = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(20);
+
+        private enum DisconnectKind
+        {
+            ExpectedRemoteClose,
+            RemoteClose,
+            TransportFailure,
+            HandshakeFailure,
+            PlannedShutdown,
+            PlannedReload
+        }
+
+        private sealed class DisconnectCause
+        {
+            public DisconnectCause(DisconnectKind kind, string reason)
+            {
+                Kind = kind;
+                Reason = reason ?? "Connection closed";
+            }
+
+            public DisconnectKind Kind { get; }
+            public string Reason { get; }
+        }
+
+        private sealed class ConnectionContext : IDisposable
+        {
+            private int _disconnectSignaled;
+
+            public ConnectionContext(int generation, ClientWebSocket socket, CancellationToken lifecycleToken)
+            {
+                Generation = generation;
+                ConnectionId = Guid.NewGuid().ToString("N");
+                Socket = socket;
+                Cancellation = CancellationTokenSource.CreateLinkedTokenSource(lifecycleToken);
+                Ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                Disconnected = new TaskCompletionSource<DisconnectCause>(TaskCreationOptions.RunContinuationsAsynchronously);
+            }
+
+            public int Generation { get; }
+            public string ConnectionId { get; }
+            public ClientWebSocket Socket { get; }
+            public CancellationTokenSource Cancellation { get; }
+            public TaskCompletionSource<bool> Ready { get; }
+            public TaskCompletionSource<DisconnectCause> Disconnected { get; }
+            public Task ReceiveTask { get; set; }
+            public Task EditorStateTask { get; set; }
+            public string SessionId { get; set; }
+            public bool SupportsEditorStatePush { get; set; }
+            public bool SupportsReadyAcknowledgement { get; set; }
+            public bool SupportsClientLifecycle { get; set; }
+
+            public void SignalDisconnect(DisconnectKind kind, string reason)
+            {
+                if (Interlocked.CompareExchange(ref _disconnectSignaled, 1, 0) == 0)
+                {
+                    Disconnected.TrySetResult(new DisconnectCause(kind, reason));
+                }
+            }
+
+            public void SignalDisconnect(string reason)
+                => SignalDisconnect(DisconnectKind.TransportFailure, reason);
+
+            public void Dispose()
+            {
+                Cancellation.Dispose();
+                Socket.Dispose();
+            }
+        }
 
         private readonly IToolDiscoveryService _toolDiscoveryService;
-        private ClientWebSocket _socket;
         private CancellationTokenSource _lifecycleCts;
-        private CancellationTokenSource _connectionCts;
-        private Task _receiveTask;
-        private Task _keepAliveTask;
-        private Task _editorStateTask;
+        private ConnectionContext _activeConnection;
+        private Task _supervisorTask;
+        private TaskCompletionSource<bool> _firstReady;
         private readonly SemaphoreSlim _sendLock = new(1, 1);
         private readonly SemaphoreSlim _editorStateSignal = new(0, 1);
 
         private Uri _endpointUri;
-        private string _sessionId;
         private string _projectHash;
         private string _projectName;
         private string _projectPath;
         private string _unityVersion;
-        private TimeSpan _keepAliveInterval = DefaultKeepAliveInterval;
-        private TimeSpan _socketKeepAliveInterval = DefaultKeepAliveInterval;
         private volatile bool _isConnected;
-        private int _isReconnectingFlag;
-        private TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
+        private volatile TransportState _state = TransportState.Disconnected(TransportDisplayName, "Transport not started");
         private string _apiKey;
         private bool _editorStateSubscribed;
-        private bool _supportsEditorStatePush;
+        private volatile bool _reloadDraining;
+        private bool _hasReportedOutage;
+        private int _connectionGeneration;
         private bool _disposed;
 
         public WebSocketTransportClient(IToolDiscoveryService toolDiscoveryService = null)
@@ -104,6 +167,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             // Get project root path (strip /Assets from dataPath) for focus nudging
             string dataPath = Application.dataPath;
+            _projectPath = null;
             if (!string.IsNullOrEmpty(dataPath))
             {
                 string normalized = dataPath.TrimEnd('/', '\\');
@@ -121,18 +185,28 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             _lifecycleCts = new CancellationTokenSource();
             _endpointUri = BuildWebSocketUri(HttpEndpointUtility.GetBaseUrl());
-            _sessionId = null;
+            _firstReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _reloadDraining = false;
+            _hasReportedOutage = false;
             SubscribeEditorState();
 
-            if (!await EstablishConnectionAsync(_lifecycleCts.Token))
+            _supervisorTask = Task.Run(
+                () => SuperviseConnectionsAsync(_lifecycleCts.Token),
+                CancellationToken.None);
+            Task completed = await Task.WhenAny(
+                _firstReady.Task,
+                Task.Delay(HandshakeTimeout, _lifecycleCts.Token)).ConfigureAwait(false);
+            if (completed != _firstReady.Task || !await _firstReady.Task.ConfigureAwait(false))
             {
+                string error = "Connection did not become ready before the handshake timeout";
                 await StopAsync();
+                _state = TransportState.Disconnected(
+                    TransportDisplayName,
+                    error,
+                    phase: TransportPhase.Faulted,
+                    details: _endpointUri.ToString());
                 return false;
             }
-
-            // State is connected but session ID might be pending until 'registered' message
-            _state = TransportState.Connected(TransportDisplayName, sessionId: "pending", details: _endpointUri.ToString());
-            _isConnected = true;
             return true;
         }
 
@@ -145,29 +219,21 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 return;
             }
 
-            try
+            ConnectionContext connection = _activeConnection;
+            _state = TransportState.Transitioning(
+                TransportDisplayName,
+                TransportPhase.Draining,
+                details: _endpointUri?.ToString());
+            if (connection != null)
             {
-                _lifecycleCts.Cancel();
+                await CloseConnectionAsync(connection, "Shutdown", graceful: true).ConfigureAwait(false);
             }
-            catch { }
 
-            await StopConnectionLoopsAsync().ConfigureAwait(false);
-
-            if (_socket != null)
+            try { _lifecycleCts.Cancel(); } catch { }
+            if (_supervisorTask != null)
             {
-                try
-                {
-                    if (_socket.State == WebSocketState.Open || _socket.State == WebSocketState.CloseReceived)
-                    {
-                        await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Shutdown", CancellationToken.None).ConfigureAwait(false);
-                    }
-                }
-                catch { }
-                finally
-                {
-                    _socket.Dispose();
-                    _socket = null;
-                }
+                try { await _supervisorTask.ConfigureAwait(false); } catch { }
+                _supervisorTask = null;
             }
 
             _isConnected = false;
@@ -180,27 +246,22 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         /// <summary>
         /// Synchronous teardown for use in beforeAssemblyReload where async is not possible.
         /// Skips the graceful WebSocket close handshake and just disposes resources immediately.
-        /// The server handles ungraceful disconnects via its ping timeout.
+        /// The server handles ungraceful disconnects through the WebSocket protocol timeout.
         /// </summary>
         public void ForceStop()
         {
             UnsubscribeEditorState();
             try { _lifecycleCts?.Cancel(); } catch { }
-            try { _connectionCts?.Cancel(); } catch { }
-
-            if (_socket != null)
+            ConnectionContext connection = Interlocked.Exchange(ref _activeConnection, null);
+            if (connection != null)
             {
-                try { _socket.Abort(); } catch { }
-                try { _socket.Dispose(); } catch { }
-                _socket = null;
+                try { connection.Cancellation.Cancel(); } catch { }
+                connection.SignalDisconnect(DisconnectKind.PlannedShutdown, "Force stop");
+                try { connection.Socket.Abort(); } catch { }
+                try { connection.Dispose(); } catch { }
             }
 
-            try { _connectionCts?.Dispose(); } catch { }
-            _connectionCts = null;
-            _receiveTask = null;
-            _keepAliveTask = null;
-            _editorStateTask = null;
-            Interlocked.Exchange(ref _isReconnectingFlag, 0);
+            _supervisorTask = null;
             _isConnected = false;
             _state = TransportState.Disconnected(TransportDisplayName);
 
@@ -210,7 +271,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         public async Task<bool> VerifyAsync()
         {
-            if (_socket == null || _socket.State != WebSocketState.Open)
+            ConnectionContext connection = _activeConnection;
+            if (connection == null
+                || connection.Socket.State != WebSocketState.Open
+                || connection.Ready.Task.Status != TaskStatus.RanToCompletion
+                || !connection.Ready.Task.Result)
             {
                 return false;
             }
@@ -224,12 +289,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(_lifecycleCts.Token);
                 timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
-                await SendPongAsync(timeoutCts.Token).ConfigureAwait(false);
-                return true;
+                JObject snapshot = await TransportCommandDispatcher.RunOnMainThreadAsync(
+                    EditorStateCache.GetSnapshot,
+                    timeoutCts.Token).ConfigureAwait(false);
+                return snapshot != null && ReferenceEquals(connection, _activeConnection);
             }
             catch (Exception ex)
             {
-                McpLog.Warn($"[WebSocket] Verify ping failed: {ex.Message}");
+                McpLog.Warn($"[WebSocket] Verify failed: {ex.Message}");
                 return false;
             }
         }
@@ -253,171 +320,279 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             _sendLock?.Dispose();
             _editorStateSignal?.Dispose();
-            _socket?.Dispose();
             _lifecycleCts?.Dispose();
             _disposed = true;
         }
 
-        private async Task<bool> EstablishConnectionAsync(CancellationToken token)
+        private async Task SuperviseConnectionsAsync(CancellationToken token)
         {
-            await StopConnectionLoopsAsync().ConfigureAwait(false);
-            _sessionId = null;
-            _supportsEditorStatePush = false;
+            int failedAttempts = 0;
+            bool hasBeenReady = false;
 
-            _connectionCts?.Dispose();
-            _connectionCts = CancellationTokenSource.CreateLinkedTokenSource(token);
-            CancellationToken connectionToken = _connectionCts.Token;
+            while (!token.IsCancellationRequested)
+            {
+                TimeSpan delay = GetReconnectDelay(failedAttempts);
+                if (delay > TimeSpan.Zero)
+                {
+                    _state = TransportState.Transitioning(
+                        TransportDisplayName,
+                        TransportPhase.Backoff,
+                        details: _endpointUri.ToString(),
+                        error: $"Retrying in {delay.TotalSeconds:0.#} seconds");
+                    try { await Task.Delay(delay, token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { break; }
+                }
 
+                _state = TransportState.Transitioning(
+                    TransportDisplayName,
+                    TransportPhase.Connecting,
+                    details: _endpointUri.ToString());
+                ConnectionContext connection = null;
+                string disconnectReason = "Connection failed";
+                DisconnectKind disconnectKind = DisconnectKind.TransportFailure;
+                try
+                {
+                    connection = await EstablishConnectionAsync(token).ConfigureAwait(false);
+                    if (connection == null)
+                    {
+                        failedAttempts++;
+                        continue;
+                    }
+
+                    _state = TransportState.Transitioning(
+                        TransportDisplayName,
+                        TransportPhase.Handshaking,
+                        details: _endpointUri.ToString());
+                    Task handshakeTimeout = Task.Delay(HandshakeTimeout, connection.Cancellation.Token);
+                    Task completed = await Task.WhenAny(
+                        connection.Ready.Task,
+                        connection.Disconnected.Task,
+                        handshakeTimeout).ConfigureAwait(false);
+                    if (completed != connection.Ready.Task || !connection.Ready.Task.Result)
+                    {
+                        disconnectReason = completed == handshakeTimeout
+                            ? "Registration handshake timed out"
+                            : (await connection.Disconnected.Task.ConfigureAwait(false)).Reason;
+                        connection.SignalDisconnect(DisconnectKind.HandshakeFailure, disconnectReason);
+                        failedAttempts++;
+                        continue;
+                    }
+
+                    _isConnected = true;
+                    hasBeenReady = true;
+                    failedAttempts = 0;
+                    _state = TransportState.Connected(
+                        TransportDisplayName,
+                        sessionId: connection.SessionId,
+                        details: _endpointUri.ToString());
+                    _firstReady?.TrySetResult(true);
+                    if (_hasReportedOutage)
+                    {
+                        McpLog.Info("[WebSocket] Reconnected to MCP server", false);
+                        _hasReportedOutage = false;
+                    }
+
+                    DisconnectCause cause = await connection.Disconnected.Task.ConfigureAwait(false);
+                    disconnectReason = cause.Reason;
+                    disconnectKind = cause.Kind;
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    disconnectReason = ex.Message;
+                    failedAttempts++;
+                    McpLog.Debug($"[WebSocket] Connection generation failed: {ex}");
+                }
+                finally
+                {
+                    _isConnected = false;
+                    if (connection != null)
+                    {
+                        await CleanupConnectionAsync(connection).ConfigureAwait(false);
+                    }
+                }
+
+                if (token.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                if (_reloadDraining)
+                {
+                    _state = TransportState.Transitioning(
+                        TransportDisplayName,
+                        TransportPhase.Draining,
+                        details: _endpointUri.ToString());
+                    try { await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { }
+                    break;
+                }
+
+                if (hasBeenReady
+                    && !_hasReportedOutage
+                    && ShouldWarnForDisconnect(disconnectKind))
+                {
+                    McpLog.Warn($"[WebSocket] Connection closed: {disconnectReason}");
+                    _hasReportedOutage = true;
+                }
+            }
+
+            _firstReady?.TrySetResult(false);
+        }
+
+        private async Task<ConnectionContext> EstablishConnectionAsync(CancellationToken token)
+        {
             Uri originalEndpoint = _endpointUri;
-            Uri connectedEndpoint = null;
             Exception lastConnectError = null;
 
             foreach (Uri candidate in BuildConnectionCandidateUris(originalEndpoint))
             {
-                connectionToken.ThrowIfCancellationRequested();
-
-                _socket?.Dispose();
-                _socket = new ClientWebSocket();
-                _socket.Options.KeepAliveInterval = _socketKeepAliveInterval;
+                token.ThrowIfCancellationRequested();
+                ClientWebSocket socket = new();
+                ConnectionContext connection = null;
+                socket.Options.KeepAliveInterval = TimeSpan.Zero;
 
                 // Add API key header if configured (for remote-hosted mode)
                 if (!string.IsNullOrEmpty(_apiKey))
                 {
-                    _socket.Options.SetRequestHeader(AuthConstants.ApiKeyHeader, _apiKey);
+                    socket.Options.SetRequestHeader(AuthConstants.ApiKeyHeader, _apiKey);
                 }
 
                 try
                 {
-                    await _socket.ConnectAsync(candidate, connectionToken).ConfigureAwait(false);
-                    connectedEndpoint = candidate;
-                    break;
+                    await socket.ConnectAsync(candidate, token).ConfigureAwait(false);
+                    if (!string.Equals(candidate.Host, originalEndpoint.Host, StringComparison.OrdinalIgnoreCase))
+                    {
+                        McpLog.Warn($"[WebSocket] Connected via fallback host '{candidate.Host}' after '{originalEndpoint.Host}' failed.");
+                        _endpointUri = candidate;
+                    }
+
+                    connection = new ConnectionContext(
+                        Interlocked.Increment(ref _connectionGeneration),
+                        socket,
+                        token);
+                    Interlocked.Exchange(ref _activeConnection, connection);
+                    connection.ReceiveTask = Task.Run(
+                        () => ReceiveLoopAsync(connection),
+                        CancellationToken.None);
+                    connection.EditorStateTask = Task.Run(
+                        () => EditorStateLoopAsync(connection),
+                        CancellationToken.None);
+                    await SendRegisterAsync(connection, connection.Cancellation.Token).ConfigureAwait(false);
+                    return connection;
                 }
-                catch (OperationCanceledException) when (connectionToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (token.IsCancellationRequested)
                 {
+                    if (connection != null)
+                    {
+                        connection.SignalDisconnect(DisconnectKind.PlannedShutdown, "Connection cancelled");
+                        await CleanupConnectionAsync(connection).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        socket.Dispose();
+                    }
                     throw;
                 }
                 catch (Exception ex)
                 {
                     lastConnectError = ex;
+                    if (connection != null)
+                    {
+                        connection.SignalDisconnect(ex.Message);
+                        await CleanupConnectionAsync(connection).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        socket.Dispose();
+                    }
                     McpLog.Debug($"[WebSocket] Connect failed for {candidate}: {ex.Message}");
                 }
             }
 
-            if (connectedEndpoint == null)
-            {
-                string errorMsg = "Connection failed. Check that the server URL is correct, the server is running, and your API key (if required) is valid.";
-                McpLog.Error($"[WebSocket] {errorMsg} (Detail: {lastConnectError?.Message ?? "Unknown error"})");
-                _state = TransportState.Disconnected(TransportDisplayName, errorMsg);
-                return false;
-            }
-
-            if (!string.Equals(connectedEndpoint.Host, originalEndpoint.Host, StringComparison.OrdinalIgnoreCase))
-            {
-                McpLog.Warn($"[WebSocket] Connected via fallback host '{connectedEndpoint.Host}' after '{originalEndpoint.Host}' failed.");
-                _endpointUri = connectedEndpoint;
-            }
-
-            StartBackgroundLoops(connectionToken);
-
-            try
-            {
-                await SendRegisterAsync(connectionToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                string regMsg = $"Registration with server failed: {ex.Message}";
-                McpLog.Error($"[WebSocket] {regMsg}");
-                _state = TransportState.Disconnected(TransportDisplayName, regMsg);
-                return false;
-            }
-
-            return true;
+            _state = TransportState.Disconnected(
+                TransportDisplayName,
+                "Connection failed. Check the server URL, server process, and API key.",
+                phase: TransportPhase.Backoff,
+                details: lastConnectError?.Message);
+            return null;
         }
 
-        /// <summary>
-        /// Stops the connection loops and disposes of the connection CTS.
-        /// Particularly useful when reconnecting, we want to ensure that background loops are cancelled correctly before starting new oens
-        /// </summary>
-        /// <param name="awaitTasks">Whether to await the receive and keep alive tasks before disposing.</param>
-        private async Task StopConnectionLoopsAsync(bool awaitTasks = true)
+        private async Task CleanupConnectionAsync(ConnectionContext connection)
         {
-            if (_connectionCts != null && !_connectionCts.IsCancellationRequested)
+            Interlocked.CompareExchange(ref _activeConnection, null, connection);
+            try { connection.Cancellation.Cancel(); } catch { }
+            if (connection.ReceiveTask != null)
             {
-                try { _connectionCts.Cancel(); } catch { }
+                try { await connection.ReceiveTask.ConfigureAwait(false); } catch { }
             }
-
-            if (_receiveTask != null)
+            if (connection.EditorStateTask != null)
             {
-                if (awaitTasks)
-                {
-                    try { await _receiveTask.ConfigureAwait(false); } catch { }
-                    _receiveTask = null;
-                }
-                else if (_receiveTask.IsCompleted)
-                {
-                    _receiveTask = null;
-                }
+                try { await connection.EditorStateTask.ConfigureAwait(false); } catch { }
             }
-
-            if (_keepAliveTask != null)
-            {
-                if (awaitTasks)
-                {
-                    try { await _keepAliveTask.ConfigureAwait(false); } catch { }
-                    _keepAliveTask = null;
-                }
-                else if (_keepAliveTask.IsCompleted)
-                {
-                    _keepAliveTask = null;
-                }
-            }
-
-            if (_editorStateTask != null)
-            {
-                if (awaitTasks)
-                {
-                    try { await _editorStateTask.ConfigureAwait(false); } catch { }
-                    _editorStateTask = null;
-                }
-                else if (_editorStateTask.IsCompleted)
-                {
-                    _editorStateTask = null;
-                }
-            }
-
-            if (_connectionCts != null)
-            {
-                _connectionCts.Dispose();
-                _connectionCts = null;
-            }
+            connection.Dispose();
         }
 
-        private void StartBackgroundLoops(CancellationToken token)
+        private async Task CloseConnectionAsync(
+            ConnectionContext connection,
+            string reason,
+            bool graceful)
         {
-            if ((_receiveTask != null && !_receiveTask.IsCompleted)
-                || (_keepAliveTask != null && !_keepAliveTask.IsCompleted)
-                || (_editorStateTask != null && !_editorStateTask.IsCompleted))
+            if (graceful
+                && (connection.Socket.State == WebSocketState.Open
+                    || connection.Socket.State == WebSocketState.CloseReceived))
             {
-                return;
+                try
+                {
+                    using CancellationTokenSource closeTimeout = new(TimeSpan.FromSeconds(1));
+                    await connection.Socket.CloseOutputAsync(
+                        WebSocketCloseStatus.NormalClosure,
+                        reason,
+                        closeTimeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Debug($"[WebSocket] Graceful close did not complete: {ex.Message}");
+                    try { connection.Socket.Abort(); } catch { }
+                }
+            }
+            else
+            {
+                try { connection.Socket.Abort(); } catch { }
             }
 
-            _receiveTask = Task.Run(() => ReceiveLoopAsync(token), CancellationToken.None);
-            _keepAliveTask = Task.Run(() => KeepAliveLoopAsync(token), CancellationToken.None);
-            _editorStateTask = Task.Run(() => EditorStateLoopAsync(token), CancellationToken.None);
+            DisconnectKind disconnectKind = reason == "Unity assembly reload"
+                ? DisconnectKind.PlannedReload
+                : DisconnectKind.PlannedShutdown;
+            connection.SignalDisconnect(disconnectKind, reason);
+            try { connection.Cancellation.Cancel(); } catch { }
         }
 
-        private async Task ReceiveLoopAsync(CancellationToken token)
+        private static TimeSpan GetReconnectDelay(int failedAttempts)
         {
+            if (failedAttempts < ReconnectSchedule.Length)
+            {
+                return ReconnectSchedule[failedAttempts];
+            }
+            return ReconnectTailInterval;
+        }
+
+        private async Task ReceiveLoopAsync(ConnectionContext connection)
+        {
+            CancellationToken token = connection.Cancellation.Token;
             while (!token.IsCancellationRequested)
             {
                 try
                 {
-                    string message = await ReceiveMessageAsync(token).ConfigureAwait(false);
+                    string message = await ReceiveMessageAsync(connection, token).ConfigureAwait(false);
                     if (message == null)
                     {
-                        continue;
+                        break;
                     }
-                    await HandleMessageAsync(message, token).ConfigureAwait(false);
+                    await HandleMessageAsync(connection, message, token).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {
@@ -425,26 +600,23 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 }
                 catch (WebSocketException wse)
                 {
-                    McpLog.Warn($"[WebSocket] Receive loop error: {wse.Message}");
-                    await HandleSocketClosureAsync(wse.Message).ConfigureAwait(false);
+                    McpLog.Debug($"[WebSocket] Receive loop error: {wse.Message}");
+                    connection.SignalDisconnect(wse.Message);
                     break;
                 }
                 catch (Exception ex)
                 {
-                    McpLog.Warn($"[WebSocket] Unexpected receive error: {ex.Message}");
-                    await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
+                    McpLog.Debug($"[WebSocket] Unexpected receive error: {ex.Message}");
+                    connection.SignalDisconnect(ex.Message);
                     break;
                 }
             }
         }
 
-        private async Task<string> ReceiveMessageAsync(CancellationToken token)
+        private static async Task<string> ReceiveMessageAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
-            if (_socket == null)
-            {
-                return null;
-            }
-
             byte[] rentedBuffer = System.Buffers.ArrayPool<byte>.Shared.Rent(8192);
             ArraySegment<byte> buffer = new(rentedBuffer);
             using MemoryStream ms = new(8192);
@@ -453,17 +625,27 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             {
                 while (!token.IsCancellationRequested)
                 {
-                    WebSocketReceiveResult result = await _socket.ReceiveAsync(buffer, token).ConfigureAwait(false);
+                    WebSocketReceiveResult result = await connection.Socket.ReceiveAsync(buffer, token).ConfigureAwait(false);
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        await HandleSocketClosureAsync(result.CloseStatusDescription ?? "Server closed connection").ConfigureAwait(false);
+                        WebSocketCloseStatus? closeStatus = result.CloseStatus;
+                        string closeReason = string.IsNullOrWhiteSpace(result.CloseStatusDescription)
+                            ? closeStatus.HasValue
+                                ? $"Server closed connection ({(int)closeStatus.Value} {closeStatus.Value})"
+                                : "Server closed connection without a close status"
+                            : result.CloseStatusDescription;
+                        connection.SignalDisconnect(
+                            IsExpectedRemoteClose(closeStatus)
+                                ? DisconnectKind.ExpectedRemoteClose
+                                : DisconnectKind.RemoteClose,
+                            closeReason);
                         return null;
                     }
 
                     if (result.MessageType != WebSocketMessageType.Text)
                     {
-                        await _socket.CloseOutputAsync(
+                        await connection.Socket.CloseOutputAsync(
                             WebSocketCloseStatus.InvalidMessageType,
                             "Only text messages are supported",
                             token).ConfigureAwait(false);
@@ -474,7 +656,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     {
                         if (ms.Length + result.Count > MaxIncomingMessageBytes)
                         {
-                            await _socket.CloseOutputAsync(
+                            await connection.Socket.CloseOutputAsync(
                                 WebSocketCloseStatus.MessageTooBig,
                                 "Message exceeded server limit",
                                 token).ConfigureAwait(false);
@@ -503,7 +685,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
-        private async Task HandleMessageAsync(string message, CancellationToken token)
+        private async Task HandleMessageAsync(
+            ConnectionContext connection,
+            string message,
+            CancellationToken token)
         {
             JObject payload;
             try
@@ -521,16 +706,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             switch (messageType)
             {
                 case "welcome":
-                    ApplyWelcome(payload);
+                    ApplyWelcome(connection, payload);
                     break;
                 case "registered":
-                    await HandleRegisteredAsync(payload, token).ConfigureAwait(false);
+                    await HandleRegisteredAsync(connection, payload, token).ConfigureAwait(false);
+                    break;
+                case "plugin_ready_ack":
+                    HandleReadyAcknowledgement(connection, payload);
                     break;
                 case "execute":
-                    await HandleExecuteAsync(payload, token).ConfigureAwait(false);
-                    break;
-                case "ping":
-                    await SendPongAsync(token).ConfigureAwait(false);
+                    await HandleExecuteAsync(connection, payload, token).ConfigureAwait(false);
                     break;
                 default:
                     // No-op for unrecognised types (keep-alives, telemetry, etc.)
@@ -538,10 +723,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
-        private void ApplyWelcome(JObject payload)
+        private void ApplyWelcome(ConnectionContext connection, JObject payload)
         {
             JArray capabilities = payload["capabilities"] as JArray;
-            _supportsEditorStatePush = false;
+            connection.SupportsEditorStatePush = false;
+            connection.SupportsReadyAcknowledgement = false;
+            connection.SupportsClientLifecycle = false;
             if (capabilities != null)
             {
                 foreach (JToken capability in capabilities)
@@ -549,40 +736,83 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     if (string.Equals(capability?.Value<string>(), "editor_state_push_v1",
                             StringComparison.Ordinal))
                     {
-                        _supportsEditorStatePush = true;
-                        break;
+                        connection.SupportsEditorStatePush = true;
+                    }
+                    else if (string.Equals(capability?.Value<string>(), "plugin_ready_ack_v1",
+                                 StringComparison.Ordinal))
+                    {
+                        connection.SupportsReadyAcknowledgement = true;
+                    }
+                    else if (string.Equals(capability?.Value<string>(), "client_lifecycle_v1",
+                                 StringComparison.Ordinal))
+                    {
+                        connection.SupportsClientLifecycle = true;
                     }
                 }
             }
 
-            int? keepAliveSeconds = payload.Value<int?>("keepAliveInterval");
-            if (keepAliveSeconds.HasValue && keepAliveSeconds.Value > 0)
-            {
-                _keepAliveInterval = TimeSpan.FromSeconds(keepAliveSeconds.Value);
-                _socketKeepAliveInterval = _keepAliveInterval;
-            }
-
-            int? serverTimeoutSeconds = payload.Value<int?>("serverTimeout");
-            if (serverTimeoutSeconds.HasValue)
-            {
-                int sourceSeconds = keepAliveSeconds ?? serverTimeoutSeconds.Value;
-                int safeSeconds = Math.Max(5, Math.Min(serverTimeoutSeconds.Value, sourceSeconds));
-                _socketKeepAliveInterval = TimeSpan.FromSeconds(safeSeconds);
-            }
         }
 
-        private async Task HandleRegisteredAsync(JObject payload, CancellationToken token)
+        private async Task HandleRegisteredAsync(
+            ConnectionContext connection,
+            JObject payload,
+            CancellationToken token)
         {
             string newSessionId = payload.Value<string>("session_id");
-            if (!string.IsNullOrEmpty(newSessionId))
+            string responseConnectionId = payload.Value<string>("connection_id");
+            if (string.IsNullOrEmpty(newSessionId))
             {
-                _sessionId = newSessionId;
-                ProjectIdentityUtility.SetSessionId(_sessionId);
-                _state = TransportState.Connected(TransportDisplayName, sessionId: _sessionId, details: _endpointUri.ToString());
-                McpLog.Info($"[WebSocket] Registered with session ID: {_sessionId}", false);
+                throw new InvalidDataException("Registered response did not include a session ID");
+            }
+            if (!string.IsNullOrEmpty(responseConnectionId)
+                && !string.Equals(responseConnectionId, connection.ConnectionId, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("Registered response targeted a stale connection generation");
+            }
 
-                await SendRegisterToolsAsync(token).ConfigureAwait(false);
-                await SendEditorStateAsync(token).ConfigureAwait(false);
+            connection.SessionId = newSessionId;
+            ProjectIdentityUtility.SetSessionId(newSessionId);
+            await SendRegisterToolsAsync(connection, token).ConfigureAwait(false);
+
+            bool readyRequired = payload.Value<bool?>("ready_required") ?? false;
+            if (connection.SupportsReadyAcknowledgement && readyRequired)
+            {
+                await SendPluginReadyAsync(connection, token).ConfigureAwait(false);
+                return;
+            }
+
+            connection.Ready.TrySetResult(true);
+            await SendEditorStateAsync(connection, token).ConfigureAwait(false);
+        }
+
+        private void HandleReadyAcknowledgement(
+            ConnectionContext connection,
+            JObject payload)
+        {
+            string sessionId = payload.Value<string>("session_id");
+            string connectionId = payload.Value<string>("connection_id");
+            if (!string.Equals(sessionId, connection.SessionId, StringComparison.Ordinal)
+                || !string.Equals(connectionId, connection.ConnectionId, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("Ready acknowledgement targeted a stale connection generation");
+            }
+
+            connection.Ready.TrySetResult(true);
+            _ = SendEditorStateAfterReadyAsync(connection);
+        }
+
+        private async Task SendEditorStateAfterReadyAsync(ConnectionContext connection)
+        {
+            try
+            {
+                await SendEditorStateAsync(connection, connection.Cancellation.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                connection.SignalDisconnect(ex.Message);
             }
         }
 
@@ -625,8 +855,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
-        private async Task EditorStateLoopAsync(CancellationToken token)
+        private async Task EditorStateLoopAsync(ConnectionContext connection)
         {
+            CancellationToken token = connection.Cancellation.Token;
             while (!token.IsCancellationRequested)
             {
                 try
@@ -641,11 +872,11 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                             // Coalesce every pending state change into one current snapshot.
                         }
 
-                        await SendEditorStateAsync(token).ConfigureAwait(false);
+                        await SendEditorStateAsync(connection, token).ConfigureAwait(false);
                     }
                     else
                     {
-                        await SendEditorHeartbeatAsync(token).ConfigureAwait(false);
+                        await SendEditorHeartbeatAsync(connection, token).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException)
@@ -654,16 +885,20 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 }
                 catch (Exception ex)
                 {
-                    McpLog.Warn($"[WebSocket] Editor state publication failed: {ex.Message}");
-                    await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
+                    McpLog.Debug($"[WebSocket] Editor state loop stopped: {ex.Message}");
+                    connection.SignalDisconnect(ex.Message);
                     break;
                 }
             }
         }
 
-        private async Task SendEditorStateAsync(CancellationToken token)
+        private async Task SendEditorStateAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
-            if (!_supportsEditorStatePush || string.IsNullOrEmpty(_sessionId))
+            if (!connection.SupportsEditorStatePush
+                || string.IsNullOrEmpty(connection.SessionId)
+                || !connection.Ready.Task.IsCompleted)
             {
                 return;
             }
@@ -673,16 +908,20 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             JObject payload = new()
             {
                 ["type"] = "editor_state",
-                ["session_id"] = _sessionId,
+                ["session_id"] = connection.SessionId,
                 ["state"] = snapshot
             };
 
-            await SendJsonAsync(payload, token).ConfigureAwait(false);
+            await SendJsonAsync(connection, payload, token).ConfigureAwait(false);
         }
 
-        private Task SendEditorHeartbeatAsync(CancellationToken token)
+        private Task SendEditorHeartbeatAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
-            if (!_supportsEditorStatePush || string.IsNullOrEmpty(_sessionId))
+            if (!connection.SupportsEditorStatePush
+                || string.IsNullOrEmpty(connection.SessionId)
+                || !connection.Ready.Task.IsCompleted)
             {
                 return Task.CompletedTask;
             }
@@ -690,14 +929,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             JObject payload = new()
             {
                 ["type"] = "editor_heartbeat",
-                ["session_id"] = _sessionId,
+                ["session_id"] = connection.SessionId,
                 ["editor_heartbeat_unix_ms"] = EditorStateCache.GetLastMainThreadHeartbeatUnixMs()
             };
 
-            return SendJsonAsync(payload, token);
+            return SendJsonAsync(connection, payload, token);
         }
 
-        private async Task SendRegisterToolsAsync(CancellationToken token)
+        private async Task SendRegisterToolsAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
             if (_toolDiscoveryService == null) return;
 
@@ -746,13 +987,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["tools"] = toolsArray
             };
 
-            await SendJsonAsync(payload, token).ConfigureAwait(false);
+            await SendJsonAsync(connection, payload, token).ConfigureAwait(false);
             McpLog.Info($"[WebSocket] Sent {tools.Count} tools registration", false);
         }
 
         public async Task ReregisterToolsAsync()
         {
-            if (!IsConnected || _lifecycleCts == null)
+            ConnectionContext connection = _activeConnection;
+            if (!IsConnected || _lifecycleCts == null || connection == null)
             {
                 McpLog.Warn("[WebSocket] Cannot reregister tools: not connected");
                 return;
@@ -760,7 +1002,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             try
             {
-                await SendRegisterToolsAsync(_lifecycleCts.Token).ConfigureAwait(false);
+                await SendRegisterToolsAsync(connection, _lifecycleCts.Token).ConfigureAwait(false);
                 McpLog.Info("[WebSocket] Tool reregistration completed", false);
             }
             catch (System.OperationCanceledException)
@@ -773,7 +1015,10 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
-        private async Task HandleExecuteAsync(JObject payload, CancellationToken token)
+        private async Task HandleExecuteAsync(
+            ConnectionContext connection,
+            JObject payload,
+            CancellationToken token)
         {
             string commandId = payload.Value<string>("id");
             string commandName = payload.Value<string>("name");
@@ -783,6 +1028,27 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             if (string.IsNullOrEmpty(commandId) || string.IsNullOrEmpty(commandName))
             {
                 McpLog.Warn("[WebSocket] Invalid execute payload (missing id or name)");
+                return;
+            }
+
+            if (_reloadDraining)
+            {
+                JObject retryResponse = new()
+                {
+                    ["type"] = "command_result",
+                    ["id"] = commandId,
+                    ["result"] = new JObject
+                    {
+                        ["success"] = false,
+                        ["error"] = "Unity is compiling or reloading; please retry",
+                        ["data"] = new JObject
+                        {
+                            ["reason"] = "unity_reloading",
+                            ["retry_after_ms"] = 250
+                        }
+                    }
+                };
+                await SendJsonAsync(connection, retryResponse, token).ConfigureAwait(false);
                 return;
             }
 
@@ -857,36 +1123,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["result"] = resultToken
             };
 
-            await SendJsonAsync(responsePayload, token).ConfigureAwait(false);
+            await SendJsonAsync(connection, responsePayload, token).ConfigureAwait(false);
         }
 
-        private async Task KeepAliveLoopAsync(CancellationToken token)
-        {
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    await Task.Delay(_keepAliveInterval, token).ConfigureAwait(false);
-                    if (_socket == null || _socket.State != WebSocketState.Open)
-                    {
-                        break;
-                    }
-                    await SendPongAsync(token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    McpLog.Warn($"[WebSocket] Keep-alive failed: {ex.Message}");
-                    await HandleSocketClosureAsync(ex.Message).ConfigureAwait(false);
-                    break;
-                }
-            }
-        }
-
-        private async Task SendRegisterAsync(CancellationToken token)
+        private async Task SendRegisterAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
             var registerPayload = new JObject
             {
@@ -895,25 +1137,35 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 ["project_name"] = _projectName,
                 ["project_hash"] = _projectHash,
                 ["unity_version"] = _unityVersion,
-                ["project_path"] = _projectPath
+                ["project_path"] = _projectPath,
+                ["connection_id"] = connection.ConnectionId,
+                ["capabilities"] = new JArray(
+                    "plugin_ready_ack_v1",
+                    "client_lifecycle_v1")
             };
 
-            await SendJsonAsync(registerPayload, token).ConfigureAwait(false);
+            await SendJsonAsync(connection, registerPayload, token).ConfigureAwait(false);
         }
 
-        private Task SendPongAsync(CancellationToken token)
+        private Task SendPluginReadyAsync(
+            ConnectionContext connection,
+            CancellationToken token)
         {
-            var payload = new JObject
+            JObject payload = new()
             {
-                ["type"] = "pong",
-                ["session_id"] = _sessionId  // Include session ID for server-side tracking
+                ["type"] = "plugin_ready",
+                ["session_id"] = connection.SessionId,
+                ["connection_id"] = connection.ConnectionId
             };
-            return SendJsonAsync(payload, token);
+            return SendJsonAsync(connection, payload, token);
         }
 
-        private async Task SendJsonAsync(JObject payload, CancellationToken token)
+        private async Task SendJsonAsync(
+            ConnectionContext connection,
+            JObject payload,
+            CancellationToken token)
         {
-            if (_socket == null)
+            if (connection == null)
             {
                 throw new InvalidOperationException("WebSocket is not initialised");
             }
@@ -931,12 +1183,16 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             await _sendLock.WaitAsync(token).ConfigureAwait(false);
             try
             {
-                if (_socket.State != WebSocketState.Open)
+                if (!ReferenceEquals(connection, _activeConnection))
+                {
+                    throw new InvalidOperationException("WebSocket connection generation is stale");
+                }
+                if (connection.Socket.State != WebSocketState.Open)
                 {
                     throw new InvalidOperationException("WebSocket is not open");
                 }
 
-                await _socket.SendAsync(buffer, WebSocketMessageType.Text, true, token).ConfigureAwait(false);
+                await connection.Socket.SendAsync(buffer, WebSocketMessageType.Text, true, token).ConfigureAwait(false);
             }
             finally
             {
@@ -944,80 +1200,55 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             }
         }
 
-        private async Task HandleSocketClosureAsync(string reason)
+        /// <summary>
+        /// Publishes a compilation or reload lifecycle transition to the active server.
+        /// </summary>
+        public async Task NotifyLifecycleAsync(string lifecycleState)
         {
-            // Capture stack trace for debugging disconnection triggers
-            var stackTrace = new System.Diagnostics.StackTrace(true);
-            McpLog.Debug($"[WebSocket] HandleSocketClosureAsync called. Reason: {reason}\nStack trace:\n{stackTrace}");
-
-            if (_lifecycleCts == null || _lifecycleCts.IsCancellationRequested)
+            ConnectionContext connection = _activeConnection;
+            if (connection == null || string.IsNullOrWhiteSpace(lifecycleState))
             {
                 return;
             }
 
-            if (Interlocked.CompareExchange(ref _isReconnectingFlag, 1, 0) != 0)
+            string normalizedState = lifecycleState.Trim().ToLowerInvariant();
+            bool isDraining = normalizedState == "compiling"
+                || normalizedState == "reloading"
+                || normalizedState == "draining";
+            _reloadDraining = isDraining;
+            if (isDraining)
             {
-                return;
+                _isConnected = false;
+                _state = TransportState.Transitioning(
+                    TransportDisplayName,
+                    TransportPhase.Draining,
+                    details: _endpointUri?.ToString());
+            }
+            else if (normalizedState == "ready" && connection.Ready.Task.IsCompleted)
+            {
+                _isConnected = true;
+                _state = TransportState.Connected(
+                    TransportDisplayName,
+                    sessionId: connection.SessionId,
+                    details: _endpointUri?.ToString());
             }
 
-            _isConnected = false;
-            _state = _state.WithError(reason ?? "Connection closed");
-            McpLog.Warn($"[WebSocket] Connection closed: {reason}");
-
-            await StopConnectionLoopsAsync(awaitTasks: false).ConfigureAwait(false);
-
-            _ = Task.Run(() => AttemptReconnectAsync(_lifecycleCts.Token), CancellationToken.None);
-        }
-
-        private async Task AttemptReconnectAsync(CancellationToken token)
-        {
-            try
+            if (connection.SupportsClientLifecycle
+                && connection.Socket.State == WebSocketState.Open)
             {
-                await StopConnectionLoopsAsync().ConfigureAwait(false);
-
-                foreach (TimeSpan delay in ReconnectSchedule)
+                JObject payload = new()
                 {
-                    if (token.IsCancellationRequested)
-                    {
-                        return;
-                    }
-
-                    if (delay > TimeSpan.Zero)
-                    {
-                        try { await Task.Delay(delay, token).ConfigureAwait(false); }
-                        catch (OperationCanceledException) { return; }
-                    }
-
-                    if (await EstablishConnectionAsync(token).ConfigureAwait(false))
-                    {
-                        _state = TransportState.Connected(TransportDisplayName, sessionId: _sessionId, details: _endpointUri.ToString());
-                        _isConnected = true;
-                        McpLog.Info("[WebSocket] Reconnected to MCP server", false);
-                        return;
-                    }
-                }
-
-                // Schedule exhausted — keep retrying every 30 s indefinitely so a transient
-                // server outage longer than ~49 s doesn't leave the plugin permanently dead.
-                McpLog.Warn($"[WebSocket] Initial reconnect schedule exhausted. Retrying every {ReconnectTailInterval.TotalSeconds}s until cancelled.");
-                _state = _state.WithError($"Server unreachable – retrying every {ReconnectTailInterval.TotalSeconds} s");
-                while (!token.IsCancellationRequested)
-                {
-                    try { await Task.Delay(ReconnectTailInterval, token).ConfigureAwait(false); }
-                    catch (OperationCanceledException) { return; }
-
-                    if (await EstablishConnectionAsync(token).ConfigureAwait(false))
-                    {
-                        _state = TransportState.Connected(TransportDisplayName, sessionId: _sessionId, details: _endpointUri.ToString());
-                        _isConnected = true;
-                        McpLog.Info("[WebSocket] Reconnected to MCP server", false);
-                        return;
-                    }
-                }
+                    ["type"] = "client_lifecycle",
+                    ["state"] = normalizedState,
+                    ["session_id"] = connection.SessionId,
+                    ["connection_id"] = connection.ConnectionId
+                };
+                await SendJsonAsync(connection, payload, connection.Cancellation.Token).ConfigureAwait(false);
             }
-            finally
+
+            if (normalizedState == "reloading")
             {
-                Interlocked.Exchange(ref _isReconnectingFlag, 0);
+                await CloseConnectionAsync(connection, "Unity assembly reload", graceful: true).ConfigureAwait(false);
             }
         }
 
@@ -1051,6 +1282,15 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
             return builder.Uri;
         }
+
+        private static bool IsExpectedRemoteClose(WebSocketCloseStatus? closeStatus)
+            => closeStatus == WebSocketCloseStatus.NormalClosure
+                || closeStatus == WebSocketCloseStatus.EndpointUnavailable;
+
+        private static bool ShouldWarnForDisconnect(DisconnectKind disconnectKind)
+            => disconnectKind != DisconnectKind.ExpectedRemoteClose
+                && disconnectKind != DisconnectKind.PlannedReload
+                && disconnectKind != DisconnectKind.PlannedShutdown;
 
         private static List<Uri> BuildConnectionCandidateUris(Uri endpointUri)
         {

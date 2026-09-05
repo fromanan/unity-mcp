@@ -133,6 +133,12 @@ namespace MCPForUnity.Editor.Services.Transport
 
         public TransportState GetState(TransportMode mode)
         {
+            IMcpTransportClient client = GetClient(mode);
+            if (client?.State != null)
+            {
+                return client.State;
+            }
+
             return mode switch
             {
                 TransportMode.Http => _httpState,
@@ -142,6 +148,17 @@ namespace MCPForUnity.Editor.Services.Transport
         }
 
         public bool IsRunning(TransportMode mode) => GetState(mode).IsConnected;
+
+        /// <summary>
+        /// Best-effort lifecycle notification used before compilation or assembly reload.
+        /// </summary>
+        public Task NotifyLifecycleAsync(TransportMode mode, string lifecycleState)
+        {
+            IMcpTransportClient client = GetClient(mode);
+            return client is WebSocketTransportClient webSocketClient
+                ? webSocketClient.NotifyLifecycleAsync(lifecycleState)
+                : Task.CompletedTask;
+        }
 
         /// <summary>
         /// Synchronous teardown for shutdown/reload hooks where async awaits are not possible.

@@ -220,7 +220,12 @@ async def run_tests(
     if minimum_tests < 1:
         return MCPResponse(success=False, error="minimum_tests must be at least 1")
 
-    gate = await preflight(ctx, requires_no_tests=True, wait_for_no_compile=True, refresh_if_dirty=True)
+    gate = await preflight(
+        ctx,
+        requires_no_tests=True,
+        wait_for_no_compile=True,
+        block_if_dirty=True,
+    )
     if isinstance(gate, MCPResponse):
         return gate
 

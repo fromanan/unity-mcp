@@ -15,6 +15,14 @@ class WelcomeMessage(BaseModel):
 class RegisteredMessage(BaseModel):
     type: str = "registered"
     session_id: str
+    connection_id: str | None = None
+    ready_required: bool = False
+
+
+class PluginReadyAckMessage(BaseModel):
+    type: str = "plugin_ready_ack"
+    session_id: str
+    connection_id: str
 
 
 class ExecuteCommandMessage(BaseModel):
@@ -25,10 +33,6 @@ class ExecuteCommandMessage(BaseModel):
     timeout: float
 
 
-class PingMessage(BaseModel):
-    """Server-initiated ping to detect dead connections."""
-    type: str = "ping"
-
 # Incoming (Plugin -> Server)
 
 
@@ -38,6 +42,8 @@ class RegisterMessage(BaseModel):
     project_hash: str = Field(max_length=128)
     unity_version: str = Field(default="Unknown", max_length=128)
     project_path: str | None = Field(default=None, max_length=4096)  # Full path to project root (for focus nudging)
+    connection_id: str | None = Field(default=None, max_length=128)
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
 
 
 class RegisterToolsMessage(BaseModel):
@@ -45,9 +51,17 @@ class RegisterToolsMessage(BaseModel):
     tools: list[ToolDefinitionModel] = Field(max_length=256)
 
 
-class PongMessage(BaseModel):
-    type: str = "pong"
+class PluginReadyMessage(BaseModel):
+    type: str = "plugin_ready"
+    session_id: str
+    connection_id: str
+
+
+class ClientLifecycleMessage(BaseModel):
+    type: str = "client_lifecycle"
+    state: str
     session_id: str | None = None
+    connection_id: str | None = None
 
 
 class EditorStateMessage(BaseModel):

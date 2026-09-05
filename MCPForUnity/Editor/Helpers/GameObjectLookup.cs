@@ -257,10 +257,14 @@ namespace MCPForUnity.Editor.Helpers
 
         private static IEnumerable<int> SearchByComponent(string componentTypeName, bool includeInactive, int maxResults)
         {
-            Type componentType = FindComponentType(componentTypeName);
-            if (componentType == null)
+            if (!UnityTypeResolver.TryResolveDetailed(
+                    componentTypeName,
+                    out Type componentType,
+                    out UnityTypeResolver.ResolutionFailure failure,
+                    typeof(Component)))
             {
-                McpLog.Warn($"[GameObjectLookup] Component type '{componentTypeName}' not found.");
+                McpLog.Warn(
+                    $"[GameObjectLookup] Component type resolution failed ({failure.Code}): {failure.Message}");
                 yield break;
             }
 
@@ -372,4 +376,3 @@ namespace MCPForUnity.Editor.Helpers
         }
     }
 }
-

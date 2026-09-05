@@ -1,7 +1,10 @@
+using System.Collections;
 using System.Collections.Generic;
 using NUnit.Framework;
 using UnityEngine;
+using UnityEditor;
 using UnityEditorInternal;
+using UnityEngine.TestTools;
 using Newtonsoft.Json.Linq;
 using MCPForUnity.Editor.Tools.GameObjects;
 
@@ -13,6 +16,7 @@ namespace MCPForUnityTests.Editor.Tools
     /// </summary>
     public class ManageGameObjectCreateTests
     {
+        private const string TestPrefabPath = "Assets/__MCPForUnityPrefabCreationHardeningTest.prefab";
         private List<GameObject> createdObjects = new List<GameObject>();
 
         [TearDown]
@@ -26,6 +30,9 @@ namespace MCPForUnityTests.Editor.Tools
                 }
             }
             createdObjects.Clear();
+            DestroyDuringPrefabInstantiationTestComponent.DestroyInstances = false;
+            DestroyDuringPrefabInstantiationTestComponent.LogWarnings = false;
+            AssetDatabase.DeleteAsset(TestPrefabPath);
         }
 
         private GameObject FindAndTrack(string name)
@@ -36,6 +43,24 @@ namespace MCPForUnityTests.Editor.Tools
                 createdObjects.Add(go);
             }
             return go;
+        }
+
+        private static void CreateTestPrefab(bool includeDestroyingComponent = false)
+        {
+            var source = new GameObject("PrefabCreationHardeningFixture");
+            try
+            {
+                if (includeDestroyingComponent)
+                {
+                    source.AddComponent<DestroyDuringPrefabInstantiationTestComponent>();
+                }
+
+                PrefabUtility.SaveAsPrefabAsset(source, TestPrefabPath);
+            }
+            finally
+            {
+                Object.DestroyImmediate(source);
+            }
         }
 
         #region Basic Create Tests
@@ -86,6 +111,148 @@ namespace MCPForUnityTests.Editor.Tools
             var resultObj = result as JObject ?? JObject.FromObject(result);
 
             Assert.IsFalse(resultObj.Value<bool>("success"), "Should fail with empty name");
+        }
+
+        #endregion
+
+        #region Prefab Hardening Tests
+
+        [Test]
+        public void Create_PlayModeGuard_RequiresExplicitOptIn()
+        {
+            Assert.IsTrue(GameObjectCreate.IsPlayModePrefabCreationBlocked(true, false));
+            Assert.IsFalse(GameObjectCreate.IsPlayModePrefabCreationBlocked(true, true));
+            Assert.IsFalse(GameObjectCreate.IsPlayModePrefabCreationBlocked(false, false));
+        }
+
+        [UnityTest]
+        public IEnumerator Create_PrefabInPlayModeWithoutOptIn_ReturnsBlockedBeforeMutation()
+        {
+            CreateTestPrefab();
+
+            yield return new EnterPlayMode();
+            var result = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "create",
+                ["name"] = "BlockedPlayModePrefabInstance",
+                ["prefabPath"] = TestPrefabPath
+            });
+            var resultObj = result as JObject ?? JObject.FromObject(result);
+            bool instanceWasCreated = GameObject.Find("BlockedPlayModePrefabInstance") != null;
+            yield return new ExitPlayMode();
+
+            Assert.IsFalse(resultObj.Value<bool>("success"), resultObj.ToString());
+            Assert.AreEqual("play_mode_create_blocked", resultObj.Value<string>("code"));
+            Assert.AreEqual(false, resultObj["data"]?.Value<bool>("stateChanged"));
+            Assert.IsFalse(instanceWasCreated);
+        }
+
+        [Test]
+        public void Create_PrefabThatDestroysItself_ReturnsStructuredLifecycleError()
+        {
+            CreateTestPrefab(includeDestroyingComponent: true);
+            DestroyDuringPrefabInstantiationTestComponent.DestroyInstances = true;
+            object result;
+
+            LogAssert.ignoreFailingMessages = true;
+            try
+            {
+                result = ManageGameObject.HandleCommand(new JObject
+                {
+                    ["action"] = "create",
+                    ["name"] = "DestroyedPrefabInstance",
+                    ["prefabPath"] = TestPrefabPath
+                });
+            }
+            finally
+            {
+                LogAssert.ignoreFailingMessages = false;
+                DestroyDuringPrefabInstantiationTestComponent.DestroyInstances = false;
+            }
+
+            var resultObj = result as JObject ?? JObject.FromObject(result);
+            Assert.IsFalse(resultObj.Value<bool>("success"), resultObj.ToString());
+            Assert.AreEqual("prefab_instance_destroyed", resultObj.Value<string>("code"));
+            Assert.AreEqual("prefab_instantiation", resultObj["data"]?.Value<string>("phase"));
+            Assert.AreEqual(true, resultObj["data"]?.Value<bool>("assetLoaded"));
+            Assert.AreEqual(false, resultObj["data"]?.Value<bool>("instanceSurvived"));
+            Assert.AreEqual(false, resultObj["data"]?.Value<bool>("retryable"));
+            Assert.IsNotEmpty(resultObj["data"]?["logs"] as JArray);
+        }
+
+        [Test]
+        public void Create_PrefabLifecycleWarning_SucceedsAndReturnsBoundedDiagnostics()
+        {
+            CreateTestPrefab(includeDestroyingComponent: true);
+            DestroyDuringPrefabInstantiationTestComponent.LogWarnings = true;
+
+            var result = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "create",
+                ["name"] = "WarningPrefabInstance",
+                ["prefabPath"] = TestPrefabPath
+            });
+            var resultObj = result as JObject ?? JObject.FromObject(result);
+
+            Assert.IsTrue(resultObj.Value<bool>("success"), resultObj.ToString());
+            Assert.IsNotEmpty(resultObj["warnings"] as JArray);
+            StringAssert.Contains(
+                "Prefab hardening fixture emitted a lifecycle warning.",
+                resultObj["warnings"]?[0]?["message"]?.ToString());
+            FindAndTrack("WarningPrefabInstance");
+        }
+
+        [Test]
+        public void Create_FailIfSamePrefab_ReturnsNonMutatingDuplicateError()
+        {
+            CreateTestPrefab();
+            var firstResult = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "create",
+                ["name"] = "ExistingPrefabInstance",
+                ["prefabPath"] = TestPrefabPath
+            });
+            var firstResultObj = firstResult as JObject ?? JObject.FromObject(firstResult);
+            Assert.IsTrue(firstResultObj.Value<bool>("success"), firstResultObj.ToString());
+            FindAndTrack("ExistingPrefabInstance");
+
+            var duplicateResult = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "create",
+                ["name"] = "RejectedPrefabInstance",
+                ["prefabPath"] = TestPrefabPath,
+                ["instancePolicy"] = "fail_if_same_prefab"
+            });
+            var duplicateResultObj = duplicateResult as JObject ?? JObject.FromObject(duplicateResult);
+
+            Assert.IsFalse(duplicateResultObj.Value<bool>("success"), duplicateResultObj.ToString());
+            Assert.AreEqual("prefab_instance_exists", duplicateResultObj.Value<string>("code"));
+            Assert.AreEqual(false, duplicateResultObj["data"]?.Value<bool>("stateChanged"));
+            Assert.IsNull(GameObject.Find("RejectedPrefabInstance"));
+        }
+
+        [Test]
+        public void Create_ReuseSamePrefab_ReturnsExistingInstanceWithoutCreatingAnother()
+        {
+            CreateTestPrefab();
+            var existing = PrefabUtility.InstantiatePrefab(
+                AssetDatabase.LoadAssetAtPath<GameObject>(TestPrefabPath)) as GameObject;
+            Assert.IsNotNull(existing);
+            existing.name = "ReusablePrefabInstance";
+            createdObjects.Add(existing);
+
+            var result = ManageGameObject.HandleCommand(new JObject
+            {
+                ["action"] = "create",
+                ["name"] = "IgnoredRequestedName",
+                ["prefabPath"] = TestPrefabPath,
+                ["instancePolicy"] = "reuse_same_prefab"
+            });
+            var resultObj = result as JObject ?? JObject.FromObject(result);
+
+            Assert.IsTrue(resultObj.Value<bool>("success"), resultObj.ToString());
+            Assert.AreEqual(existing.GetInstanceID(), resultObj["data"]?.Value<int>("instanceID"));
+            Assert.IsNull(GameObject.Find("IgnoredRequestedName"));
         }
 
         #endregion
@@ -488,4 +655,3 @@ namespace MCPForUnityTests.Editor.Tools
         #endregion
     }
 }
-

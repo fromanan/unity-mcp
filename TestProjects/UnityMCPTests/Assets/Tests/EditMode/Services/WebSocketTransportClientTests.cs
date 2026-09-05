@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.WebSockets;
 using System.Reflection;
 using System.Text;
 using MCPForUnity.Editor.Services.Transport.Transports;
@@ -12,6 +13,7 @@ namespace MCPForUnityTests.Editor.Services
     public class WebSocketTransportClientTests
     {
         private const string CandidateBuilderMethodName = "BuildConnectionCandidateUris";
+        private const string ReconnectDelayMethodName = "GetReconnectDelay";
         private const string WebSocketTransportClientTypeName = "MCPForUnity.Editor.Services.Transport.Transports.WebSocketTransportClient";
         private static readonly MethodInfo BuildConnectionCandidateUrisMethod = ResolveCandidateBuilderMethod();
 
@@ -80,6 +82,67 @@ namespace MCPForUnityTests.Editor.Services
                 Assert.AreEqual("/custom/path", candidate.AbsolutePath);
                 Assert.AreEqual("?mode=test", candidate.Query);
             }
+        }
+
+        [Test]
+        public void ConnectionLifecycle_UsesGenerationContextAndOneSupervisor()
+        {
+            Type clientType = typeof(WebSocketTransportClient);
+            Type contextType = clientType.GetNestedType(
+                "ConnectionContext",
+                BindingFlags.NonPublic);
+
+            Assert.IsNotNull(contextType);
+            Assert.IsNotNull(contextType.GetProperty("Generation"));
+            Assert.IsNotNull(contextType.GetProperty("ConnectionId"));
+            Assert.IsNotNull(contextType.GetProperty("Ready"));
+            Assert.IsNotNull(contextType.GetProperty("Disconnected"));
+            Assert.IsNotNull(clientType.GetMethod(
+                "SuperviseConnectionsAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic));
+            Assert.IsNull(clientType.GetMethod(
+                "AttemptReconnectAsync",
+                BindingFlags.Instance | BindingFlags.NonPublic));
+            Assert.IsNull(clientType.GetField(
+                "_keepAliveTask",
+                BindingFlags.Instance | BindingFlags.NonPublic));
+        }
+
+        [Test]
+        public void GetReconnectDelay_AfterSchedule_UsesBoundedTail()
+        {
+            MethodInfo method = typeof(WebSocketTransportClient).GetMethod(
+                ReconnectDelayMethodName,
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.IsNotNull(method);
+
+            TimeSpan initial = (TimeSpan)method.Invoke(null, new object[] { 0 });
+            TimeSpan tail = (TimeSpan)method.Invoke(null, new object[] { int.MaxValue });
+
+            Assert.AreEqual(TimeSpan.Zero, initial);
+            Assert.AreEqual(TimeSpan.FromSeconds(30), tail);
+        }
+
+        [Test]
+        public void IsExpectedRemoteClose_ClassifiesNormalLifecycleCodesOnly()
+        {
+            MethodInfo method = typeof(WebSocketTransportClient).GetMethod(
+                "IsExpectedRemoteClose",
+                BindingFlags.Static | BindingFlags.NonPublic);
+            Assert.IsNotNull(method);
+
+            Assert.IsTrue((bool)method.Invoke(
+                null,
+                new object[] { WebSocketCloseStatus.NormalClosure }));
+            Assert.IsTrue((bool)method.Invoke(
+                null,
+                new object[] { WebSocketCloseStatus.EndpointUnavailable }));
+            Assert.IsFalse((bool)method.Invoke(
+                null,
+                new object[] { WebSocketCloseStatus.InternalServerError }));
+            Assert.IsFalse((bool)method.Invoke(
+                null,
+                new object[] { null }));
         }
 
         private static List<Uri> InvokeBuildConnectionCandidateUris(Uri endpoint)

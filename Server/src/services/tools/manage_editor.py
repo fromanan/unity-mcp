@@ -1,4 +1,5 @@
 from typing import Annotated, Any, Literal
+from uuid import uuid4
 
 from fastmcp import Context
 from mcp.types import ToolAnnotations
@@ -10,7 +11,7 @@ from transport.unity_transport import send_with_unity_instance
 from transport.legacy.unity_connection import async_send_command_with_retry
 
 @mcp_for_unity_tool(
-    description="Controls and queries the Unity editor's state and settings. Read-only actions: telemetry_status, telemetry_ping. Modifying actions: play, pause, stop, set_active_tool, add_tag, remove_tag, add_layer, remove_layer, deploy_package, restore_package, undo, redo. For prefab editing (open/save/close prefab stage), use manage_prefabs. deploy_package copies the configured MCPForUnity source folder into the project's installed package location (triggers recompile, no confirmation dialog). restore_package reverts to the pre-deployment backup. undo/redo perform Unity editor undo/redo and return the affected group name.",
+    description="Controls and queries the Unity editor's state and settings. Read-only actions: telemetry_status, telemetry_ping. Modifying actions: play, pause, stop, set_active_tool, add_tag, remove_tag, add_layer, remove_layer, deploy_package, restore_package, undo, redo. Play fails closed while temporary additive-scene leases or cross-scene references exist. For prefab editing (open/save/close prefab stage), use manage_prefabs. deploy_package copies the configured MCPForUnity source folder into the project's installed package location (triggers recompile, no confirmation dialog). restore_package reverts to the pre-deployment backup. undo/redo perform Unity editor undo/redo and return the affected group name.",
     annotations=ToolAnnotations(
         title="Manage Editor",
     ),
@@ -45,6 +46,12 @@ async def manage_editor(
             "layerName": layer_name,
         }
         params = {k: v for k, v in params.items() if v is not None}
+        params["mcpRequestId"] = str(uuid4())
+        client_session_id = getattr(ctx, "session_id", None)
+        if client_session_id:
+            params["mcpClientSessionId"] = str(client_session_id)
+        if unity_instance:
+            params["mcpUnityInstance"] = str(unity_instance)
 
         # Send command using centralized retry helper with instance routing
         response = await send_with_unity_instance(async_send_command_with_retry, unity_instance, "manage_editor", params)

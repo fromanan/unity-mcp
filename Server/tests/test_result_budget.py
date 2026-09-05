@@ -80,6 +80,7 @@ async def test_result_beyond_store_limit_is_rejected_before_full_serialization(
     monkeypatch.setattr(result_store, "max_item_bytes", 1024)
     original = {
         "success": False,
+        "code": "prefab_instance_destroyed",
         "message": "Original failure.",
         "error": "specific_error",
         "hint": "retry",
@@ -93,6 +94,7 @@ async def test_result_beyond_store_limit_is_rejected_before_full_serialization(
     )
 
     assert budgeted["success"] is False
+    assert budgeted["code"] == "prefab_instance_destroyed"
     assert budgeted["error"] == "specific_error"
     assert budgeted["hint"] == "retry"
     assert budgeted["data"]["stored"] is False

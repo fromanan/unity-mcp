@@ -97,7 +97,6 @@ def register_all_resources(mcp: FastMCP, *, project_scoped_tools: bool = True):
             logger.debug(
                 f"Registered resource template: {resource_name} - {uri}")
             registered_count += 1
-            resource_info['func'] = wrapped_template
         else:
             wrapped = enforce_result_budget(f"resource:{resource_name}")(func)
             wrapped = _serialize_pydantic(wrapped)
@@ -109,7 +108,6 @@ def register_all_resources(mcp: FastMCP, *, project_scoped_tools: bool = True):
                 description=description,
                 **kwargs,
             )(wrapped)
-            resource_info['func'] = wrapped
             logger.debug(
                 f"Registered resource: {resource_name} - {description}")
             registered_count += 1

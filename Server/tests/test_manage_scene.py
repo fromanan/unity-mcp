@@ -2,6 +2,7 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
@@ -38,9 +39,9 @@ def mock_unity(monkeypatch):
 # ── All actions forward to Unity ─────────────────────────────────────
 
 ALL_ACTIONS = [
-    "create", "load", "save", "get_hierarchy",
+    "create", "load", "load_preview", "save", "get_hierarchy",
     "get_active", "get_build_settings", "scene_view_frame",
-    "close_scene", "set_active_scene", "get_loaded_scenes",
+    "close_scene", "close_preview_scene", "set_active_scene", "get_loaded_scenes",
     "move_to_scene",
     "validate",
 ]
@@ -64,6 +65,34 @@ def test_load_additive_passes_flag(mock_unity):
     ))
     assert result["success"] is True
     assert mock_unity["params"]["additive"] is True
+
+
+def test_load_additive_passes_authoring_intent(mock_unity):
+    result = asyncio.run(manage_scene(
+        SimpleNamespace(), action="load",
+        path="Assets/Scenes/Level2.unity", additive=True,
+        scene_intent="authoring",
+    ))
+    assert result["success"] is True
+    assert mock_unity["params"]["sceneIntent"] == "authoring"
+
+
+def test_load_preview_passes_path(mock_unity):
+    result = asyncio.run(manage_scene(
+        SimpleNamespace(), action="load_preview",
+        path="Assets/_Recovery/Recovered.unity",
+    ))
+    assert result["success"] is True
+    assert mock_unity["params"]["path"] == "Assets/_Recovery/Recovered.unity"
+
+
+def test_close_preview_scene_passes_lease_id(mock_unity):
+    result = asyncio.run(manage_scene(
+        SimpleNamespace(), action="close_preview_scene",
+        lease_id="lease-123",
+    ))
+    assert result["success"] is True
+    assert mock_unity["params"]["leaseId"] == "lease-123"
 
 
 def test_close_scene_passes_scene_name_and_remove(mock_unity):
@@ -137,5 +166,19 @@ def test_none_params_omitted(mock_unity):
     assert "target" not in params
     assert "removeScene" not in params
     assert "additive" not in params
+    assert "sceneIntent" not in params
+    assert "leaseId" not in params
     assert "template" not in params
     assert "autoRepair" not in params
+
+
+def test_scene_command_includes_correlation_metadata(mock_unity):
+    result = asyncio.run(manage_scene(
+        SimpleNamespace(session_id="client-session-1"),
+        action="get_loaded_scenes",
+    ))
+    assert result["success"] is True
+    params = mock_unity["params"]
+    assert str(UUID(params["mcpRequestId"])) == params["mcpRequestId"]
+    assert params["mcpClientSessionId"] == "client-session-1"
+    assert params["mcpUnityInstance"] == "unity-instance-1"

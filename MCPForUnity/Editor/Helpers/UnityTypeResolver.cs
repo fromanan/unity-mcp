@@ -18,8 +18,35 @@ namespace MCPForUnity.Editor.Helpers
     /// </summary>
     public static class UnityTypeResolver
     {
+        public const string InvalidTypeNameCode = "invalid_type_name";
+        public const string AmbiguousTypeCode = "ambiguous_type";
+        public const string TypeNotFoundCode = "type_not_found";
+
         private static readonly Dictionary<string, Type> CacheByFqn = new(StringComparer.Ordinal);
         private static readonly Dictionary<string, Type> CacheByName = new(StringComparer.Ordinal);
+
+        public sealed class ResolutionFailure
+        {
+            internal ResolutionFailure(
+                string code,
+                string message,
+                string hint,
+                int candidateCount,
+                string[] candidates)
+            {
+                Code = code;
+                Message = message;
+                Hint = hint;
+                CandidateCount = candidateCount;
+                Candidates = candidates;
+            }
+
+            public string Code { get; }
+            public string Message { get; }
+            public string Hint { get; }
+            public int CandidateCount { get; }
+            public string[] Candidates { get; }
+        }
 
         /// <summary>
         /// Resolves a type by name, with optional base type constraint.
@@ -32,40 +59,68 @@ namespace MCPForUnity.Editor.Helpers
         /// <returns>True if type was resolved successfully</returns>
         public static bool TryResolve(string typeName, out Type type, out string error, Type requiredBaseType = null)
         {
-            error = string.Empty;
+            bool resolved = TryResolveDetailed(
+                typeName,
+                out type,
+                out ResolutionFailure failure,
+                requiredBaseType);
+            error = failure?.Message ?? string.Empty;
+            return resolved;
+        }
+
+        /// <summary>
+        /// Resolves a type and returns a stable failure code plus bounded candidate details when resolution fails.
+        /// </summary>
+        public static bool TryResolveDetailed(
+            string typeName,
+            out Type type,
+            out ResolutionFailure failure,
+            Type requiredBaseType = null)
+        {
+            failure = null;
             type = null;
 
             if (string.IsNullOrWhiteSpace(typeName))
             {
-                error = "Type name cannot be null or empty";
+                failure = new ResolutionFailure(
+                    InvalidTypeNameCode,
+                    "Type name cannot be null or empty",
+                    "Provide a non-empty type name.",
+                    0,
+                    Array.Empty<string>());
                 return false;
             }
 
+            bool isShortName = IsShortName(typeName);
+
             // Check caches
-            if (CacheByFqn.TryGetValue(typeName, out type) && PassesConstraint(type, requiredBaseType))
+            if (!isShortName && CacheByFqn.TryGetValue(typeName, out type) && PassesConstraint(type, requiredBaseType))
                 return true;
-            if (!typeName.Contains(".") && CacheByName.TryGetValue(typeName, out type) && PassesConstraint(type, requiredBaseType))
+            if (isShortName && CacheByName.TryGetValue(typeName, out type) && PassesConstraint(type, requiredBaseType))
                 return true;
 
             // Try direct Type.GetType
-            type = Type.GetType(typeName, throwOnError: false);
-            if (type != null && PassesConstraint(type, requiredBaseType))
+            if (!isShortName)
             {
-                Cache(type);
-                return true;
+                type = Type.GetType(typeName, throwOnError: false);
+                if (type != null && PassesConstraint(type, requiredBaseType))
+                {
+                    Cache(type, cacheByShortName: false);
+                    return true;
+                }
             }
 
             // Search loaded assemblies (prefer Player assemblies)
-            var candidates = FindCandidates(typeName, requiredBaseType);
+            List<Type> candidates = FindCandidates(typeName, requiredBaseType);
             if (candidates.Count == 1)
             {
                 type = candidates[0];
-                Cache(type);
+                Cache(type, cacheByShortName: isShortName);
                 return true;
             }
             if (candidates.Count > 1)
             {
-                error = FormatAmbiguityError(typeName, candidates);
+                failure = CreateAmbiguityFailure(typeName, candidates);
                 type = null;
                 return false;
             }
@@ -74,26 +129,31 @@ namespace MCPForUnity.Editor.Helpers
             // Last resort: TypeCache (fast index)
             if (requiredBaseType != null)
             {
-                var tc = TypeCache.GetTypesDerivedFrom(requiredBaseType)
-                                  .Where(t => NamesMatch(t, typeName));
+                IEnumerable<Type> tc = TypeCache.GetTypesDerivedFrom(requiredBaseType)
+                                                .Where(t => NamesMatch(t, typeName));
                 candidates = DisambiguateByIdentity(PreferPlayer(tc).ToList());
                 if (candidates.Count == 1)
                 {
                     type = candidates[0];
-                    Cache(type);
+                    Cache(type, cacheByShortName: isShortName);
                     return true;
                 }
                 if (candidates.Count > 1)
                 {
-                    error = FormatAmbiguityError(typeName, candidates);
+                    failure = CreateAmbiguityFailure(typeName, candidates);
                     type = null;
                     return false;
                 }
             }
 #endif
 
-            error = $"Type '{typeName}' not found in loaded runtime assemblies. " +
-                    "Use a fully-qualified name (Namespace.TypeName) and ensure the script compiled.";
+            failure = new ResolutionFailure(
+                TypeNotFoundCode,
+                $"Type '{typeName}' not found in loaded runtime assemblies. " +
+                "Use a fully-qualified name (Namespace.TypeName) and ensure the script compiled.",
+                "Use a fully-qualified name and ensure the defining script compiled successfully.",
+                0,
+                Array.Empty<string>());
             type = null;
             return false;
         }
@@ -141,17 +201,20 @@ namespace MCPForUnity.Editor.Helpers
             t.Name.Equals(query, StringComparison.Ordinal) ||
             (t.FullName?.Equals(query, StringComparison.Ordinal) ?? false);
 
-        private static void Cache(Type t)
+        private static bool IsShortName(string query) =>
+            !query.Contains(".") && !query.Contains(",");
+
+        private static void Cache(Type t, bool cacheByShortName)
         {
             if (t == null) return;
             if (t.FullName != null) CacheByFqn[t.FullName] = t;
-            CacheByName[t.Name] = t;
+            if (cacheByShortName) CacheByName[t.Name] = t;
         }
 
         private static List<Type> FindCandidates(string query, Type requiredBaseType)
         {
-            bool isShort = !query.Contains('.');
-            var loaded = UnityAssembliesCompat.GetLoadedAssemblies();
+            bool isShort = IsShortName(query);
+            IEnumerable<System.Reflection.Assembly> loaded = UnityAssembliesCompat.GetLoadedAssemblies();
 
 #if UNITY_EDITOR
             // Names of Player (runtime) script assemblies
@@ -258,6 +321,19 @@ namespace MCPForUnity.Editor.Helpers
             if (candidates.Count > 5) names += $" ... ({candidates.Count - 5} more)";
             return $"Ambiguous type reference '{query}'. Found {candidates.Count} matches: [{names}]. Use a fully-qualified name.";
         }
+
+        private static ResolutionFailure CreateAmbiguityFailure(string query, List<Type> candidates)
+        {
+            string[] candidateNames = candidates
+                .Take(5)
+                .Select(candidate => candidate.FullName ?? candidate.Name)
+                .ToArray();
+            return new ResolutionFailure(
+                AmbiguousTypeCode,
+                FormatAmbiguityError(query, candidates),
+                "Use one of the fully-qualified candidate names.",
+                candidates.Count,
+                candidateNames);
+        }
     }
 }
-

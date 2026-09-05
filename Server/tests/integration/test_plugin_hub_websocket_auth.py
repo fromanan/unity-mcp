@@ -9,7 +9,14 @@ import pytest
 from core.config import config
 from core.constants import API_KEY_HEADER
 from services.api_key_service import ApiKeyService, ValidationResult
+from models.models import ToolDefinitionModel
 from transport.plugin_hub import PluginHub
+from transport.models import (
+    ClientLifecycleMessage,
+    PluginReadyMessage,
+    RegisterMessage,
+    RegisterToolsMessage,
+)
 from transport.plugin_registry import PluginRegistry
 
 
@@ -26,6 +33,10 @@ def _reset_plugin_hub():
     old_registry = PluginHub._registry
     old_connections = PluginHub._connections.copy()
     old_pending = PluginHub._pending.copy()
+    old_connection_ids = PluginHub._connection_id_by_session.copy()
+    old_pending_registrations = PluginHub._pending_registrations.copy()
+    old_registration_timeout_tasks = PluginHub._registration_timeout_tasks.copy()
+    old_reloading_sessions = PluginHub._reloading_sessions.copy()
     old_lock = PluginHub._lock
     old_loop = PluginHub._loop
 
@@ -34,6 +45,13 @@ def _reset_plugin_hub():
     PluginHub._registry = old_registry
     PluginHub._connections = old_connections
     PluginHub._pending = old_pending
+    PluginHub._connection_id_by_session = old_connection_ids
+    PluginHub._pending_registrations = old_pending_registrations
+    for task in PluginHub._registration_timeout_tasks.values():
+        if task not in old_registration_timeout_tasks.values():
+            task.cancel()
+    PluginHub._registration_timeout_tasks = old_registration_timeout_tasks
+    PluginHub._reloading_sessions = old_reloading_sessions
     PluginHub._lock = old_lock
     PluginHub._loop = old_loop
 
@@ -189,3 +207,210 @@ class TestUserIdFlowsToRegistration:
 
         await hub.on_disconnect(ws, 1000)
         assert editor_state_store.get("TestProject@abc123") is None
+
+
+class TestReadyHandshakeLifecycle:
+    @pytest.mark.asyncio
+    async def test_provisional_reconnect_keeps_previous_session_until_ready(self, monkeypatch):
+        monkeypatch.setattr(config, "http_remote_hosted", False)
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        hub = _make_hub()
+        old_ws = _make_mock_websocket()
+        new_ws = _make_mock_websocket()
+        replace_global_tools = AsyncMock()
+        monkeypatch.setattr(
+            PluginHub,
+            "_replace_global_tools_for_session",
+            replace_global_tools,
+        )
+
+        await hub._handle_register(
+            old_ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+            ),
+        )
+        old_session_id = await registry.get_session_id_by_hash("hash")
+
+        await hub._handle_register(
+            new_ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+                connection_id="generation-2",
+                capabilities=["plugin_ready_ack_v1"],
+            ),
+        )
+
+        assert await registry.get_session_id_by_hash("hash") == old_session_id
+        provisional = PluginHub._pending_registrations[id(new_ws)]
+        await hub._handle_register_tools(
+            new_ws,
+            RegisterToolsMessage(
+                tools=[ToolDefinitionModel(name="ready_tool", description="ready")],
+            ),
+        )
+        await hub._handle_plugin_ready(
+            new_ws,
+            PluginReadyMessage(
+                session_id=provisional.session_id,
+                connection_id="generation-2",
+            ),
+        )
+
+        assert await registry.get_session_id_by_hash("hash") == provisional.session_id
+        promoted = await registry.get_session(provisional.session_id)
+        assert "ready_tool" in promoted.tools
+        replace_global_tools.assert_awaited()
+        promoted_tools, promoted_owner = replace_global_tools.await_args.args
+        assert promoted_owner == provisional.session_id
+        assert [tool.name for tool in promoted_tools] == ["ready_tool"]
+        old_ws.close.assert_awaited_once_with(code=1001)
+        assert new_ws.send_json.await_args_list[-1].args[0]["type"] == "plugin_ready_ack"
+
+        await hub.on_disconnect(old_ws, 1005)
+        assert await registry.get_session_id_by_hash("hash") == provisional.session_id
+
+    @pytest.mark.asyncio
+    async def test_provisional_disconnect_rolls_back_without_orphan_session(self, monkeypatch):
+        monkeypatch.setattr(config, "http_remote_hosted", False)
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        hub = _make_hub()
+        ws = _make_mock_websocket()
+
+        await hub._handle_register(
+            ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+                connection_id="generation-1",
+                capabilities=["plugin_ready_ack_v1"],
+            ),
+        )
+        await hub.on_disconnect(ws, 1005)
+
+        assert not PluginHub._pending_registrations
+        assert await registry.get_session_id_by_hash("hash") is None
+        assert not PluginHub._connections
+
+    @pytest.mark.asyncio
+    async def test_activation_failure_restores_previous_routable_session(self, monkeypatch):
+        monkeypatch.setattr(config, "http_remote_hosted", False)
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        hub = _make_hub()
+        old_ws = _make_mock_websocket()
+        new_ws = _make_mock_websocket()
+
+        await hub._handle_register(
+            old_ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+            ),
+        )
+        old_session_id = await registry.get_session_id_by_hash("hash")
+
+        await hub._handle_register(
+            new_ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+                connection_id="generation-2",
+                capabilities=["plugin_ready_ack_v1"],
+            ),
+        )
+        provisional = PluginHub._pending_registrations[id(new_ws)]
+
+        from services.state.external_changes_scanner import external_changes_scanner
+
+        original_start_tracking = external_changes_scanner.start_tracking
+        calls = 0
+
+        async def fail_new_activation(instance_id, project_path, session_id):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated activation failure")
+            await original_start_tracking(instance_id, project_path, session_id)
+
+        monkeypatch.setattr(
+            external_changes_scanner,
+            "start_tracking",
+            fail_new_activation,
+        )
+
+        with pytest.raises(RuntimeError, match="simulated activation failure"):
+            await hub._handle_plugin_ready(
+                new_ws,
+                PluginReadyMessage(
+                    session_id=provisional.session_id,
+                    connection_id="generation-2",
+                ),
+            )
+
+        assert await registry.get_session_id_by_hash("hash") == old_session_id
+        assert PluginHub._connections[old_session_id] is old_ws
+        old_ws.close.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provisional_registration_times_out_and_closes(self, monkeypatch):
+        monkeypatch.setattr(config, "http_remote_hosted", False)
+        monkeypatch.setattr(PluginHub, "REGISTRATION_TIMEOUT", 0.01)
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        hub = _make_hub()
+        ws = _make_mock_websocket()
+
+        await hub._handle_register(
+            ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+                connection_id="generation-1",
+                capabilities=["plugin_ready_ack_v1"],
+            ),
+        )
+        await asyncio.sleep(0.03)
+
+        assert not PluginHub._pending_registrations
+        assert not PluginHub._registration_timeout_tasks
+        ws.close.assert_awaited_once_with(
+            code=1008,
+            reason="Plugin registration timed out",
+        )
+
+    @pytest.mark.asyncio
+    async def test_planned_reload_returns_retryable_response(self, monkeypatch):
+        monkeypatch.setattr(config, "http_remote_hosted", False)
+        registry = PluginRegistry()
+        PluginHub.configure(registry, asyncio.get_running_loop())
+        hub = _make_hub()
+        ws = _make_mock_websocket()
+        await hub._handle_register(
+            ws,
+            RegisterMessage(
+                project_name="Project",
+                project_hash="hash",
+                unity_version="6000.3",
+            ),
+        )
+        session_id = await registry.get_session_id_by_hash("hash")
+
+        await hub._handle_client_lifecycle(
+            ws,
+            ClientLifecycleMessage(state="reloading", session_id=session_id),
+        )
+        result = await PluginHub.send_command(session_id, "manage_scene", {})
+
+        assert result["success"] is False
+        assert result["data"]["reason"] == "unity_reloading"

@@ -328,7 +328,11 @@ class CustomToolService:
                     user_id=user_id,
                 )
             except Exception as exc:  # pragma: no cover - network/domain reload variability
-                logger.debug(f"Polling {tool_name} failed, will retry: {exc}")
+                logger.debug(
+                    "Polling %s failed, will retry: %s",
+                    tool_name,
+                    exc,
+                )
                 # Back off modestly but stay responsive.
                 response = {
                     "_mcp_status": "pending",

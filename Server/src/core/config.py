@@ -51,6 +51,8 @@ class ServerConfig:
     # Logging settings
     log_level: str = "INFO"
     log_format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    log_queue_capacity: int = 4096
+    log_shutdown_timeout_seconds: float = 2.0
 
     # Server settings
     max_retries: int = 5

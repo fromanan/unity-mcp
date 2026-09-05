@@ -99,7 +99,11 @@ async def manage_prefabs(
 
     # Preflight check for operations to ensure Unity is ready
     try:
-        gate = await preflight(ctx, wait_for_no_compile=True, refresh_if_dirty=True)
+        gate = await preflight(
+            ctx,
+            wait_for_no_compile=True,
+            block_if_dirty=action not in {"get_info", "get_hierarchy"},
+        )
         if gate is not None:
             return gate.model_dump()
     except Exception as exc:

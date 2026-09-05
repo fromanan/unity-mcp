@@ -15,6 +15,9 @@ from transport.bounded_streamable_http import create_bounded_streamable_http_app
 
 logger = logging.getLogger(__name__)
 
+WEBSOCKET_PING_INTERVAL_SECONDS = 20.0
+WEBSOCKET_PING_TIMEOUT_SECONDS = 60.0
+
 
 class HttpRuntimeController:
     def __init__(self) -> None:
@@ -143,6 +146,8 @@ def run_http_server(
         port=port,
         log_config=None,
         access_log=False,
+        ws_ping_interval=WEBSOCKET_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=WEBSOCKET_PING_TIMEOUT_SECONDS,
     )
     server = uvicorn.Server(uvicorn_config)
     http_runtime_controller.attach(server, app)

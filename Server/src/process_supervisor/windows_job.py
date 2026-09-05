@@ -218,7 +218,12 @@ class WindowsJob:
         )
 
     def launch_suspended(
-        self, command: Sequence[str], *, cwd: str | None = None
+        self,
+        command: Sequence[str],
+        *,
+        cwd: str | None = None,
+        stdout_handle: int | None = None,
+        stderr_handle: int | None = None,
     ) -> int:
         if not command:
             raise ValueError("command must not be empty")
@@ -227,8 +232,16 @@ class WindowsJob:
         startup.cb = ctypes.sizeof(startup)
         startup.dwFlags = STARTF_USESTDHANDLES
         startup.hStdInput = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-        startup.hStdOutput = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        startup.hStdError = kernel32.GetStdHandle(STD_ERROR_HANDLE)
+        startup.hStdOutput = (
+            stdout_handle
+            if stdout_handle is not None
+            else kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        )
+        startup.hStdError = (
+            stderr_handle
+            if stderr_handle is not None
+            else kernel32.GetStdHandle(STD_ERROR_HANDLE)
+        )
         process = PROCESS_INFORMATION()
         flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT
         _check_bool(

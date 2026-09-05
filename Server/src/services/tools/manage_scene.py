@@ -1,4 +1,5 @@
 from typing import Annotated, Literal, Any
+from uuid import uuid4
 
 from fastmcp import Context
 from mcp.types import ToolAnnotations
@@ -15,8 +16,11 @@ from services.tools.preflight import preflight
     description=(
         "Performs CRUD operations on Unity scenes. "
         "Read-only actions: get_hierarchy, get_active, get_build_settings, get_loaded_scenes, scene_view_frame. "
-        "Modifying actions: create (with optional template), load (with optional additive flag), save, "
-        "close_scene, set_active_scene, move_to_scene, validate (with optional auto_repair). "
+        "Modifying actions: create (with optional template), load, load_preview, save, close_scene, "
+        "close_preview_scene, set_active_scene, move_to_scene, validate (with optional auto_repair). "
+        "Use load_preview for recovery/backup inspection. Additive load defaults to a temporary lease that blocks "
+        "save and Play Mode until closed; pass scene_intent='authoring' only for an intentional multi-scene setup. "
+        "When multiple normal scenes are loaded, save requires scene_name or scene_path. "
         "For build settings management (add/remove/enable scenes), use manage_build(action='scenes'). "
         "For screenshots, use manage_camera (screenshot, screenshot_multiview actions)."
     ),
@@ -30,12 +34,14 @@ async def manage_scene(
     action: Annotated[Literal[
         "create",
         "load",
+        "load_preview",
         "save",
         "get_hierarchy",
         "get_active",
         "get_build_settings",
         "scene_view_frame",
         "close_scene",
+        "close_preview_scene",
         "set_active_scene",
         "get_loaded_scenes",
         "move_to_scene",
@@ -73,7 +79,11 @@ async def manage_scene(
     remove_scene: Annotated[bool | str,
                             "For close_scene: true to fully remove, false to just unload."] | None = None,
     additive: Annotated[bool | str,
-                        "For load: true to open scene additively (keeps current scene)."] | None = None,
+                        "For load: true to open scene additively. Recovery/backup scenes must use load_preview."] | None = None,
+    scene_intent: Annotated[Literal["temporary_inspection", "authoring"],
+                            "For additive load: temporary_inspection (default) creates a blocking lease; authoring opts into a durable multi-scene setup."] | None = None,
+    lease_id: Annotated[str,
+                        "For close_preview_scene: lease ID returned by load_preview."] | None = None,
     # --- Scene template ---
     template: Annotated[str,
                         "For create: scene template ('empty', 'default', '3d_basic', '2d_basic'). Omit for empty scene."] | None = None,
@@ -82,7 +92,16 @@ async def manage_scene(
                            "For validate: true to auto-fix missing scripts (undoable)."] | None = None,
 ) -> dict[str, Any]:
     unity_instance = await get_unity_instance_from_context(ctx)
-    gate = await preflight(ctx, wait_for_no_compile=True, refresh_if_dirty=True)
+    gate = await preflight(
+        ctx,
+        wait_for_no_compile=True,
+        block_if_dirty=action not in {
+            "get_hierarchy",
+            "get_active",
+            "get_build_settings",
+            "get_loaded_scenes",
+        },
+    )
     if gate is not None:
         return gate.model_dump()
     try:
@@ -137,6 +156,10 @@ async def manage_scene(
         coerced_additive = coerce_bool(additive, default=None)
         if coerced_additive is not None:
             params["additive"] = coerced_additive
+        if scene_intent is not None:
+            params["sceneIntent"] = scene_intent
+        if lease_id is not None:
+            params["leaseId"] = lease_id
         # Scene template
         if template is not None:
             params["template"] = template
@@ -145,6 +168,13 @@ async def manage_scene(
         coerced_auto_repair = coerce_bool(auto_repair, default=None)
         if coerced_auto_repair is not None:
             params["autoRepair"] = coerced_auto_repair
+
+        params["mcpRequestId"] = str(uuid4())
+        client_session_id = getattr(ctx, "session_id", None)
+        if client_session_id:
+            params["mcpClientSessionId"] = str(client_session_id)
+        if unity_instance:
+            params["mcpUnityInstance"] = str(unity_instance)
 
         # Use centralized retry helper with instance routing
         response = await send_with_unity_instance(async_send_command_with_retry, unity_instance, "manage_scene", params)

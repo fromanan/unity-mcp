@@ -133,3 +133,59 @@ async def test_preflight_fails_closed_for_stale_state(monkeypatch):
     assert result.success is False
     assert result.error == "infrastructure_error"
     assert result.data["reason"] == "stale_editor_state"
+
+
+@pytest.mark.asyncio
+async def test_preflight_fails_closed_when_refresh_returns_failure(monkeypatch):
+    import services.resources.editor_state as editor_state_mod
+    import services.tools.preflight as preflight_mod
+    import services.tools.refresh_unity as refresh_unity_mod
+    from models import MCPResponse
+
+    async def dirty(_ctx):
+        return {
+            "success": True,
+            "data": {
+                "assets": {"external_changes_dirty": True},
+                "advice": {"blocking_reasons": []},
+                "compilation": {"is_compiling": False},
+            },
+        }
+
+    async def failed_refresh(*_args, **_kwargs):
+        return MCPResponse(success=False, error="refresh failed")
+
+    monkeypatch.setattr(preflight_mod, "_in_pytest", lambda: False)
+    monkeypatch.setattr(editor_state_mod, "get_editor_state", dirty)
+    monkeypatch.setattr(refresh_unity_mod, "refresh_unity", failed_refresh)
+
+    result = await preflight_mod.preflight(DummyContext(), refresh_if_dirty=True)
+
+    assert result.success is False
+    assert result.error == "infrastructure_error"
+    assert result.data["reason"] == "asset_refresh_failed"
+
+
+@pytest.mark.asyncio
+async def test_preflight_blocks_dirty_mutation_without_refresh(monkeypatch):
+    import services.resources.editor_state as editor_state_mod
+    import services.tools.preflight as preflight_mod
+
+    async def dirty(_ctx):
+        return {
+            "success": True,
+            "data": {
+                "assets": {"external_changes_dirty": True},
+                "advice": {"blocking_reasons": []},
+                "compilation": {"is_compiling": False},
+            },
+        }
+
+    monkeypatch.setattr(preflight_mod, "_in_pytest", lambda: False)
+    monkeypatch.setattr(editor_state_mod, "get_editor_state", dirty)
+
+    result = await preflight_mod.preflight(DummyContext(), block_if_dirty=True)
+
+    assert result.success is False
+    assert result.error == "busy"
+    assert result.data["reason"] == "external_changes_dirty"

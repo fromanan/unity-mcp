@@ -1,0 +1,6 @@
+<Project>
+  <ItemGroup Condition="'$(MSBuildProjectName)' == 'MCPForUnity.Editor'">
+    <Compile Remove="$(MSBuildThisFileDirectory)..\..\MCPForUnity\Editor\Helpers\AttributedTypeCatalog.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)..\..\MCPForUnity\Editor\Helpers\AttributedTypeCatalog.cs" Link="Editor\Helpers\AttributedTypeCatalog.cs" />
+  </ItemGroup>
+</Project>

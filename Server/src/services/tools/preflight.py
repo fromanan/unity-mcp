@@ -50,6 +50,7 @@ async def preflight(
     requires_no_tests: bool = False,
     wait_for_no_compile: bool = False,
     refresh_if_dirty: bool = False,
+    block_if_dirty: bool = False,
     max_wait_s: float = 30.0,
 ) -> MCPResponse | None:
     """
@@ -79,14 +80,39 @@ async def preflight(
         return _infrastructure_error("invalid_editor_state")
 
     # Optional refresh-if-dirty
-    if refresh_if_dirty:
-        assets = data.get("assets")
-        if isinstance(assets, dict) and assets.get("external_changes_dirty") is True:
+    assets = data.get("assets")
+    if isinstance(assets, dict) and assets.get("external_changes_dirty") is True:
+        if refresh_if_dirty:
             try:
                 from services.tools.refresh_unity import refresh_unity
-                await refresh_unity(ctx, mode="if_dirty", scope="all", compile="request", wait_for_ready=True)
+                refresh_response = await refresh_unity(
+                    ctx,
+                    mode="if_dirty",
+                    scope="all",
+                    compile="request",
+                    wait_for_ready=True,
+                )
             except Exception:
                 return _infrastructure_error("asset_refresh_failed", 1000)
+            refresh_result = (
+                refresh_response.model_dump()
+                if hasattr(refresh_response, "model_dump")
+                else refresh_response
+            )
+            if not isinstance(refresh_result, dict) or not refresh_result.get("success", False):
+                return _infrastructure_error("asset_refresh_failed", 1000)
+            try:
+                from services.resources.editor_state import get_editor_state
+                state_resp = await get_editor_state(ctx)
+                state = state_resp.model_dump() if hasattr(
+                    state_resp, "model_dump") else state_resp
+                data = state.get("data") if isinstance(state, dict) else None
+                if not isinstance(data, dict):
+                    return _infrastructure_error("invalid_editor_state")
+            except Exception:
+                return _infrastructure_error("editor_state_unavailable")
+        elif block_if_dirty:
+            return _busy("external_changes_dirty", 1000)
 
     # Tests running: fail fast for tools that require exclusivity.
     if requires_no_tests:

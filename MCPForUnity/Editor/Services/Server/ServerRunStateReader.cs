@@ -4,6 +4,7 @@ using System.Net;
 using MCPForUnity.Editor.Constants;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
+using UnityEngine;
 
 namespace MCPForUnity.Editor.Services.Server
 {
@@ -22,7 +23,41 @@ namespace MCPForUnity.Editor.Services.Server
                 {
                     return false;
                 }
-                var json = JObject.Parse(File.ReadAllText(path));
+                if (!TryReadPath(path, out status))
+                {
+                    return false;
+                }
+                TryReadLiveSessions(status);
+                return true;
+            }
+            catch (Exception)
+            {
+                status = null;
+                return false;
+            }
+        }
+
+        internal static string GetStateFilePathForPort(int port)
+        {
+            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
+            return Path.Combine(
+                projectRoot,
+                "Library",
+                "MCPForUnity",
+                "RunState",
+                $"mcp_http_{port}.state.json");
+        }
+
+        internal static bool TryReadPath(string path, out ManagedServerStatus status)
+        {
+            status = null;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                {
+                    return false;
+                }
+                JObject json = JObject.Parse(File.ReadAllText(path));
                 if (json.Value<int?>("schema_version") != 1)
                 {
                     return false;
@@ -43,7 +78,6 @@ namespace MCPForUnity.Editor.Services.Server
                     ExitReason = json.Value<string>("exit_reason"),
                     ServerExitCode = json.Value<int?>("server_exit_code")
                 };
-                TryReadLiveSessions(status);
                 return true;
             }
             catch (Exception)

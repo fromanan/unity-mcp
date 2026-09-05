@@ -77,7 +77,7 @@ async def manage_components(
     """
     unity_instance = await get_unity_instance_from_context(ctx)
 
-    gate = await preflight(ctx, wait_for_no_compile=True, refresh_if_dirty=True)
+    gate = await preflight(ctx, wait_for_no_compile=True, block_if_dirty=True)
     if gate is not None:
         return gate.model_dump()
 

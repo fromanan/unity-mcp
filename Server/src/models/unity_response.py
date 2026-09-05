@@ -26,21 +26,27 @@ def normalize_unity_response(response: Any) -> Any:
 
     payload = result if isinstance(result, dict) else {}
     success = status == "success"
+    code = payload.get("code") or response.get("code")
     message = payload.get("message") or response.get("message")
     error = payload.get("error") or response.get("error")
+    hint = payload.get("hint") or response.get("hint")
+    warnings = payload.get("warnings") or response.get("warnings")
 
     data = payload.get("data")
     if data is None and isinstance(payload, dict) and payload:
         data = {k: v for k, v in payload.items() if k not in {
-            "message", "error", "status", "code"}}
+            "message", "error", "status", "code", "hint", "warnings"}}
         if not data:
             data = None
 
     normalized: dict[str, Any] = {
         "success": success,
+        "code": code,
         "message": message,
         "error": error if not success else None,
         "data": data,
+        "hint": hint,
+        "warnings": warnings,
     }
 
     if not success and not normalized["error"]:
@@ -63,8 +69,12 @@ def parse_resource_response(response: Any, typed_cls: Type[MCPResponse]) -> MCPR
     if response.get("success") is False or response.get("status") == "error":
         return MCPResponse(
             success=False,
+            code=response.get("code"),
             error=response.get("error"),
             message=response.get("message"),
+            data=response.get("data"),
+            hint=response.get("hint"),
+            warnings=response.get("warnings"),
         )
 
     return typed_cls(**response)

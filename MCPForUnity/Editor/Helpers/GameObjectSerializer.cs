@@ -259,6 +259,40 @@ namespace MCPForUnity.Editor.Helpers
             return propertyType.IsArray || typeof(IEnumerable).IsAssignableFrom(propertyType);
         }
 
+        private static bool IsObsoleteMember(MemberInfo member)
+        {
+            if (member == null)
+                return false;
+
+            if (member.IsDefined(typeof(ObsoleteAttribute), inherit: true))
+                return true;
+
+            if (member is PropertyInfo propertyInfo)
+            {
+                MethodInfo getter = propertyInfo.GetGetMethod(nonPublic: true);
+                return getter != null && getter.IsDefined(typeof(ObsoleteAttribute), inherit: true);
+            }
+
+            return false;
+        }
+
+        private static bool IsUnavailableAudioSourceProperty(Component component, string propertyName)
+        {
+            if (!(component is AudioSource audioSource))
+                return false;
+
+            bool requiresAudioClip = propertyName == nameof(AudioSource.time)
+                || propertyName == nameof(AudioSource.timeSamples);
+            if (!requiresAudioClip)
+                return false;
+
+#if UNITY_6000_0_OR_NEWER
+            return !(audioSource.resource is AudioClip);
+#else
+            return audioSource.clip == null;
+#endif
+        }
+
         private static bool IsUnavailableNavMeshAgentProperty(Component component, string propertyName)
         {
             if (!(component is UnityEngine.AI.NavMeshAgent navMeshAgent))
@@ -270,6 +304,12 @@ namespace MCPForUnity.Editor.Helpers
                 return false;
 
             return !navMeshAgent.isActiveAndEnabled || !navMeshAgent.isOnNavMesh;
+        }
+
+        private static bool IsUnavailableComponentProperty(Component component, string propertyName)
+        {
+            return IsUnavailableAudioSourceProperty(component, propertyName)
+                || IsUnavailableNavMeshAgentProperty(component, propertyName);
         }
 
         /// <summary>
@@ -495,6 +535,12 @@ namespace MCPForUnity.Editor.Helpers
                     {
                         // Basic filtering (readable, not indexer, not transform which is handled elsewhere)
                         if (!propInfo.CanRead || propInfo.GetIndexParameters().Length > 0 || propInfo.Name == "transform") continue;
+                        if (IsObsoleteMember(propInfo))
+                        {
+                            if (omittedPropertyNames.Count < MaxObjectFields)
+                                omittedPropertyNames.Add(propInfo.Name);
+                            continue;
+                        }
                         // Skip properties whose return type would crash when accessed via reflection
                         // (e.g. Fusion IL-weaved types, Span<>, ReadOnlySpan<>, pointers)
                         if (IsUnsafeType(propInfo.PropertyType) || IsPotentiallyUnboundedProperty(componentType, propInfo))
@@ -518,6 +564,7 @@ namespace MCPForUnity.Editor.Helpers
                     foreach (var fieldInfo in declaredFields)
                     {
                         if (fieldInfo.Name.EndsWith("k__BackingField")) continue; // Skip backing fields
+                        if (IsObsoleteMember(fieldInfo)) continue;
                         // Skip fields whose type would crash when accessed via reflection
                         // (e.g. Fusion IL-weaved types, Span<>, ReadOnlySpan<>, pointers)
                         if (IsUnsafeType(fieldInfo.FieldType)) continue;
@@ -617,7 +664,7 @@ namespace MCPForUnity.Editor.Helpers
                 }
                 // --- End Skip Collider Properties ---
 
-                if (IsUnavailableNavMeshAgentProperty(c, propName))
+                if (IsUnavailableComponentProperty(c, propName))
                 {
                     skipProperty = true;
                 }

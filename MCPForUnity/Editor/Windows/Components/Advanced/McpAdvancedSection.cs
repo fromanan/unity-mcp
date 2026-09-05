@@ -29,6 +29,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
         private Toggle autoStartOnLoadToggle;
         private Toggle debugLogsToggle;
         private Toggle logRecordToggle;
+        private Toggle fullLogParametersToggle;
         private Toggle devModeForceRefreshToggle;
         private Toggle allowInsecureRemoteHttpToggle;
         private IntegerField serverMemorySoftLimitMb;
@@ -81,6 +82,7 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             autoStartOnLoadToggle = Root.Q<Toggle>("auto-start-on-load-toggle");
             debugLogsToggle = Root.Q<Toggle>("debug-logs-toggle");
             logRecordToggle = Root.Q<Toggle>("log-record-toggle");
+            fullLogParametersToggle = Root.Q<Toggle>("full-log-parameters-toggle");
             devModeForceRefreshToggle = Root.Q<Toggle>("dev-mode-force-refresh-toggle");
             allowInsecureRemoteHttpToggle = Root.Q<Toggle>("allow-insecure-remote-http-toggle");
             serverMemorySoftLimitMb = Root.Q<IntegerField>("server-memory-soft-limit-mb");
@@ -122,10 +124,17 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             }
             if (logRecordToggle != null)
             {
-                logRecordToggle.tooltip = "Log every MCP tool execution (tool, action, status, duration) to Assets/UnityMCP/Log/mcp.log.";
+                logRecordToggle.tooltip = "Log every MCP tool execution (tool, parameter shape, action, status, duration) to Library/MCPForUnity/Logs/mcp.log.";
                 var logRecordLabel = logRecordToggle?.parent?.Q<Label>();
                 if (logRecordLabel != null)
                     logRecordLabel.tooltip = logRecordToggle.tooltip;
+            }
+            if (fullLogParametersToggle != null)
+            {
+                fullLogParametersToggle.tooltip = "Opt in to bounded parameter values in MCP records. Secret-looking fields remain redacted.";
+                var fullLogParametersLabel = fullLogParametersToggle?.parent?.Q<Label>();
+                if (fullLogParametersLabel != null)
+                    fullLogParametersLabel.tooltip = fullLogParametersToggle.tooltip;
             }
             if (devModeForceRefreshToggle != null)
             {
@@ -204,6 +213,8 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
 
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
+            if (fullLogParametersToggle != null)
+                fullLogParametersToggle.value = McpLogRecord.IncludeParameterValues;
 
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
             if (allowInsecureRemoteHttpToggle != null)
@@ -267,6 +278,14 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
                 logRecordToggle.RegisterValueChangedCallback(evt =>
                 {
                     McpLogRecord.IsEnabled = evt.newValue;
+                });
+            }
+
+            if (fullLogParametersToggle != null)
+            {
+                fullLogParametersToggle.RegisterValueChangedCallback(evt =>
+                {
+                    McpLogRecord.IncludeParameterValues = evt.newValue;
                 });
             }
 
@@ -461,6 +480,8 @@ namespace MCPForUnity.Editor.Windows.Components.Advanced
             debugLogsToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false);
             if (logRecordToggle != null)
                 logRecordToggle.value = McpLogRecord.IsEnabled;
+            if (fullLogParametersToggle != null)
+                fullLogParametersToggle.value = McpLogRecord.IncludeParameterValues;
             devModeForceRefreshToggle.value = EditorPrefs.GetBool(EditorPrefKeys.DevModeForceServerRefresh, false);
             if (allowInsecureRemoteHttpToggle != null)
             {

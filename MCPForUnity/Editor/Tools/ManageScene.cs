@@ -2,8 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using MCPForUnity.Editor.Helpers; // For Response class
 using MCPForUnity.Runtime.Helpers; // For ScreenshotUtility
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -62,8 +65,13 @@ namespace MCPForUnity.Editor.Tools
             public string target { get; set; }           // GO reference for move_to_scene
             public bool? removeScene { get; set; }       // for close_scene
             public bool? additive { get; set; }          // for load additive mode
+            public string sceneIntent { get; set; }      // "temporary_inspection" (default) or "authoring"
+            public string leaseId { get; set; }          // for close_preview_scene
             public string template { get; set; }         // for create with template
             public bool? autoRepair { get; set; }        // for validate with auto-repair
+            public string mcpRequestId { get; set; }
+            public string mcpClientSessionId { get; set; }
+            public string mcpUnityInstance { get; set; }
         }
 
         private static float[] ParseFloatArray(JToken token)
@@ -140,8 +148,13 @@ namespace MCPForUnity.Editor.Tools
                 target = (p["target"])?.ToString(),
                 removeScene = ParamCoercion.CoerceBoolNullable(p["removeScene"] ?? p["remove_scene"]),
                 additive = ParamCoercion.CoerceBoolNullable(p["additive"]),
+                sceneIntent = (p["sceneIntent"] ?? p["scene_intent"])?.ToString(),
+                leaseId = (p["leaseId"] ?? p["lease_id"])?.ToString(),
                 template = (p["template"])?.ToString()?.ToLowerInvariant(),
                 autoRepair = ParamCoercion.CoerceBoolNullable(p["autoRepair"] ?? p["auto_repair"]),
+                mcpRequestId = (p["mcpRequestId"] ?? p["mcp_request_id"])?.ToString(),
+                mcpClientSessionId = (p["mcpClientSessionId"] ?? p["mcp_client_session_id"])?.ToString(),
+                mcpUnityInstance = (p["mcpUnityInstance"] ?? p["mcp_unity_instance"])?.ToString(),
             };
         }
 
@@ -156,6 +169,23 @@ namespace MCPForUnity.Editor.Tools
                     return scene;
             }
             return null;
+        }
+
+        private static string NormalizeSceneLoadPath(string requestedPath)
+        {
+            if (string.IsNullOrWhiteSpace(requestedPath))
+            {
+                return null;
+            }
+
+            string normalized = AssetPathUtility.NormalizeSeparators(requestedPath).TrimStart('/');
+            if (normalized.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith("Temp/", StringComparison.OrdinalIgnoreCase))
+            {
+                return normalized;
+            }
+            return "Assets/" + normalized;
         }
 
         /// <summary>
@@ -240,17 +270,16 @@ namespace MCPForUnity.Editor.Tools
                         return CreateSceneFromTemplate(fullPath, relativePath, cmd.template);
                     return CreateScene(fullPath, relativePath);
                 case "load":
+                {
                     // Loading can be done by path/name or build index
                     // When path ends with .unity and no name is given, use path directly as the scene path
                     string loadPath = relativePath;
                     if (string.IsNullOrEmpty(loadPath) && !string.IsNullOrEmpty(path))
-                        loadPath = AssetPathUtility.NormalizeSeparators(
-                            path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
-                                ? path : "Assets/" + path);
+                        loadPath = NormalizeSceneLoadPath(path);
                     if (!string.IsNullOrEmpty(loadPath))
                     {
                         if (cmd.additive == true)
-                            return LoadSceneAdditive(loadPath);
+                            return LoadSceneAdditive(loadPath, cmd);
                         return LoadScene(loadPath);
                     }
                     else if (buildIndex.HasValue)
@@ -259,9 +288,23 @@ namespace MCPForUnity.Editor.Tools
                         return new ErrorResponse(
                             "Either 'name'/'path' or 'buildIndex' must be provided for 'load' action."
                         );
+                }
+                case "load_preview":
+                {
+                    string previewPath = string.IsNullOrEmpty(path)
+                        ? relativePath
+                        : NormalizeSceneLoadPath(path);
+                    if (string.IsNullOrEmpty(previewPath))
+                    {
+                        return new ErrorResponse("'path' is required for 'load_preview'.");
+                    }
+                    return LoadPreviewScene(previewPath, cmd);
+                }
                 case "save":
+                {
                     // Save current scene, optionally to a new path
-                    return SaveScene(fullPath, relativePath);
+                    return SaveScene(fullPath, relativePath, cmd);
+                }
                 case "get_hierarchy":
                     try { McpLog.Info("[ManageScene] get_hierarchy: entering", always: false); } catch { }
                     var gh = GetSceneHierarchyPaged(cmd);
@@ -282,6 +325,8 @@ namespace MCPForUnity.Editor.Tools
                 // Multi-scene editing
                 case "close_scene":
                     return CloseScene(cmd);
+                case "close_preview_scene":
+                    return ClosePreviewScene(cmd);
                 case "set_active_scene":
                     return SetActiveScene(cmd);
                 case "get_loaded_scenes":
@@ -299,7 +344,7 @@ namespace MCPForUnity.Editor.Tools
 
                 default:
                     return new ErrorResponse(
-                        $"Unknown action: '{action}'. Valid actions: create, load, save, get_hierarchy, get_active, get_build_settings, screenshot, scene_view_frame, close_scene, set_active_scene, get_loaded_scenes, move_to_scene, validate. For build settings, use manage_build."
+                        $"Unknown action: '{action}'. Valid actions: create, load, load_preview, save, get_hierarchy, get_active, get_build_settings, screenshot, scene_view_frame, close_scene, close_preview_scene, set_active_scene, get_loaded_scenes, move_to_scene, validate. For build settings, use manage_build."
                     );
             }
         }
@@ -458,14 +503,52 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
-        private static object SaveScene(string fullPath, string relativePath)
+        private static object SaveScene(string fullPath, string relativePath, SceneCommand cmd)
         {
             try
             {
-                Scene currentScene = EditorSceneManager.GetActiveScene();
+                bool hasExplicitTarget = !string.IsNullOrEmpty(cmd.sceneName) || !string.IsNullOrEmpty(cmd.scenePath);
+                Scene currentScene;
+                if (hasExplicitTarget)
+                {
+                    Scene? targetScene = FindLoadedScene(cmd.sceneName, cmd.scenePath);
+                    if (!targetScene.HasValue)
+                    {
+                        return ErrorResponse.Structured(
+                            "scene_not_loaded",
+                            "The requested save target is not among the loaded scenes.",
+                            SceneSafetyState.BuildStatusData());
+                    }
+                    currentScene = targetScene.Value;
+                }
+                else
+                {
+                    if (SceneManager.sceneCount > 1)
+                    {
+                        return ErrorResponse.Structured(
+                            "multiple_scenes_require_explicit_target",
+                            "Multiple scenes are loaded. Provide 'scene_name' or 'scene_path' so save cannot target the wrong active scene.",
+                            SceneSafetyState.BuildStatusData());
+                    }
+                    currentScene = EditorSceneManager.GetActiveScene();
+                }
+
                 if (!currentScene.IsValid())
                 {
                     return new ErrorResponse("No valid scene is currently active to save.");
+                }
+                if (!currentScene.isLoaded || EditorSceneManager.IsPreviewScene(currentScene))
+                {
+                    return ErrorResponse.Structured(
+                        "invalid_scene_save_target",
+                        $"Scene '{currentScene.name}' is not a loaded authoring scene and cannot be saved by manage_scene.",
+                        SceneSafetyState.BuildStatusData());
+                }
+
+                ErrorResponse safetyError = SceneSafetyState.ValidateSave(currentScene);
+                if (safetyError != null)
+                {
+                    return safetyError;
                 }
 
                 bool saved;
@@ -1599,22 +1682,188 @@ namespace MCPForUnity.Editor.Tools
 
         // ── Multi-scene editing ────────────────────────────────────────────
 
-        private static object LoadSceneAdditive(string scenePath)
+        private static object LoadSceneAdditive(string scenePath, SceneCommand cmd)
         {
+            if (SceneSafetyState.IsRecoveryOrBackupPath(scenePath))
+            {
+                return ErrorResponse.Structured(
+                    "recovery_scene_requires_preview",
+                    $"Scene '{scenePath}' is a recovery or backup scene. Use action='load_preview' so it cannot join the normal loaded-scene set.",
+                    SceneSafetyState.BuildStatusData());
+            }
+
+            string intent = string.IsNullOrWhiteSpace(cmd.sceneIntent)
+                ? SceneSafetyState.TemporaryInspectionIntent
+                : cmd.sceneIntent.Trim().ToLowerInvariant();
+            if (intent != SceneSafetyState.TemporaryInspectionIntent && intent != SceneSafetyState.AuthoringIntent)
+            {
+                return ErrorResponse.Structured(
+                    "invalid_scene_intent",
+                    $"Unknown scene_intent '{cmd.sceneIntent}'. Use 'temporary_inspection' or 'authoring'.");
+            }
+
             string projectRoot = Application.dataPath.Substring(0, Application.dataPath.Length - "Assets".Length);
             if (!File.Exists(Path.Combine(projectRoot, scenePath)))
                 return new ErrorResponse($"Scene not found: '{scenePath}'");
 
-            var existing = SceneManager.GetSceneByPath(scenePath);
+            Scene existing = SceneManager.GetSceneByPath(scenePath);
             if (existing.IsValid() && existing.isLoaded)
                 return new ErrorResponse($"Scene '{existing.name}' is already loaded.");
 
-            var scene = EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive);
-            return new SuccessResponse($"Opened '{scene.name}' additively.", new
+            List<SceneSafetyState.SceneSnapshot> originalScenes = SceneSafetyState.CaptureScenes();
+            Scene scene = EditorSceneManager.OpenScene(scenePath, OpenSceneMode.Additive);
+            SceneSafetyState.SceneLease lease = null;
+            if (intent == SceneSafetyState.TemporaryInspectionIntent)
+            {
+                lease = SceneSafetyState.RegisterLease(
+                    scene,
+                    SceneSafetyState.AdditiveLeaseKind,
+                    intent,
+                    originalScenes,
+                    cmd.mcpRequestId,
+                    cmd.mcpClientSessionId,
+                    cmd.mcpUnityInstance);
+            }
+
+            SceneSafetyState.SceneSafetyStatus status = SceneSafetyState.GetStatus();
+            object warnings = status.CrossSceneReferenceHazards.Count > 0 || !string.IsNullOrEmpty(status.DetectionError)
+                ? new
+                {
+                    crossSceneReferenceHazards = status.CrossSceneReferenceHazards,
+                    detectionError = status.DetectionError,
+                    saveAndPlayAreBlocked = true
+                }
+                : null;
+            return new SuccessResponse($"Opened '{scene.name}' additively with scene_intent='{intent}'.", new
             {
                 sceneName = scene.name,
                 scenePath = scene.path,
-                loadedSceneCount = SceneManager.sceneCount
+                loadedSceneCount = SceneManager.sceneCount,
+                temporaryLease = lease == null ? null : SceneSafetyState.ToLeaseData(lease),
+                safety = status
+            }, warnings);
+        }
+
+        private static object LoadPreviewScene(string scenePath, SceneCommand cmd)
+        {
+            string projectRoot = Application.dataPath.Substring(0, Application.dataPath.Length - "Assets".Length);
+            if (!File.Exists(Path.Combine(projectRoot, scenePath)))
+            {
+                return new ErrorResponse($"Scene not found: '{scenePath}'");
+            }
+            if (SceneSafetyState.FindLease(null, scenePath, SceneSafetyState.PreviewLeaseKind) != null)
+            {
+                return ErrorResponse.Structured(
+                    "preview_scene_already_loaded",
+                    $"Preview scene '{scenePath}' is already open.",
+                    SceneSafetyState.BuildStatusData());
+            }
+
+            List<SceneSafetyState.SceneSnapshot> originalScenes = SceneSafetyState.CaptureScenes();
+            string previewLoadPath = scenePath;
+            string temporaryCopyPath = null;
+            Scene scene;
+            try
+            {
+                if (!scenePath.EndsWith(".unity", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!SceneSafetyState.IsRecoveryOrBackupPath(scenePath))
+                    {
+                        return ErrorResponse.Structured(
+                            "preview_scene_extension_invalid",
+                            $"Preview scene '{scenePath}' must be a .unity scene or a recognized recovery/backup file.",
+                            SceneSafetyState.BuildStatusData());
+                    }
+
+                    string temporaryDirectory = Path.Combine(projectRoot, "Temp", "MCPForUnity", "PreviewScenes");
+                    Directory.CreateDirectory(temporaryDirectory);
+                    temporaryCopyPath = AssetPathUtility.NormalizeSeparators(Path.Combine(
+                        "Temp",
+                        "MCPForUnity",
+                        "PreviewScenes",
+                        $"{Path.GetFileNameWithoutExtension(scenePath)}-{Guid.NewGuid():N}.unity"));
+                    File.Copy(
+                        Path.Combine(projectRoot, scenePath),
+                        Path.Combine(projectRoot, temporaryCopyPath));
+                    previewLoadPath = temporaryCopyPath;
+                }
+
+                scene = EditorSceneManager.OpenPreviewScene(previewLoadPath);
+            }
+            catch (Exception exception)
+            {
+                SceneSafetyState.DeleteTemporaryPreviewCopy(temporaryCopyPath);
+                return ErrorResponse.Structured(
+                    "preview_scene_open_failed",
+                    $"Failed to open preview scene '{scenePath}': {exception.Message}",
+                    SceneSafetyState.BuildStatusData());
+            }
+            SceneSafetyState.RestoreOriginalActiveScene(originalScenes);
+            SceneSafetyState.SceneLease lease = SceneSafetyState.RegisterLease(
+                scene,
+                SceneSafetyState.PreviewLeaseKind,
+                SceneSafetyState.TemporaryInspectionIntent,
+                originalScenes,
+                cmd.mcpRequestId,
+                cmd.mcpClientSessionId,
+                cmd.mcpUnityInstance,
+                scenePath,
+                temporaryCopyPath);
+            return new SuccessResponse($"Opened '{scene.name}' in an isolated preview scene.", new
+            {
+                sceneName = scene.name,
+                scenePath = lease.ScenePath,
+                loadedScenePath = lease.LoadedScenePath,
+                lease = SceneSafetyState.ToLeaseData(lease),
+                normalLoadedSceneCount = SceneManager.sceneCount,
+                previewSceneCount = EditorSceneManager.previewSceneCount
+            });
+        }
+
+        private static object ClosePreviewScene(SceneCommand cmd)
+        {
+            SceneSafetyState.SceneLease lease = SceneSafetyState.FindLease(
+                cmd.leaseId,
+                cmd.scenePath ?? cmd.path,
+                SceneSafetyState.PreviewLeaseKind);
+            if (lease == null)
+            {
+                return ErrorResponse.Structured(
+                    "preview_scene_lease_not_found",
+                    "No open preview-scene lease matched. Provide 'lease_id' or 'scene_path'.",
+                    SceneSafetyState.BuildStatusData());
+            }
+
+            Scene scene = SceneSafetyState.ResolveLeaseScene(lease);
+            if (!scene.IsValid() || !scene.isLoaded || !EditorSceneManager.IsPreviewScene(scene))
+            {
+                SceneSafetyState.DeleteTemporaryPreviewCopy(lease.TemporaryCopyPath);
+                SceneSafetyState.ReleaseLease(lease.LeaseId);
+                return ErrorResponse.Structured(
+                    "preview_scene_not_loaded",
+                    $"Preview scene for lease '{lease.LeaseId}' is no longer loaded.",
+                    SceneSafetyState.BuildStatusData());
+            }
+
+            string capturedName = scene.name;
+            string capturedLoadedPath = scene.path;
+            SceneSafetyState.RestoreOriginalActiveScene(lease.OriginalScenes);
+            bool closed = EditorSceneManager.ClosePreviewScene(scene);
+            if (!closed)
+            {
+                return new ErrorResponse($"Failed to close preview scene '{capturedName}'.");
+            }
+
+            SceneSafetyState.DeleteTemporaryPreviewCopy(lease.TemporaryCopyPath);
+            SceneSafetyState.ReleaseLease(lease.LeaseId);
+            return new SuccessResponse($"Closed preview scene '{capturedName}'.", new
+            {
+                leaseId = lease.LeaseId,
+                sceneName = capturedName,
+                scenePath = lease.ScenePath,
+                loadedScenePath = capturedLoadedPath,
+                normalLoadedSceneCount = SceneManager.sceneCount,
+                previewSceneCount = EditorSceneManager.previewSceneCount
             });
         }
 
@@ -1631,11 +1880,19 @@ namespace MCPForUnity.Editor.Tools
                 return new ErrorResponse($"Scene '{scene.Value.name}' has unsaved changes. Save first or data will be lost.");
 
             string capturedName = scene.Value.name;
+            SceneSafetyState.SceneLease sceneLease = SceneSafetyState.FindLease(
+                null,
+                scene.Value.path,
+                SceneSafetyState.AdditiveLeaseKind);
             bool remove = cmd.removeScene ?? false;
             bool closed = EditorSceneManager.CloseScene(scene.Value, remove);
             string verb = remove ? "Removed" : "Unloaded";
             if (!closed)
                 return new ErrorResponse($"Failed to {verb.ToLowerInvariant()} scene '{capturedName}'.");
+            if (sceneLease != null)
+            {
+                SceneSafetyState.ReleaseLease(sceneLease.LeaseId);
+            }
             return new SuccessResponse($"{verb} scene '{capturedName}'.", new
             {
                 sceneName = capturedName,
@@ -1661,11 +1918,11 @@ namespace MCPForUnity.Editor.Tools
 
         private static object GetLoadedScenes()
         {
-            var activeScene = SceneManager.GetActiveScene();
-            var scenes = new List<object>();
+            Scene activeScene = SceneManager.GetActiveScene();
+            List<object> scenes = new();
             for (int i = 0; i < SceneManager.sceneCount; i++)
             {
-                var s = SceneManager.GetSceneAt(i);
+                Scene s = SceneManager.GetSceneAt(i);
                 scenes.Add(new
                 {
                     name = s.name,
@@ -1677,7 +1934,11 @@ namespace MCPForUnity.Editor.Tools
                     rootCount = s.isLoaded ? s.rootCount : 0
                 });
             }
-            return new SuccessResponse($"{scenes.Count} scene(s) loaded.", new { scenes });
+            return new SuccessResponse($"{scenes.Count} scene(s) loaded.", new
+            {
+                scenes,
+                safety = SceneSafetyState.GetStatus()
+            });
         }
 
         private static object MoveToScene(SceneCommand cmd)
@@ -2137,5 +2398,754 @@ namespace MCPForUnity.Editor.Tools
             }
         }
 
+    }
+
+    internal static class SceneSafetyState
+    {
+        internal const string TemporaryInspectionIntent = "temporary_inspection";
+        internal const string AuthoringIntent = "authoring";
+        internal const string AdditiveLeaseKind = "additive";
+        internal const string PreviewLeaseKind = "preview";
+
+        private const string LeaseStateKey = "MCPForUnity.SceneSafety.Leases.v1";
+        private static readonly Dictionary<int, Scene> LivePreviewScenes = new();
+
+        internal sealed class SceneSnapshot
+        {
+            [JsonProperty("name")]
+            public string Name { get; set; }
+
+            [JsonProperty("path")]
+            public string Path { get; set; }
+
+            [JsonProperty("handle")]
+            public int Handle { get; set; }
+
+            [JsonProperty("isLoaded")]
+            public bool IsLoaded { get; set; }
+
+            [JsonProperty("isDirty")]
+            public bool IsDirty { get; set; }
+
+            [JsonProperty("isActive")]
+            public bool IsActive { get; set; }
+        }
+
+        internal sealed class SceneLease
+        {
+            [JsonProperty("leaseId")]
+            public string LeaseId { get; set; }
+
+            [JsonProperty("kind")]
+            public string Kind { get; set; }
+
+            [JsonProperty("intent")]
+            public string Intent { get; set; }
+
+            [JsonProperty("sceneName")]
+            public string SceneName { get; set; }
+
+            [JsonProperty("scenePath")]
+            public string ScenePath { get; set; }
+
+            [JsonProperty("loadedScenePath")]
+            public string LoadedScenePath { get; set; }
+
+            [JsonProperty("temporaryCopyPath", NullValueHandling = NullValueHandling.Ignore)]
+            public string TemporaryCopyPath { get; set; }
+
+            [JsonProperty("sceneHandle")]
+            public int SceneHandle { get; set; }
+
+            [JsonProperty("openedUtc")]
+            public string OpenedUtc { get; set; }
+
+            [JsonProperty("requestId")]
+            public string RequestId { get; set; }
+
+            [JsonProperty("clientSessionId")]
+            public string ClientSessionId { get; set; }
+
+            [JsonProperty("unityInstance")]
+            public string UnityInstance { get; set; }
+
+            [JsonProperty("originalSceneFingerprint")]
+            public string OriginalSceneFingerprint { get; set; }
+
+            [JsonProperty("originalScenes")]
+            public List<SceneSnapshot> OriginalScenes { get; set; }
+        }
+
+        internal sealed class CrossSceneReferenceHazard
+        {
+            [JsonProperty("sceneName")]
+            public string SceneName { get; set; }
+
+            [JsonProperty("scenePath")]
+            public string ScenePath { get; set; }
+
+            [JsonProperty("sceneHandle")]
+            public int SceneHandle { get; set; }
+        }
+
+        internal sealed class SceneSafetyStatus
+        {
+            [JsonProperty("currentSceneFingerprint")]
+            public string CurrentSceneFingerprint { get; set; }
+
+            [JsonProperty("temporarySceneLeases")]
+            public List<object> TemporarySceneLeases { get; set; }
+
+            [JsonProperty("crossSceneReferenceHazards")]
+            public List<CrossSceneReferenceHazard> CrossSceneReferenceHazards { get; set; }
+
+            [JsonProperty("detectionError", NullValueHandling = NullValueHandling.Ignore)]
+            public string DetectionError { get; set; }
+        }
+
+        internal static List<SceneSnapshot> CaptureScenes()
+        {
+            Scene activeScene = SceneManager.GetActiveScene();
+            List<SceneSnapshot> scenes = new();
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene scene = SceneManager.GetSceneAt(i);
+                scenes.Add(new SceneSnapshot
+                {
+                    Name = scene.name,
+                    Path = scene.path,
+                    Handle = scene.handle,
+                    IsLoaded = scene.isLoaded,
+                    IsDirty = scene.isDirty,
+                    IsActive = scene == activeScene
+                });
+            }
+            return scenes;
+        }
+
+        internal static string ComputeFingerprint(IReadOnlyList<SceneSnapshot> scenes)
+        {
+            StringBuilder payload = new();
+            foreach (SceneSnapshot scene in scenes.OrderBy(item => item.Handle))
+            {
+                payload.Append(scene.Handle).Append('|')
+                    .Append(scene.Path ?? string.Empty).Append('|')
+                    .Append(scene.Name ?? string.Empty).Append('|')
+                    .Append(scene.IsLoaded ? '1' : '0').Append('|')
+                    .Append(scene.IsDirty ? '1' : '0').Append('|')
+                    .Append(scene.IsActive ? '1' : '0').Append(';');
+            }
+
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(payload.ToString()));
+                return BitConverter.ToString(hash).Replace("-", string.Empty).ToLowerInvariant();
+            }
+        }
+
+        internal static SceneLease RegisterLease(
+            Scene scene,
+            string kind,
+            string intent,
+            List<SceneSnapshot> originalScenes,
+            string requestId,
+            string clientSessionId,
+            string unityInstance,
+            string sourceScenePath = null,
+            string temporaryCopyPath = null)
+        {
+            List<SceneLease> leases = LoadLeases();
+            SceneLease lease = new()
+            {
+                LeaseId = Guid.NewGuid().ToString("D"),
+                Kind = kind,
+                Intent = intent,
+                SceneName = scene.name,
+                ScenePath = string.IsNullOrEmpty(sourceScenePath) ? scene.path : sourceScenePath,
+                LoadedScenePath = scene.path,
+                TemporaryCopyPath = temporaryCopyPath,
+                SceneHandle = scene.handle,
+                OpenedUtc = DateTime.UtcNow.ToString("O"),
+                RequestId = requestId,
+                ClientSessionId = clientSessionId,
+                UnityInstance = unityInstance,
+                OriginalSceneFingerprint = ComputeFingerprint(originalScenes),
+                OriginalScenes = originalScenes
+            };
+            leases.Add(lease);
+            if (string.Equals(kind, PreviewLeaseKind, StringComparison.Ordinal))
+            {
+                LivePreviewScenes[scene.handle] = scene;
+            }
+            SaveLeases(leases);
+            return lease;
+        }
+
+        internal static SceneLease FindLease(string leaseId, string scenePath, string kind)
+        {
+            string normalizedPath = NormalizeScenePath(scenePath);
+            foreach (SceneLease lease in LoadLeases())
+            {
+                if (!string.IsNullOrEmpty(kind) && !string.Equals(lease.Kind, kind, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                if (!string.IsNullOrEmpty(leaseId) && string.Equals(lease.LeaseId, leaseId, StringComparison.Ordinal))
+                {
+                    return lease;
+                }
+                if (!string.IsNullOrEmpty(normalizedPath)
+                    && string.Equals(NormalizeScenePath(lease.ScenePath), normalizedPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return lease;
+                }
+            }
+            return null;
+        }
+
+        internal static Scene ResolveLeaseScene(SceneLease lease)
+        {
+            if (lease == null)
+            {
+                return default;
+            }
+
+            Scene scene;
+            if (string.Equals(lease.Kind, PreviewLeaseKind, StringComparison.Ordinal)
+                && LivePreviewScenes.TryGetValue(lease.SceneHandle, out scene)
+                && MatchesLeaseKind(scene, lease.Kind))
+            {
+                return scene;
+            }
+            if (!string.Equals(lease.Kind, PreviewLeaseKind, StringComparison.Ordinal))
+            {
+                for (int i = 0; i < SceneManager.sceneCount; i++)
+                {
+                    scene = SceneManager.GetSceneAt(i);
+                    if (scene.handle == lease.SceneHandle && MatchesLeaseKind(scene, lease.Kind))
+                    {
+                        return scene;
+                    }
+                }
+            }
+            string loadedScenePath = string.IsNullOrEmpty(lease.LoadedScenePath)
+                ? lease.ScenePath
+                : lease.LoadedScenePath;
+            if (!string.IsNullOrEmpty(loadedScenePath))
+            {
+                scene = SceneManager.GetSceneByPath(loadedScenePath);
+                if (MatchesLeaseKind(scene, lease.Kind))
+                {
+                    return scene;
+                }
+            }
+            return default;
+        }
+
+        internal static bool RestoreOriginalActiveScene(IEnumerable<SceneSnapshot> originalScenes)
+        {
+            SceneSnapshot originalActive = originalScenes?.FirstOrDefault(snapshot => snapshot.IsActive);
+            if (originalActive == null)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene scene = SceneManager.GetSceneAt(i);
+                bool pathMatches = !string.IsNullOrEmpty(originalActive.Path)
+                    && string.Equals(scene.path, originalActive.Path, StringComparison.OrdinalIgnoreCase);
+                bool handleMatches = scene.handle == originalActive.Handle;
+                bool nameMatches = string.IsNullOrEmpty(originalActive.Path)
+                    && string.Equals(scene.name, originalActive.Name, StringComparison.Ordinal);
+                if (scene.IsValid() && scene.isLoaded && (pathMatches || handleMatches || nameMatches))
+                {
+                    return SceneManager.SetActiveScene(scene);
+                }
+            }
+
+            return false;
+        }
+
+        internal static void ReleaseLease(string leaseId)
+        {
+            if (string.IsNullOrEmpty(leaseId))
+            {
+                return;
+            }
+            List<SceneLease> leases = LoadLeases(false);
+            if (leases.RemoveAll(lease => string.Equals(lease.LeaseId, leaseId, StringComparison.Ordinal)) > 0)
+            {
+                foreach (int handle in LivePreviewScenes
+                    .Where(pair => leases.All(lease => lease.SceneHandle != pair.Key))
+                    .Select(pair => pair.Key)
+                    .ToArray())
+                {
+                    LivePreviewScenes.Remove(handle);
+                }
+                SaveLeases(leases);
+            }
+        }
+
+        internal static void DeleteTemporaryPreviewCopy(string temporaryCopyPath)
+        {
+            if (string.IsNullOrEmpty(temporaryCopyPath))
+            {
+                return;
+            }
+
+            string normalized = NormalizeScenePath(temporaryCopyPath);
+            const string ownedPrefix = "Temp/MCPForUnity/PreviewScenes/";
+            if (!normalized.StartsWith(ownedPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                McpLog.Warn($"[SceneSafety] Refused to delete unowned preview copy path '{temporaryCopyPath}'.");
+                return;
+            }
+
+            string projectRoot = Application.dataPath.Substring(0, Application.dataPath.Length - "Assets".Length);
+            string ownedRoot = Path.GetFullPath(Path.Combine(projectRoot, "Temp", "MCPForUnity", "PreviewScenes"));
+            string fullPath = Path.GetFullPath(Path.Combine(projectRoot, normalized));
+            if (!fullPath.StartsWith(ownedRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            {
+                McpLog.Warn($"[SceneSafety] Refused to delete preview copy outside '{ownedRoot}'.");
+                return;
+            }
+            if (File.Exists(fullPath))
+            {
+                File.Delete(fullPath);
+            }
+        }
+
+        internal static SceneSafetyStatus GetStatus()
+        {
+            List<SceneSnapshot> scenes = CaptureScenes();
+            List<CrossSceneReferenceHazard> hazards;
+            string detectionError;
+            TryDetectCrossSceneReferences(out hazards, out detectionError);
+            return new SceneSafetyStatus
+            {
+                CurrentSceneFingerprint = ComputeFingerprint(scenes),
+                TemporarySceneLeases = LoadLeases().Select(ToLeaseData).ToList(),
+                CrossSceneReferenceHazards = hazards,
+                DetectionError = detectionError
+            };
+        }
+
+        internal static object BuildStatusData()
+        {
+            return GetStatus();
+        }
+
+        internal static object ToLeaseData(SceneLease lease)
+        {
+            return new
+            {
+                leaseId = lease.LeaseId,
+                kind = lease.Kind,
+                intent = lease.Intent,
+                sceneName = lease.SceneName,
+                scenePath = lease.ScenePath,
+                loadedScenePath = lease.LoadedScenePath,
+                temporaryCopyPath = lease.TemporaryCopyPath,
+                sceneHandle = lease.SceneHandle,
+                openedUtc = lease.OpenedUtc,
+                requestId = lease.RequestId,
+                clientSessionId = lease.ClientSessionId,
+                unityInstance = lease.UnityInstance,
+                originalSceneFingerprint = lease.OriginalSceneFingerprint,
+                originalScenes = lease.OriginalScenes
+            };
+        }
+
+        internal static ErrorResponse ValidateSave(Scene scene)
+        {
+            try
+            {
+                if (EditorSceneManager.DetectCrossSceneReferences(scene))
+                {
+                    return ErrorResponse.Structured(
+                        "cross_scene_references_detected",
+                        $"Scene '{scene.name}' contains cross-scene references that Unity cannot serialize. Save was blocked before touching disk.",
+                        BuildStatusData());
+                }
+            }
+            catch (Exception exception)
+            {
+                return ErrorResponse.Structured(
+                    "scene_safety_check_failed",
+                    $"Cross-scene reference detection failed for '{scene.name}': {exception.Message}. Save was blocked.",
+                    BuildStatusData());
+            }
+
+            List<SceneLease> leases = GetBlockingAdditiveLeases();
+            if (leases.Count > 0)
+            {
+                return ErrorResponse.Structured(
+                    "temporary_additive_scene_open",
+                    "A temporary MCP additive-scene lease is still open. Close that scene before saving any authoring scene.",
+                    new
+                    {
+                        temporarySceneLeases = leases.Select(ToLeaseData).ToList(),
+                        safety = BuildStatusData()
+                    });
+            }
+            return null;
+        }
+
+        internal static ErrorResponse ValidatePlayModeEntry()
+        {
+            List<SceneLease> leases = GetBlockingAdditiveLeases();
+            if (leases.Count > 0)
+            {
+                return ErrorResponse.Structured(
+                    "temporary_additive_scene_open",
+                    "Play Mode was blocked because a temporary MCP additive-scene lease is still open.",
+                    new
+                    {
+                        temporarySceneLeases = leases.Select(ToLeaseData).ToList(),
+                        safety = BuildStatusData()
+                    });
+            }
+
+            List<CrossSceneReferenceHazard> hazards;
+            string detectionError;
+            if (!TryDetectCrossSceneReferences(out hazards, out detectionError))
+            {
+                return ErrorResponse.Structured(
+                    "scene_safety_check_failed",
+                    $"Play Mode was blocked because cross-scene reference detection failed: {detectionError}",
+                    BuildStatusData());
+            }
+            if (hazards.Count > 0)
+            {
+                return ErrorResponse.Structured(
+                    "cross_scene_references_detected",
+                    "Play Mode was blocked because one or more loaded scenes contain cross-scene references.",
+                    BuildStatusData());
+            }
+            return null;
+        }
+
+        internal static bool IsRecoveryOrBackupPath(string scenePath)
+        {
+            string normalized = NormalizeScenePath(scenePath);
+            return normalized.StartsWith("assets/_recovery/", StringComparison.OrdinalIgnoreCase)
+                || normalized.IndexOf("/_recovery/", StringComparison.OrdinalIgnoreCase) >= 0
+                || normalized.StartsWith("temp/", StringComparison.OrdinalIgnoreCase)
+                || normalized.IndexOf("/__backupscenes/", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        internal static void ClearLeasesForTests()
+        {
+            LivePreviewScenes.Clear();
+            SessionState.EraseString(LeaseStateKey);
+        }
+
+        private static List<SceneLease> GetBlockingAdditiveLeases()
+        {
+            return LoadLeases()
+                .Where(lease => string.Equals(lease.Kind, AdditiveLeaseKind, StringComparison.Ordinal)
+                    && string.Equals(lease.Intent, TemporaryInspectionIntent, StringComparison.Ordinal))
+                .ToList();
+        }
+
+        private static bool TryDetectCrossSceneReferences(
+            out List<CrossSceneReferenceHazard> hazards,
+            out string detectionError)
+        {
+            hazards = new List<CrossSceneReferenceHazard>();
+            detectionError = null;
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene scene = SceneManager.GetSceneAt(i);
+                if (!scene.IsValid() || !scene.isLoaded || EditorSceneManager.IsPreviewScene(scene))
+                {
+                    continue;
+                }
+                try
+                {
+                    if (EditorSceneManager.DetectCrossSceneReferences(scene))
+                    {
+                        hazards.Add(new CrossSceneReferenceHazard
+                        {
+                            SceneName = scene.name,
+                            ScenePath = scene.path,
+                            SceneHandle = scene.handle
+                        });
+                    }
+                }
+                catch (Exception exception)
+                {
+                    detectionError = $"{scene.path}: {exception.Message}";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static List<SceneLease> LoadLeases(bool pruneStale = true)
+        {
+            string json = SessionState.GetString(LeaseStateKey, string.Empty);
+            List<SceneLease> leases;
+            try
+            {
+                leases = string.IsNullOrEmpty(json)
+                    ? new List<SceneLease>()
+                    : JsonConvert.DeserializeObject<List<SceneLease>>(json) ?? new List<SceneLease>();
+            }
+            catch (Exception exception)
+            {
+                McpLog.Warn($"[SceneSafety] Failed to restore scene leases: {exception.Message}");
+                leases = new List<SceneLease>();
+            }
+
+            if (pruneStale)
+            {
+                List<SceneLease> staleLeases = leases.Where(lease => !IsLeaseOpen(lease)).ToList();
+                if (staleLeases.Count > 0)
+                {
+                    foreach (SceneLease lease in staleLeases)
+                    {
+                        DeleteTemporaryPreviewCopy(lease.TemporaryCopyPath);
+                    }
+                    leases.RemoveAll(lease => staleLeases.Contains(lease));
+                    SaveLeases(leases);
+                }
+            }
+            return leases;
+        }
+
+        private static void SaveLeases(List<SceneLease> leases)
+        {
+            if (leases == null || leases.Count == 0)
+            {
+                SessionState.EraseString(LeaseStateKey);
+                return;
+            }
+            SessionState.SetString(LeaseStateKey, JsonConvert.SerializeObject(leases));
+        }
+
+        private static bool IsLeaseOpen(SceneLease lease)
+        {
+            Scene scene = ResolveLeaseScene(lease);
+            return scene.IsValid() && scene.isLoaded;
+        }
+
+        private static bool MatchesLeaseKind(Scene scene, string kind)
+        {
+            if (!scene.IsValid() || !scene.isLoaded)
+            {
+                return false;
+            }
+            bool isPreview = EditorSceneManager.IsPreviewScene(scene);
+            return string.Equals(kind, PreviewLeaseKind, StringComparison.Ordinal) ? isPreview : !isPreview;
+        }
+
+        private static string NormalizeScenePath(string scenePath)
+        {
+            return string.IsNullOrEmpty(scenePath)
+                ? string.Empty
+                : scenePath.Replace('\\', '/').Trim();
+        }
+    }
+
+    internal static class SceneCommandJournal
+    {
+        private const long MaxJournalBytes = 1024 * 1024;
+        private static readonly UTF8Encoding Utf8NoBom = new(false);
+
+        internal static object Execute(string commandName, JObject parameters, Func<object> handler)
+        {
+            if (!ShouldRecord(commandName, parameters))
+            {
+                return handler();
+            }
+
+            List<SceneSafetyState.SceneSnapshot> beforeScenes = SceneSafetyState.CaptureScenes();
+            string requestId = GetParameter(parameters, "mcpRequestId", "mcp_request_id");
+            if (string.IsNullOrEmpty(requestId))
+            {
+                requestId = Guid.NewGuid().ToString("D");
+            }
+
+            try
+            {
+                object result = handler();
+                AppendEntry(commandName, parameters, requestId, beforeScenes, result, null);
+                return result;
+            }
+            catch (Exception exception)
+            {
+                AppendEntry(commandName, parameters, requestId, beforeScenes, null, exception);
+                throw;
+            }
+        }
+
+        internal static bool ShouldRecord(string commandName, JObject parameters)
+        {
+            string action = GetParameter(parameters, "action");
+            if (string.Equals(commandName, "manage_scene", StringComparison.OrdinalIgnoreCase))
+            {
+                switch (action)
+                {
+                    case "create":
+                    case "load":
+                    case "load_preview":
+                    case "save":
+                    case "close_scene":
+                    case "close_preview_scene":
+                    case "set_active_scene":
+                    case "move_to_scene":
+                    {
+                        return true;
+                    }
+                    case "validate":
+                    {
+                        string autoRepair = GetParameter(parameters, "autoRepair", "auto_repair");
+                        return string.Equals(autoRepair, "true", StringComparison.OrdinalIgnoreCase);
+                    }
+                    default:
+                    {
+                        return false;
+                    }
+                }
+            }
+            if (string.Equals(commandName, "manage_editor", StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Equals(action, "play", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(action, "pause", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(action, "stop", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        internal static string GetJournalPath()
+        {
+            string projectRoot = Application.dataPath.Substring(0, Application.dataPath.Length - "Assets".Length);
+            return Path.Combine(projectRoot, "Library", "MCPForUnity", "CommandJournal", "scene-commands.jsonl");
+        }
+
+        private static void AppendEntry(
+            string commandName,
+            JObject parameters,
+            string requestId,
+            List<SceneSafetyState.SceneSnapshot> beforeScenes,
+            object result,
+            Exception exception)
+        {
+            try
+            {
+                List<SceneSafetyState.SceneSnapshot> afterScenes = SceneSafetyState.CaptureScenes();
+                bool success = exception == null && (!(result is IMcpResponse response) || response.Success);
+                string resultSummary = exception == null ? SummarizeResult(result) : exception.Message;
+                string entry = JsonConvert.SerializeObject(new
+                {
+                    utc = DateTime.UtcNow.ToString("O"),
+                    requestId,
+                    clientSessionId = GetParameter(parameters, "mcpClientSessionId", "mcp_client_session_id"),
+                    unityInstance = GetParameter(parameters, "mcpUnityInstance", "mcp_unity_instance"),
+                    tool = commandName,
+                    action = GetParameter(parameters, "action"),
+                    target = GetTarget(parameters),
+                    success,
+                    result = resultSummary,
+                    beforeSceneFingerprint = SceneSafetyState.ComputeFingerprint(beforeScenes),
+                    afterSceneFingerprint = SceneSafetyState.ComputeFingerprint(afterScenes),
+                    beforeScenes,
+                    afterScenes
+                });
+
+                string path = GetJournalPath();
+                string directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+                FileInfo journal = new(path);
+                int entryBytes = Utf8NoBom.GetByteCount(entry) + 1;
+                if (entryBytes > MaxJournalBytes)
+                {
+                    McpLog.Warn("[SceneCommandJournal] Command record exceeded the journal size limit and was not written.");
+                    return;
+                }
+                if (journal.Exists && journal.Length + entryBytes > MaxJournalBytes)
+                {
+                    CompactJournal(path, entryBytes);
+                }
+                File.AppendAllText(path, entry + "\n", Utf8NoBom);
+            }
+            catch (Exception journalException)
+            {
+                McpLog.Warn($"[SceneCommandJournal] Failed to append command record: {journalException.Message}");
+            }
+        }
+
+        private static void CompactJournal(string path, int incomingEntryBytes)
+        {
+            Queue<string> retained = new();
+            long retainedBytes = 0;
+            long retainedBudget = MaxJournalBytes - incomingEntryBytes;
+            foreach (string line in File.ReadLines(path))
+            {
+                int lineBytes = Utf8NoBom.GetByteCount(line) + 1;
+                retained.Enqueue(line);
+                retainedBytes += lineBytes;
+                while (retainedBytes > retainedBudget && retained.Count > 0)
+                {
+                    string removed = retained.Dequeue();
+                    retainedBytes -= Utf8NoBom.GetByteCount(removed) + 1;
+                }
+            }
+            string content = retained.Count == 0 ? string.Empty : string.Join("\n", retained) + "\n";
+            File.WriteAllText(path, content, Utf8NoBom);
+        }
+
+        private static string SummarizeResult(object result)
+        {
+            if (result == null)
+            {
+                return "null";
+            }
+            string summary;
+            try
+            {
+                summary = JsonConvert.SerializeObject(result);
+            }
+            catch
+            {
+                summary = result.ToString();
+            }
+            if (string.IsNullOrEmpty(summary))
+            {
+                return string.Empty;
+            }
+            return summary.Length <= 512 ? summary : summary.Substring(0, 512);
+        }
+
+        private static string GetTarget(JObject parameters)
+        {
+            return GetParameter(parameters, "scenePath", "scene_path")
+                ?? GetParameter(parameters, "path")
+                ?? GetParameter(parameters, "sceneName", "scene_name")
+                ?? GetParameter(parameters, "name")
+                ?? GetParameter(parameters, "target");
+        }
+
+        private static string GetParameter(JObject parameters, params string[] names)
+        {
+            if (parameters == null)
+            {
+                return null;
+            }
+            foreach (string name in names)
+            {
+                JToken token = parameters[name];
+                if (token != null && token.Type != JTokenType.Null)
+                {
+                    return token.ToString();
+                }
+            }
+            return null;
+        }
     }
 }

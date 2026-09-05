@@ -45,7 +45,8 @@ jobs:
             echo "unity_ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "unity_ok=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Unity license secrets absent; E2E bridge smoke will be skipped (not failed)."
+            echo "::error::Unity license secrets absent; E2E bridge smoke cannot run."
+            exit 1
           fi
 
       - uses: actions/checkout@v4

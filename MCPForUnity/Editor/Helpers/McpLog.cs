@@ -13,7 +13,7 @@ namespace MCPForUnity.Editor.Helpers
 
         private static volatile bool _debugEnabled = ReadDebugPreference();
 
-        private static bool IsDebugEnabled() => _debugEnabled;
+        internal static bool DebugEnabled => _debugEnabled;
 
         private static bool ReadDebugPreference()
         {
@@ -30,13 +30,13 @@ namespace MCPForUnity.Editor.Helpers
 
         public static void Debug(string message)
         {
-            if (!IsDebugEnabled()) return;
+            if (!DebugEnabled) return;
             UnityEngine.Debug.Log($"{DebugPrefix} {message}");
         }
 
         public static void Info(string message, bool always = true)
         {
-            if (!always && !IsDebugEnabled()) return;
+            if (!always && !DebugEnabled) return;
             UnityEngine.Debug.Log($"{InfoPrefix} {message}");
         }
 

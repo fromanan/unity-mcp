@@ -65,10 +65,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         private static void IoInfo(string s) { McpLog.Info(s, always: false); }
 
-        private static bool IsDebugEnabled()
-        {
-            try { return EditorPrefs.GetBool(EditorPrefKeys.DebugLogs, false); } catch { return false; }
-        }
+        private static bool IsDebugEnabled() => McpLog.DebugEnabled;
 
         private static void LogBreadcrumb(string stage)
         {

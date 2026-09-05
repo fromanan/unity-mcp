@@ -117,10 +117,12 @@ def _minimum_json_bytes(
         if isinstance(value, MCPResponse):
             value = {
                 "success": value.success,
+                "code": value.code,
                 "message": value.message,
                 "error": value.error,
                 "data": value.data,
                 "hint": value.hint,
+                "warnings": value.warnings,
             }
             value = {key: item for key, item in value.items() if item is not None}
         else:
@@ -204,10 +206,12 @@ def _json_payload(result: Any) -> Any:
     if isinstance(result, MCPResponse):
         payload = {
             "success": result.success,
+            "code": result.code,
             "message": result.message,
             "error": result.error,
             "data": result.data,
             "hint": result.hint,
+            "warnings": result.warnings,
         }
         return {key: value for key, value in payload.items() if value is not None}
     if isinstance(result, BaseModel):
@@ -313,7 +317,7 @@ def _truncated_result(
             "message": f"{original_message or ''} {message}".strip(),
             "data": payload,
         }
-        for key in ("error", "hint"):
+        for key in ("code", "error", "hint", "warnings"):
             if result.get(key) is not None:
                 response[key] = result[key]
         return response

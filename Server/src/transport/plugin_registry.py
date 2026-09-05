@@ -68,6 +68,34 @@ class PluginRegistry:
             A tuple of (new_session, evicted_session_id). The evicted ID is None
             when no previous session was replaced.
         """
+        session, evicted_session = await self.register_reversible(
+            session_id,
+            project_name,
+            project_hash,
+            unity_version,
+            project_path,
+            user_id=user_id,
+            max_sessions=max_sessions,
+            max_sessions_per_user=max_sessions_per_user,
+        )
+        return session, evicted_session.session_id if evicted_session else None
+
+    async def register_reversible(
+        self,
+        session_id: str,
+        project_name: str,
+        project_hash: str,
+        unity_version: str,
+        project_path: str | None = None,
+        user_id: str | None = None,
+        max_sessions: int | None = None,
+        max_sessions_per_user: int | None = None,
+    ) -> tuple[PluginSession, PluginSession | None]:
+        """Register a session and return the full session it replaced, if any.
+
+        The returned session can be supplied to ``rollback_registration`` when
+        downstream activation fails after the registry swap.
+        """
         if config.http_remote_hosted and not user_id:
             raise ValueError("user_id is required in remote-hosted mode")
 
@@ -105,23 +133,61 @@ class PluginRegistry:
             )
 
             # Remove old mapping for this hash if it existed under a different session
-            evicted_session_id: str | None = None
+            evicted_session: PluginSession | None = None
             if user_id:
                 # Remote-hosted mode: use composite key (user_id, project_hash)
                 composite_key = (user_id, project_hash)
                 if previous_session_id and previous_session_id != session_id:
-                    self._sessions.pop(previous_session_id, None)
-                    evicted_session_id = previous_session_id
+                    evicted_session = self._sessions.pop(previous_session_id, None)
                 self._user_hash_to_session[composite_key] = session_id
             else:
                 # Local mode: use project_hash only
                 if previous_session_id and previous_session_id != session_id:
-                    self._sessions.pop(previous_session_id, None)
-                    evicted_session_id = previous_session_id
+                    evicted_session = self._sessions.pop(previous_session_id, None)
                 self._hash_to_session[project_hash] = session_id
 
             self._sessions[session_id] = session
-            return session, evicted_session_id
+            return session, evicted_session
+
+    async def rollback_registration(
+        self,
+        session_id: str,
+        replaced_session: PluginSession | None,
+    ) -> bool:
+        """Remove a failed activation and atomically restore its predecessor.
+
+        Returns False when another registration has already superseded
+        ``session_id``; in that case this stale rollback leaves current routing
+        untouched.
+        """
+        async with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+
+            if session.user_id:
+                key = (session.user_id, session.project_hash)
+                if self._user_hash_to_session.get(key) != session_id:
+                    return False
+                self._user_hash_to_session.pop(key, None)
+            else:
+                if self._hash_to_session.get(session.project_hash) != session_id:
+                    return False
+                self._hash_to_session.pop(session.project_hash, None)
+
+            self._sessions.pop(session_id, None)
+            if replaced_session is None:
+                return True
+
+            self._sessions[replaced_session.session_id] = replaced_session
+            if replaced_session.user_id:
+                key = (replaced_session.user_id, replaced_session.project_hash)
+                self._user_hash_to_session[key] = replaced_session.session_id
+            else:
+                self._hash_to_session[
+                    replaced_session.project_hash
+                ] = replaced_session.session_id
+            return True
 
     async def touch(self, session_id: str) -> None:
         """Update the ``connected_at`` timestamp when a heartbeat is received."""

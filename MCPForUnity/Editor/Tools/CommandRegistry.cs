@@ -295,7 +295,10 @@ namespace MCPForUnity.Editor.Tools
                 throw new InvalidOperationException($"Handler for '{commandName}' does not provide a synchronous implementation");
             }
 
-            return handlerInfo.SyncHandler(@params);
+            return SceneCommandJournal.Execute(
+                commandName,
+                @params,
+                () => handlerInfo.SyncHandler(@params));
         }
 
         /// <summary>
@@ -324,7 +327,10 @@ namespace MCPForUnity.Editor.Tools
                 throw new InvalidOperationException($"Handler for '{commandName}' does not provide a synchronous implementation");
             }
 
-            object result = handlerInfo.SyncHandler(payload);
+            object result = SceneCommandJournal.Execute(
+                commandName,
+                payload,
+                () => handlerInfo.SyncHandler(payload));
             return Task.FromResult(result);
         }
 

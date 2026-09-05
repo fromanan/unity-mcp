@@ -51,10 +51,16 @@ namespace MCPForUnity.Editor.Tools
             {
                 // Play Mode Control
                 case "play":
+                {
                     try
                     {
                         if (!EditorApplication.isPlaying)
                         {
+                            ErrorResponse safetyError = SceneSafetyState.ValidatePlayModeEntry();
+                            if (safetyError != null)
+                            {
+                                return safetyError;
+                            }
                             EditorApplication.isPlaying = true;
                             return new SuccessResponse("Entered play mode.");
                         }
@@ -64,6 +70,7 @@ namespace MCPForUnity.Editor.Tools
                     {
                         return new ErrorResponse($"Error entering play mode: {e.Message}");
                     }
+                }
                 case "pause":
                     try
                     {

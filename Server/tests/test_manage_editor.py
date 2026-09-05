@@ -3,6 +3,7 @@ import asyncio
 import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import UUID
 
 import pytest
 
@@ -94,4 +95,15 @@ def test_undo_omits_none_params(mock_unity):
     assert "tagName" not in params
     assert "layerName" not in params
 
+
+def test_editor_command_includes_correlation_metadata(mock_unity):
+    result = asyncio.run(manage_editor(
+        SimpleNamespace(session_id="client-session-1"),
+        action="play",
+    ))
+    assert result["success"] is True
+    params = mock_unity["params"]
+    assert str(UUID(params["mcpRequestId"])) == params["mcpRequestId"]
+    assert params["mcpClientSessionId"] == "client-session-1"
+    assert params["mcpUnityInstance"] == "unity-instance-1"
 

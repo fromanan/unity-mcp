@@ -41,7 +41,12 @@ async def test_manage_gameobject_create_with_tag(monkeypatch):
 
     async def fake_send(cmd, params, **kwargs):
         captured["params"] = params
-        return {"success": True, "data": {}}
+        return {
+            "success": True,
+            "message": "created",
+            "data": {},
+            "warnings": [{"type": "Warning", "message": "fixture warning"}],
+        }
 
     monkeypatch.setattr(
         manage_go_mod,
@@ -55,6 +60,8 @@ async def test_manage_gameobject_create_with_tag(monkeypatch):
         name="TestObject",
         tag="Player",
         position=[1.0, 2.0, 3.0],
+        allow_play_mode_create="true",
+        instance_policy="fail_if_same_prefab",
     )
 
     assert resp.get("success") is True
@@ -63,3 +70,6 @@ async def test_manage_gameobject_create_with_tag(monkeypatch):
     assert p["name"] == "TestObject"
     assert p["tag"] == "Player"
     assert p["position"] == [1.0, 2.0, 3.0]
+    assert p["allowPlayModeCreate"] is True
+    assert p["instancePolicy"] == "fail_if_same_prefab"
+    assert resp["warnings"][0]["message"] == "fixture warning"

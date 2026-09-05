@@ -106,3 +106,88 @@ namespace MCPForUnityTests.Editor.Tools
         }
     }
 }
+
+namespace MCPForUnityTests.Editor.Tools
+{
+    [TestFixture]
+    public class FindGameObjectsTypeResolutionErrorTests
+    {
+        [Test]
+        public void AmbiguousComponentName_ReturnsStructuredErrorAfterQualifiedLookup()
+        {
+            string qualifiedName = typeof(TypeResolutionFixtures.One.McpAmbiguousLookupProbe).FullName;
+            bool qualifiedResolved = UnityTypeResolver.TryResolveDetailed(
+                qualifiedName,
+                out System.Type resolvedType,
+                out UnityTypeResolver.ResolutionFailure qualifiedFailure,
+                typeof(Component));
+
+            Assert.IsTrue(qualifiedResolved);
+            Assert.AreEqual(typeof(TypeResolutionFixtures.One.McpAmbiguousLookupProbe), resolvedType);
+            Assert.IsNull(qualifiedFailure);
+            LogAssert.Expect(
+                LogType.Warning,
+                new Regex("Component type resolution failed \\(ambiguous_component_type\\)"));
+
+            object result = FindGameObjects.HandleCommand(new JObject
+            {
+                ["searchMethod"] = "by_component",
+                ["searchTerm"] = nameof(TypeResolutionFixtures.One.McpAmbiguousLookupProbe)
+            });
+            JObject response = JObject.FromObject(result);
+            JObject data = (JObject)response["data"];
+            string[] candidates = data["candidates"].ToObject<string[]>();
+
+            Assert.IsFalse(response.Value<bool>("success"));
+            Assert.AreEqual("ambiguous_component_type", response.Value<string>("code"));
+            Assert.That(response.Value<string>("message"), Does.Contain("Ambiguous type reference"));
+            Assert.That(response.Value<string>("hint"), Does.Contain("fully-qualified"));
+            Assert.GreaterOrEqual(data.Value<int>("candidateCount"), 2);
+            CollectionAssert.Contains(
+                candidates,
+                typeof(TypeResolutionFixtures.One.McpAmbiguousLookupProbe).FullName);
+            CollectionAssert.Contains(
+                candidates,
+                typeof(TypeResolutionFixtures.Two.McpAmbiguousLookupProbe).FullName);
+        }
+
+        [Test]
+        public void MissingComponentName_ReturnsStructuredNotFoundError()
+        {
+            const string missingTypeName = "McpDefinitelyMissingComponentType";
+            LogAssert.Expect(
+                LogType.Warning,
+                new Regex("Component type resolution failed \\(component_type_not_found\\)"));
+
+            object result = FindGameObjects.HandleCommand(new JObject
+            {
+                ["searchMethod"] = "by_component",
+                ["searchTerm"] = missingTypeName
+            });
+            JObject response = JObject.FromObject(result);
+            JObject data = (JObject)response["data"];
+            JArray candidates = (JArray)data["candidates"];
+
+            Assert.IsFalse(response.Value<bool>("success"));
+            Assert.AreEqual("component_type_not_found", response.Value<string>("code"));
+            Assert.That(response.Value<string>("message"), Does.Contain("not found"));
+            Assert.That(response.Value<string>("hint"), Does.Contain("compiled successfully"));
+            Assert.AreEqual(0, data.Value<int>("candidateCount"));
+            Assert.AreEqual(0, candidates.Count);
+        }
+    }
+}
+
+namespace MCPForUnityTests.Editor.Tools.TypeResolutionFixtures.One
+{
+    public sealed class McpAmbiguousLookupProbe : MonoBehaviour
+    {
+    }
+}
+
+namespace MCPForUnityTests.Editor.Tools.TypeResolutionFixtures.Two
+{
+    public sealed class McpAmbiguousLookupProbe : MonoBehaviour
+    {
+    }
+}

@@ -62,8 +62,8 @@ async def test_timeout_returns_false(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stale_only_treated_as_ready(monkeypatch):
-    """If the only blocking reason is stale_status, consider ready."""
+async def test_stale_only_fails_closed(monkeypatch):
+    """If the only blocking reason is stale_status, keep waiting and time out."""
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
 
     from services.tools import refresh_unity as mod
@@ -74,8 +74,9 @@ async def test_stale_only_treated_as_ready(monkeypatch):
     monkeypatch.setattr(mod.editor_state, "get_editor_state", fake_get_editor_state)
 
     ctx = DummyContext()
-    ready, elapsed = await mod.wait_for_editor_ready(ctx, timeout_s=5.0)
-    assert ready is True
+    ready, elapsed = await mod.wait_for_editor_ready(ctx, timeout_s=0.3)
+    assert ready is False
+    assert elapsed >= 0.25
 
 
 @pytest.mark.asyncio

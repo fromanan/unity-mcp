@@ -51,7 +51,7 @@ class UnityConnection:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError as exc:
-            logger.debug(f"Unable to set TCP_NODELAY: {exc}")
+            logger.debug("Unable to set TCP_NODELAY: %s", exc)
 
     def connect(self, connect_timeout: float | None = None) -> bool:
         """Establish a connection to the Unity Editor."""
@@ -71,7 +71,7 @@ class UnityConnection:
                     (self.host, self.port), connect_timeout)
                 self._prepare_socket(self.sock)
                 self._needs_tool_resync = True
-                logger.debug(f"Connected to Unity at {self.host}:{self.port}")
+                logger.debug("Connected to Unity at %s:%s", self.host, self.port)
 
                 # Strict handshake: require FRAMING=1
                 try:
@@ -113,7 +113,7 @@ class UnityConnection:
                     self.sock.settimeout(config.connection_timeout)
                 return True
             except Exception as e:
-                logger.error(f"Failed to connect to Unity: {str(e)}")
+                logger.error("Failed to connect to Unity: %s", e)
                 try:
                     if self.sock:
                         self.sock.close()
@@ -128,7 +128,7 @@ class UnityConnection:
             try:
                 self.sock.close()
             except Exception as e:
-                logger.error(f"Error disconnecting from Unity: {str(e)}")
+                logger.error("Error disconnecting from Unity: %s", e)
             finally:
                 self.sock = None
 
@@ -210,7 +210,7 @@ class UnityConnection:
             except TimeoutError:
                 raise
             except Exception as exc:
-                logger.error(f"Error during framed receive: {exc}")
+                logger.error("Error during framed receive: %s", exc)
                 raise
 
         data = bytearray()
@@ -344,13 +344,13 @@ class UnityConnection:
                     "Unity status file disappeared before it could be read")
                 return None
             except json.JSONDecodeError as exc:
-                logger.warning(f"Malformed Unity status file: {exc}")
+                logger.warning("Malformed Unity status file: %s", exc)
                 return None
             except OSError as exc:
-                logger.warning(f"Failed to read Unity status file: {exc}")
+                logger.warning("Failed to read Unity status file: %s", exc)
                 return None
             except Exception as exc:
-                logger.debug(f"Preflight status check failed: {exc}")
+                logger.debug("Preflight status check failed: %s", exc)
                 return None
 
         # Extract hash suffix from instance id (e.g., Project@hash)
@@ -374,7 +374,7 @@ class UnityConnection:
                     hint="retry",
                 )
         except Exception as exc:
-            logger.debug(f"Preflight status check failed: {exc}")
+            logger.debug("Preflight status check failed: %s", exc)
 
         if payload is None:
             payload = json.dumps(
@@ -486,7 +486,7 @@ class UnityConnection:
                             f"Unity port changed {self.port} -> {new_port}")
                     self.port = new_port
                 except Exception as de:
-                    logger.debug(f"Port discovery failed: {de}")
+                    logger.debug("Port discovery failed: %s", de)
 
                 if attempt < attempts:
                     # Heartbeat-aware, jittered backoff
@@ -599,7 +599,7 @@ class UnityConnectionPool:
         if instance_identifier is None:
             if self._default_instance_id:
                 instance_identifier = self._default_instance_id
-                logger.debug(f"Using default instance: {instance_identifier}")
+                logger.debug("Using default instance: %s", instance_identifier)
             elif len(instances) == 1:
                 # Sole instance: unambiguous, select it without requiring a hint.
                 return instances[0]
@@ -730,7 +730,7 @@ class UnityConnectionPool:
                     logger.info(
                         f"Updating cached port for {target.id}: {conn.port} -> {target.port}")
                     conn.port = target.port
-                logger.debug(f"Reusing existing connection to: {target.id}")
+                logger.debug("Reusing existing connection to: %s", target.id)
 
             return self._connections[target.id]
 
@@ -743,7 +743,7 @@ class UnityConnectionPool:
                         f"Disconnecting from Unity instance: {instance_id}")
                     conn.disconnect()
                 except Exception:
-                    logger.exception(f"Error disconnecting from {instance_id}")
+                    logger.exception("Error disconnecting from %s", instance_id)
             self._connections.clear()
 
 

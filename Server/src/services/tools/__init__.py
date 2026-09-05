@@ -2,6 +2,7 @@
 
 import logging
 import os
+from functools import wraps
 from pathlib import Path
 from typing import TypeVar
 
@@ -14,10 +15,19 @@ from services.registry import (
     DEFAULT_ENABLED_GROUPS,
     DEFAULT_TOOL_PROFILE,
     TOOL_GROUPS,
+    get_group_tool_names,
     get_registered_tools,
 )
 
 logger = logging.getLogger("mcp-for-unity-server")
+
+_READINESS_BYPASS_TOOLS = frozenset({
+    "get_test_job",
+    "read_console",
+    "refresh_unity",
+    "run_tests",
+    "unity_docs",
+})
 
 # Export decorator and helpers for easy imports within tools
 __all__ = [
@@ -25,6 +35,25 @@ __all__ = [
     "sync_tool_visibility_from_unity",
     "get_unity_instance_from_context",
 ]
+
+
+def _with_unity_readiness_guard(tool_name: str, func, unity_target: str | None):
+    if unity_target is None or tool_name in _READINESS_BYPASS_TOOLS:
+        return func
+
+    @wraps(func)
+    async def guarded(*args, **kwargs):
+        ctx = kwargs.get("ctx")
+        if ctx is None and args:
+            ctx = args[0]
+        if ctx is not None:
+            from services.tools.preflight import preflight
+            gate = await preflight(ctx, wait_for_no_compile=True)
+            if gate is not None:
+                return gate.model_dump()
+        return await func(*args, **kwargs)
+
+    return guarded
 
 
 def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
@@ -73,6 +102,12 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
             )
             continue
 
+        func = _with_unity_readiness_guard(
+            tool_name,
+            func,
+            tool_info.get('unity_target'),
+        )
+
         # Apply decorators: logging -> telemetry -> mcp.tool
         # Note: Parameter normalization (camelCase -> snake_case) is handled by
         # ParamNormalizerMiddleware before FastMCP validation
@@ -81,7 +116,6 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
         wrapped = telemetry_tool(tool_name)(wrapped)
         wrapped = mcp.tool(
             name=tool_name, description=description, **kwargs)(wrapped)
-        tool_info['func'] = wrapped
         registered_count += 1
         logger.debug(f"Registered tool: {tool_name} - {description}")
 
@@ -103,6 +137,7 @@ def register_all_tools(mcp: FastMCP, *, project_scoped_tools: bool = True):
 
 
 async def sync_tool_visibility_from_unity(
+    ctx: Context | None = None,
     instance_id: str | None = None,
     notify: bool = True,
 ) -> dict:
@@ -120,13 +155,26 @@ async def sync_tool_visibility_from_unity(
     Returns:
         dict with sync results (enabled/disabled groups, tool count).
     """
+    from core.config import config
     from transport.legacy.unity_connection import async_send_command_with_retry
     from transport.plugin_hub import PluginHub
 
     try:
-        response = await async_send_command_with_retry(
-            "get_tool_states", {}, instance_id=instance_id,
-        )
+        is_http = (config.transport_mode or "stdio").lower() == "http"
+        if is_http:
+            if ctx is None:
+                return {"error": "HTTP tool sync requires an MCP request context"}
+            from transport.unity_transport import send_with_unity_instance
+            response = await send_with_unity_instance(
+                async_send_command_with_retry,
+                instance_id,
+                "get_tool_states",
+                {},
+            )
+        else:
+            response = await async_send_command_with_retry(
+                "get_tool_states", {}, instance_id=instance_id,
+            )
 
         # Detect unsupported command (Unity package too old)
         if isinstance(response, dict):
@@ -175,10 +223,22 @@ async def sync_tool_visibility_from_unity(
             len(enabled_tools), len(tools),
         )
 
-        PluginHub._sync_server_tool_visibility(
-            enabled_tools,
-            enable_registered=notify,
-        )
+        if is_http:
+            group_tools = get_group_tool_names()
+            enabled_names = {
+                tool.get("name") for tool in enabled_tools if tool.get("name")
+            }
+            for group_name, tool_names in group_tools.items():
+                tags = {f"group:{group_name}"}
+                if any(name in enabled_names for name in tool_names):
+                    await ctx.enable_components(tags=tags, components={"tool"})
+                else:
+                    await ctx.disable_components(tags=tags, components={"tool"})
+        else:
+            PluginHub._sync_server_tool_visibility(
+                enabled_tools,
+                enable_registered=notify,
+            )
 
         # Register custom (non-built-in) tools via CustomToolService.
         # The extended get_tool_states response includes is_built_in,
@@ -188,7 +248,7 @@ async def sync_tool_visibility_from_unity(
         has_extended_metadata = any(
             "is_built_in" in t for t in enabled_tools
         )
-        if has_extended_metadata:
+        if has_extended_metadata and not is_http:
             custom_tool_dicts = [
                 t for t in enabled_tools if not t.get("is_built_in", True)
             ]
@@ -252,11 +312,10 @@ async def sync_tool_visibility_from_unity(
                 "Update MCPForUnity to enable custom tool sync in stdio mode."
             )
 
-        if notify:
+        if notify and not is_http:
             await PluginHub._notify_mcp_tool_list_changed()
 
         # Build summary
-        from services.registry import get_group_tool_names
         group_tools = get_group_tool_names()
         enabled_names = {t.get("name") for t in enabled_tools if t.get("name")}
         enabled_groups = []

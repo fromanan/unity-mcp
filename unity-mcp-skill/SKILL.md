@@ -20,12 +20,27 @@ Before applying a template:
 **Always read relevant resources before using tools.** This prevents errors and provides the necessary context.
 
 ```
-1. Check editor state     → mcpforunity://editor/state
-2. Understand the scene   → mcpforunity://scene/gameobject-api
-3. Find what you need     → find_gameobjects or resources
-4. Take action            → tools (manage_gameobject, create_script, script_apply_edits, apply_text_edits, validate_script, delete_script, get_sha, etc.)
-5. Verify results         → read_console, manage_camera(action="screenshot"), resources
+1. Select the instance    → mcpforunity://instances, then set_active_instance when needed
+2. Check editor state     → mcpforunity://editor/state
+3. Discover tools         → manage_tools(action="search", query="...")
+4. Activate one group     → manage_tools(action="activate", group="...")
+5. Inspect the target     → resources, then find_gameobjects or another narrow query
+6. Take action            → the activated tool using its live schema
+7. Verify results         → editor state, filtered console reads, resources, and screenshots/tests as appropriate
 ```
+
+## Tool Discovery and Bounded Results
+
+The default server exposes only `manage_tools`, `set_active_instance`, `execute_custom_tool`, and `manage_script_capabilities`. Search first, then activate only the group needed for the current task:
+
+```python
+manage_tools(action="search", query="scene")
+manage_tools(action="activate", group="core")
+```
+
+Use `mcpforunity://tool-groups` for a compact group catalog. The live MCP schema is authoritative; this skill's references are curated operating guidance rather than an exhaustive copy of every tool schema.
+
+Large results may return a `result_uri` such as `mcpforunity://results/{result_id}/0`. Read that URI and follow `next_uri` until it is null. Do not repeat the original broad call merely to force the payload inline.
 
 ## Critical Best Practices
 
@@ -45,21 +60,23 @@ read_console(types=["error"], count=10, include_stacktrace=True)
 
 **Why:** Unity must compile scripts before they're usable. `create_script` and `script_apply_edits` already trigger import and compilation automatically — calling `refresh_unity` afterward is redundant.
 
-### 2. Use `batch_execute` for Multiple Operations
+### 2. Use `batch_execute` to Reduce Round Trips
 
 ```python
-# 10-100x faster than sequential calls
+# One MCP round trip for several ordered Unity commands
 batch_execute(
     commands=[
         {"tool": "manage_gameobject", "params": {"action": "create", "name": "Cube1", "primitive_type": "Cube"}},
         {"tool": "manage_gameobject", "params": {"action": "create", "name": "Cube2", "primitive_type": "Cube"}},
         {"tool": "manage_gameobject", "params": {"action": "create", "name": "Cube3", "primitive_type": "Cube"}}
     ],
-    parallel=True  # Hint only: Unity may still execute sequentially
+    fail_fast=True
 )
 ```
 
 **Max 25 commands per batch by default (configurable in Unity MCP Tools window, max 100).** Use `fail_fast=True` for dependent operations.
+
+Unity executes the batch as one main-thread sequence. The legacy `parallel` and `max_parallelism` fields are deprecated compatibility inputs and do not make Unity commands concurrent. A batch is not rollback-transactional: earlier successful commands remain applied if a later command fails.
 
 **Tip:** Also use `batch_execute` for discovery — batch multiple `find_gameobjects` calls instead of calling them one at a time:
 ```python
@@ -133,11 +150,32 @@ read_console(
 
 ```python
 # Read mcpforunity://editor/state to check:
-# - is_compiling: Wait if true
-# - is_domain_reload_pending: Wait if true  
-# - ready_for_tools: Only proceed if true
-# - blocking_reasons: Why tools might fail
+# - compilation.is_compiling: Wait if true
+# - compilation.is_domain_reload_pending: Wait if true
+# - advice.ready_for_tools: Only proceed if true
+# - advice.blocking_reasons: Why tools might fail
+# - staleness.is_stale: A stale snapshot is not readiness proof
 ```
+
+## Mutation Safety Contracts
+
+### Scene recovery, additive work, save, and Play Mode
+
+- Inspect recovery scenes with `manage_scene(action="load_preview")`, then close the returned lease with `close_preview_scene`. Never load recovery or `Temp/__Backupscenes/*.backup` files additively into the authoring scene.
+- Additive loads default to `scene_intent="temporary_inspection"`. Their lease blocks MCP save and Play Mode until closed. Use `scene_intent="authoring"` only for a deliberate persistent multi-scene composition.
+- When multiple normal scenes are loaded, identify the save target with `scene_name` or `scene_path`. Save and MCP Play fail closed on cross-scene references.
+- Scene-changing commands and editor Play/pause/stop commands write a bounded journal at `Library/MCPForUnity/CommandJournal/scene-commands.jsonl` with request/session/Unity correlation and before/after scene fingerprints. Use it for recovery and audit evidence; do not treat it as mutation authority.
+
+### Prefab creation and lifecycle
+
+- Prefab creation in Play Mode is blocked unless `allow_play_mode_create=true` is explicitly supplied. Opt in only when `Awake`/`OnEnable`, singleton, and persistence effects are intentional.
+- `instance_policy` accepts `always_create` (ordinary default), `fail_if_same_prefab`, or `reuse_same_prefab`. Prefer reject or reuse for singleton/bootstrap prefabs.
+- Interpret stable failure codes before diagnosing corruption: `play_mode_create_blocked`, `prefab_instance_exists`, and `prefab_instance_destroyed`. The last means the instance died during a lifecycle phase; inspect its `hint`, `data`, and bounded diagnostics.
+- A successful creation may still contain `warnings`. Preserve and inspect `code`, `message`, `hint`, `data`, and `warnings` rather than collapsing the response to one text field.
+
+### Reflected component data
+
+Component resources omit obsolete members, unsafe/unbounded values, and state-invalid getters before invocation. In particular, `AudioSource.time` and `timeSamples` are omitted unless the source has a real `AudioClip`; guarded `NavMeshAgent` properties remain unavailable off-mesh. Check `serialization.omittedProperties` and `serialization.truncated` before concluding that a property does not exist or has no value.
 
 ## Parameter Type Conventions
 
@@ -178,19 +216,25 @@ uri="file:///full/path/to/file.cs"
 
 | Category | Key Tools | Use For |
 |----------|-----------|---------|
-| **Scene** | `manage_scene`, `find_gameobjects` | Scene operations, finding objects |
-| **Objects** | `manage_gameobject`, `manage_components` | Creating/modifying GameObjects |
-| **Scripts** | `create_script`, `script_apply_edits`, `validate_script` | C# code management (auto-refreshes on create/edit) |
-| **Assets** | `manage_asset`, `manage_prefabs` | Asset operations. **Prefab instantiation** is done via `manage_gameobject(action="create", prefab_path="...")`, not `manage_prefabs`. |
-| **Editor** | `manage_editor`, `execute_menu_item`, `read_console` | Editor control, package deployment (`deploy_package`/`restore_package` actions) |
-| **Testing** | `run_tests`, `get_test_job` | Unity Test Framework |
-| **Batch** | `batch_execute` | Parallel/bulk operations |
+| **Discovery** | `manage_tools`, `set_active_instance`, `execute_custom_tool`, `mcpforunity://tool-groups` | Search and activate only the required tool group, select the target Editor, and invoke active-project extensions. |
+| **Scene** | `manage_scene`, `find_gameobjects` | Scene operations, isolated recovery previews, leases, and object discovery. |
+| **Objects** | `manage_gameobject`, `manage_components` | Create/modify GameObjects and components with lifecycle-safe prefab handling. |
+| **Scripts** | `create_script`, `script_apply_edits`, `apply_text_edits`, `find_in_file`, `get_sha`, `validate_script`, `delete_script`, `manage_script_capabilities` | C# code management with SHA/precondition guards and automatic import/compile on create/edit. |
+| **Assets/Builds** | `manage_asset`, `manage_prefabs`, `manage_material`, `manage_build`, `manage_packages` | Assets, materials, prefab contents, Player builds, and packages. **Instantiate prefabs with `manage_gameobject`.** |
+| **Editor** | `manage_editor`, `execute_menu_item`, `read_console` | Editor control, undo/redo, package deployment, and filtered diagnostics. |
+| **Testing** | `run_tests`, `get_test_job`, `manage_validation` | Unity Test Framework and durable validation records. |
+| **Batch** | `batch_execute` | Reduce round trips for ordered Unity commands; not parallel and not rollback-transactional. |
 | **Camera** | `manage_camera` | Camera management (Unity Camera + Cinemachine). **Tier 1** (always available): create, target, lens, priority, list, screenshot. **Tier 2** (requires `com.unity.cinemachine`): brain, body/aim/noise pipeline, extensions, blending, force/release. 7 presets: follow, third_person, freelook, dolly, static, top_down, side_scroller. Resource: `mcpforunity://scene/cameras`. Use `ping` to check Cinemachine availability. See [tools-reference.md](references/tools-reference.md#camera-tools). |
 | **Graphics** | `manage_graphics` | Rendering and post-processing management. 33 actions across 5 groups: **Volume** (create/configure volumes and effects, URP/HDRP), **Bake** (lightmaps, light probes, reflection probes, Edit mode only), **Stats** (draw calls, batches, memory), **Pipeline** (quality levels, pipeline settings), **Features** (URP renderer features: add, remove, toggle, reorder). Resources: `mcpforunity://scene/volumes`, `mcpforunity://rendering/stats`, `mcpforunity://pipeline/renderer-features`. Use `ping` to check pipeline status. See [tools-reference.md](references/tools-reference.md#graphics-tools). |
-| **Packages** | `manage_packages` | Install, remove, search, and manage Unity packages and scoped registries. Query actions: list installed, search registry, get info, ping, poll status. Mutating actions: add/remove packages, embed for editing, add/remove scoped registries, force resolve. Validates identifiers, warns on git URLs, checks dependents before removal (`force=true` to override). See [tools-reference.md](references/tools-reference.md#package-tools). |
 | **Physics** | `manage_physics` | Manage 3D and 2D physics (21 actions). Settings, collision matrix, materials, joints (14 types). Queries: `raycast`, `raycast_all`, `linecast`, `shapecast` (sphere/box/capsule sweep), `overlap`. Forces: `apply_force` (AddForce/AddTorque/AddExplosionForce with ForceMode). Rigidbody: `get_rigidbody`, `configure_rigidbody` (mass, drag, gravity, constraints, collision detection). Validation: scene-wide checks. Simulation: `simulate_step` in edit mode. See [tools-reference.md](references/tools-reference.md#physics-tools). |
 | **ProBuilder** | `manage_probuilder` | 3D modeling, mesh editing, complex geometry. **When `com.unity.probuilder` is installed, prefer ProBuilder shapes over primitive GameObjects** for editable geometry, multi-material faces, or complex shapes. Supports 12 shape types, face/edge/vertex editing, smoothing, and per-face materials. See [ProBuilder Guide](references/probuilder-guide.md). |
 | **UI** | `manage_ui`, `batch_execute` with `manage_gameobject` + `manage_components` | **UI Toolkit**: Use `manage_ui` to create UXML/USS files, attach UIDocument, inspect visual trees. **uGUI (Canvas)**: Use `batch_execute` for Canvas, Panel, Button, Text, Slider, Toggle, Input Field. **Read `mcpforunity://project/info` first** to detect uGUI/TMP/Input System/UI Toolkit availability. (see [UI workflows](references/workflows.md#ui-creation-workflows)) |
+| **Animation/VFX** | `manage_animation`, `manage_vfx`, `manage_shader`, `manage_texture` | Animator/clip work and opt-in VFX/shader/texture operations. |
+| **Rendering inspection** | `inspect_render_target`, `inspect_material`, `inspect_texture`, `inspect_shader_graph`, `validate_render_contract`, `sample_material`, `render_probe`, `profile_render_target` | Read-only owner/material/texture/shader/probe evidence. |
+| **Rendering authoring** | `manage_rendering_authoring` | Opt-in transactional material, importer, and Shader Graph patches; plan/dry-run before apply. |
+| **Scripting extensions** | `manage_scriptable_object`, `execute_code` | ScriptableObject management and explicitly authorized in-Editor C# execution. |
+| **Profiling** | `manage_profiler` | Profiler counters, captures, memory snapshots, and Frame Debugger evidence. |
+| **Asset generation** | `generate_image`, `generate_audio`, `generate_model`, `import_model`, `import_model_file` | Opt-in generated/imported assets using configured providers. |
 | **Docs** | `unity_reflect`, `unity_docs` | API verification and documentation lookup. **`unity_reflect`** inspects live C# APIs via reflection (requires Unity connection): `search` types across assemblies, `get_type` for member summary, `get_member` for full signatures. **`unity_docs`** fetches official docs from docs.unity3d.com (no Unity connection needed): `get_doc` (ScriptReference), `get_manual` (Manual pages), `get_package_doc` (package docs), `lookup` (parallel search all sources + project assets). **Trust hierarchy: reflection > project assets > docs.** Workflow: `unity_reflect` search -> get_type -> get_member -> `unity_docs` lookup. See [tools-reference.md](references/tools-reference.md#docs-tools). |
 
 ## Common Workflows
@@ -269,9 +313,13 @@ set_active_instance(instance="MyProject@abc123")
 | Symptom | Cause | Solution |
 |---------|-------|----------|
 | Tools return "busy" | Compilation in progress | Wait, check `editor_state` |
+| Tool is not listed | Its group is not active | `manage_tools(action="search", query="...")`, then activate the matching group |
 | "stale_file" error | File changed since SHA | Re-fetch SHA with `get_sha`, retry |
 | Connection lost | Domain reload | Wait ~5s, reconnect |
 | Commands fail silently | Wrong instance | Check `set_active_instance` |
+| Prefab reported destroyed | Lifecycle code destroyed the new instance | Inspect `code`, `hint`, `data.phase`, and `warnings`; do not assume asset corruption |
+| Save or Play is blocked | Temporary scene lease or cross-scene reference exists | Close the lease or repair the reference; do not bypass the guard |
+| Deployed Python behavior is unchanged | The running MCP server still has old modules loaded | Treat installed files and running-process activation separately; restart only when authorized |
 
 ## Reference Files
 

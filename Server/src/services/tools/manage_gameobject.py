@@ -83,9 +83,20 @@ async def manage_gameobject(
     prefab_path: Annotated[str, "Path for prefab creation"] | None = None,
     prefab_folder: Annotated[str,
                              "Folder for prefab creation"] | None = None,
+    allow_play_mode_create: Annotated[
+        bool | str,
+        "Explicit safety opt-in for prefab creation while Unity is in Play Mode. Defaults to false. "
+        "Use only when Awake/OnEnable and singleton side effects are intentional."
+    ] | None = None,
+    instance_policy: Annotated[
+        Literal["always_create", "fail_if_same_prefab", "reuse_same_prefab"],
+        "Prefab duplicate policy for 'create'. always_create preserves normal prefab semantics; "
+        "fail_if_same_prefab returns a non-mutating error when a matching root instance exists; "
+        "reuse_same_prefab returns the first matching loaded root instance."
+    ] | None = None,
     # --- Parameters for 'modify' ---
     set_active: Annotated[bool | str,
-                          "If True, sets the GameObject active (accepts true/false or 'true'/'false')"] | None = None,
+                          "Sets the GameObject active state during 'create' or 'modify' (accepts true/false or 'true'/'false')"] | None = None,
     layer: Annotated[str, "Layer name"] | None = None,
     is_static: Annotated[bool | str,
                          "Set the GameObject's static flag. true = all StaticEditorFlags, false = none (accepts true/false or 'true'/'false')"] | None = None,
@@ -121,7 +132,7 @@ async def manage_gameobject(
     # Removed session_state import
     unity_instance = await get_unity_instance_from_context(ctx)
 
-    gate = await preflight(ctx, wait_for_no_compile=True, refresh_if_dirty=True)
+    gate = await preflight(ctx, wait_for_no_compile=True, block_if_dirty=True)
     if gate is not None:
         return gate.model_dump()
 
@@ -147,6 +158,7 @@ async def manage_gameobject(
 
     # --- Normalize boolean parameters ---
     save_as_prefab = coerce_bool(save_as_prefab)
+    allow_play_mode_create = coerce_bool(allow_play_mode_create)
     set_active = coerce_bool(set_active)
     is_static = coerce_bool(is_static)
     world_space = coerce_bool(world_space, default=True)
@@ -183,6 +195,8 @@ async def manage_gameobject(
             "saveAsPrefab": save_as_prefab,
             "prefabPath": prefab_path,
             "prefabFolder": prefab_folder,
+            "allowPlayModeCreate": allow_play_mode_create,
+            "instancePolicy": instance_policy,
             "setActive": set_active,
             "layer": layer,
             "isStatic": is_static,
@@ -227,10 +241,6 @@ async def manage_gameobject(
             params,
         )
 
-        # Check if the response indicates success
-        # If the response is not successful, raise an exception with the error message
-        if isinstance(response, dict) and response.get("success"):
-            return {"success": True, "message": response.get("message", "GameObject operation successful."), "data": response.get("data")}
         return response if isinstance(response, dict) else {"success": False, "message": str(response)}
 
     except Exception as e:

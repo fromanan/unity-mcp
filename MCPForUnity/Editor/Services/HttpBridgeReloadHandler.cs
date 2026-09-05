@@ -4,6 +4,7 @@ using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Services.Transport;
 using MCPForUnity.Editor.Windows;
 using UnityEditor;
+using UnityEditor.Compilation;
 
 namespace MCPForUnity.Editor.Services
 {
@@ -46,6 +47,8 @@ namespace MCPForUnity.Editor.Services
 
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+            CompilationPipeline.compilationStarted += OnCompilationStarted;
+            CompilationPipeline.compilationFinished += OnCompilationFinished;
         }
 
         internal static bool IsResumePending => SessionState.GetBool(ResumeSessionKey, false);
@@ -71,18 +74,69 @@ namespace MCPForUnity.Editor.Services
 
         internal static void OnBeforeAssemblyReloadCore(TransportManager transport)
         {
-            if (transport.IsRunning(TransportMode.Http))
+            TransportState state = transport.GetState(TransportMode.Http);
+            if (state.Phase != TransportPhase.Stopped && state.Phase != TransportPhase.Faulted)
             {
                 SessionState.SetBool(ResumeSessionKey, true);
 
-                // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
-                // leave an orphaned socket due to an unfinished async close handshake.
+                // beforeAssemblyReload is synchronous. Give the client one bounded chance to
+                // publish the planned reload and a normal close frame before the hard fallback.
+                try
+                {
+                    Task drainTask = transport.NotifyLifecycleAsync(TransportMode.Http, "reloading");
+                    if (!drainTask.Wait(TimeSpan.FromSeconds(1.5)))
+                    {
+                        McpLog.Debug("[HTTP Reload] Graceful reload drain timed out; forcing teardown");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    McpLog.Debug($"[HTTP Reload] Graceful reload drain failed: {ex.Message}");
+                }
                 transport.ForceStop(TransportMode.Http);
             }
             // When the bridge is not running, leave any pending flag alone: during a multi-pass
             // compile the next reload lands before the deferred resume ran, and deleting the
             // flag here is what used to lose the resume permanently (#1229). Explicit cancel
             // paths (End Session, transport switch, orphan cleanup) erase the flag instead.
+        }
+
+        private static void OnCompilationStarted(object context)
+        {
+            TransportManager transport = MCPServiceLocator.TransportManager;
+            if (!transport.IsRunning(TransportMode.Http))
+            {
+                return;
+            }
+
+            _ = NotifyLifecycleBestEffortAsync(transport, "compiling");
+        }
+
+        private static void OnCompilationFinished(object context)
+        {
+            TransportManager transport = MCPServiceLocator.TransportManager;
+            TransportState state = transport.GetState(TransportMode.Http);
+            if (state.Phase == TransportPhase.Draining)
+            {
+                _ = NotifyLifecycleBestEffortAsync(transport, "ready");
+            }
+        }
+
+        private static async Task NotifyLifecycleBestEffortAsync(
+            TransportManager transport,
+            string lifecycleState)
+        {
+            try
+            {
+                await transport.NotifyLifecycleAsync(
+                    TransportMode.Http,
+                    lifecycleState);
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug(
+                    $"[HTTP Reload] Failed to publish '{lifecycleState}' lifecycle state: {ex.Message}");
+            }
         }
 
         private static void OnAfterAssemblyReload()

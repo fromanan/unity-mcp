@@ -12,6 +12,8 @@ Resources provide read-only access to Unity state. Use resources to inspect befo
 - [Project Resources](#project-resources)
 - [Instance Resources](#instance-resources)
 - [Test Resources](#test-resources)
+- [Tool Catalog Resource](#tool-catalog-resource)
+- [Stored Result Resources](#stored-result-resources)
 
 ---
 
@@ -23,7 +25,7 @@ All resources use `mcpforunity://` scheme:
 mcpforunity://{category}/{resource_path}[?query_params]
 ```
 
-**Categories:** `editor`, `scene`, `prefab`, `project`, `pipeline`, `rendering`, `menu-items`, `custom-tools`, `tests`, `instances`
+**Categories:** `editor`, `scene`, `prefab`, `project`, `pipeline`, `rendering`, `menu-items`, `custom-tools`, `tests`, `instances`, `tool-groups`, `results`
 
 ---
 
@@ -387,6 +389,8 @@ Unity proactively publishes changed snapshots after capability negotiation. The 
 }
 ```
 
+Component payloads can include `serialization.truncated` and `serialization.omittedProperties`. The serializer intentionally omits obsolete members, unsafe or unbounded return types, and state-invalid getters before invoking them. Treat an omitted property as unavailable in this read, not proof that the Unity API or serialized field does not exist. `AudioSource.time` and `timeSamples`, for example, are omitted unless the source has a real `AudioClip`.
+
 ---
 
 ## Prefab Resources
@@ -602,6 +606,30 @@ Assets/Prefabs/Player.prefab → Assets%2FPrefabs%2FPlayer.prefab
 - `mode` (string): "EditMode" or "PlayMode"
 
 **Example:** `mcpforunity://tests/EditMode`
+
+---
+
+## Tool Catalog Resource
+
+### mcpforunity://tool-groups
+
+**Purpose:** Compact catalog of available tool groups and counts.
+
+Use `manage_tools(action="search", query="...")` to locate a capability, then activate only the required group. Request exact tool names only when needed; the live tool schema after activation is authoritative.
+
+---
+
+## Stored Result Resources
+
+### mcpforunity://results/{result_id}/{offset}
+
+**Purpose:** Read one bounded page of a tool result that exceeded the inline response budget.
+
+**Parameters:**
+- `result_id` (string): Opaque ID from the tool's returned `result_uri`
+- `offset` (int): Character offset from the exact current or `next_uri`
+
+Read the exact `result_uri` returned by the tool and follow `next_uri` until it is null. Stored results are caller-owned and short-lived; if one expires, rerun a narrower or explicitly paged query.
 
 ---
 

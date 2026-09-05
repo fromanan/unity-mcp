@@ -159,10 +159,11 @@ jobs:
             echo "unity_ok=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Skip Unity tests (missing license secrets)
+      - name: Fail Unity tests (missing license secrets)
         if: steps.detect.outputs.unity_ok != 'true'
         run: |
-          echo "Unity license secrets missing; skipping Unity tests."
+          echo "::error::Unity license secrets missing; Unity tests did not run."
+          exit 1
 
       - uses: actions/cache@v4
         with:

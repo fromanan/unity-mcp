@@ -524,9 +524,9 @@ namespace MCPForUnity.Editor.Services
                 Sequence = _sequence,
                 Unity = new EditorStateUnity
                 {
-                    InstanceId = null,
+                    InstanceId = $"{ProjectIdentityUtility.GetProjectName()}@{ProjectIdentityUtility.GetProjectHash()}",
                     UnityVersion = Application.unityVersion,
-                    ProjectId = null,
+                    ProjectId = ProjectIdentityUtility.GetProjectHash(),
                     Platform = Application.platform.ToString(),
                     IsBatchMode = Application.isBatchMode
                 },

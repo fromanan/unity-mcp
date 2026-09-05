@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 from services.registry import get_registered_tools, mcp_for_unity_tool
 import services.registry.tool_registry as tool_registry_module
+import services.tools as tools_module
 from services.tools.manage_tools import manage_tools
 
 
@@ -66,6 +67,44 @@ def test_tool_registry_rejects_invalid_unity_target_values():
             return None
 
 
+def test_server_registration_does_not_replace_canonical_tool_functions(monkeypatch):
+    async def original(_ctx):
+        return {"success": True}
+
+    entry = {
+        "func": original,
+        "name": "isolated_tool",
+        "description": "Isolated registration test",
+        "unity_target": "isolated_tool",
+        "group": "core",
+        "kwargs": {"tags": {"group:core"}},
+    }
+
+    class FakeMcp:
+        def __init__(self):
+            self.registered = []
+
+        def tool(self, **_kwargs):
+            def register(func):
+                self.registered.append(func)
+                return func
+
+            return register
+
+        def disable(self, **_kwargs):
+            return None
+
+    monkeypatch.setattr(tools_module, "discover_modules", lambda *_args: [])
+    monkeypatch.setattr(tools_module, "get_registered_tools", lambda: [entry])
+    server = FakeMcp()
+
+    tools_module.register_all_tools(server)
+    tools_module.register_all_tools(server)
+
+    assert entry["func"] is original
+    assert len(server.registered) == 2
+
+
 @pytest.mark.asyncio
 async def test_manage_tools_skips_duplicate_visibility_transform():
     ctx = AsyncMock()
@@ -77,3 +116,73 @@ async def test_manage_tools_skips_duplicate_visibility_transform():
 
     assert result["unchanged"] is True
     ctx.enable_components.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registration_guard_fails_closed_before_unity_tool(monkeypatch):
+    from models import MCPResponse
+    import services.tools.preflight as preflight_module
+
+    called = False
+
+    async def blocked(_ctx, **_kwargs):
+        return MCPResponse(success=False, error="infrastructure_error")
+
+    async def unity_tool(_ctx):
+        nonlocal called
+        called = True
+        return {"success": True}
+
+    monkeypatch.setattr(preflight_module, "preflight", blocked)
+    guarded = tools_module._with_unity_readiness_guard(
+        "manage_gameobject",
+        unity_tool,
+        "manage_gameobject",
+    )
+
+    result = await guarded(AsyncMock())
+
+    assert result["success"] is False
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_http_tool_sync_uses_session_visibility(monkeypatch):
+    from core.config import config
+    import transport.unity_transport as unity_transport
+
+    async def fake_send(*_args, **_kwargs):
+        return {
+            "success": True,
+            "data": {
+                "tools": [
+                    {"name": "manage_gameobject", "enabled": True},
+                    {"name": "unity_docs", "enabled": False},
+                ],
+            },
+        }
+
+    monkeypatch.setattr(config, "transport_mode", "http")
+    monkeypatch.setattr(unity_transport, "send_with_unity_instance", fake_send)
+    monkeypatch.setattr(
+        tools_module,
+        "get_group_tool_names",
+        lambda: {
+            "core": ["manage_gameobject"],
+            "docs": ["unity_docs"],
+        },
+    )
+    ctx = AsyncMock()
+
+    result = await tools_module.sync_tool_visibility_from_unity(
+        ctx=ctx,
+        instance_id="Zornhau@abc",
+    )
+
+    assert result["synced"] is True
+    ctx.enable_components.assert_awaited_once_with(
+        tags={"group:core"}, components={"tool"}
+    )
+    ctx.disable_components.assert_awaited_once_with(
+        tags={"group:docs"}, components={"tool"}
+    )

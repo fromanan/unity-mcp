@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -414,7 +415,7 @@ namespace MCPForUnity.Editor.Services
                 }
 
                 _lastLaunchedProcess = System.Diagnostics.Process.Start(startInfo);
-                AttachLaunchLogging(_lastLaunchedProcess, effectiveLog);
+                AttachLaunchLogging(_lastLaunchedProcess, effectiveLog, stateFilePath);
                 if (!string.IsNullOrEmpty(pidFilePath))
                 {
                     StoreLocalHttpServerHandshake(pidFilePath, instanceToken);
@@ -1181,7 +1182,8 @@ namespace MCPForUnity.Editor.Services
 
         private void AttachLaunchLogging(
             System.Diagnostics.Process process,
-            string logFilePath)
+            string logFilePath,
+            string stateFilePath)
         {
             if (process == null)
             {
@@ -1226,9 +1228,28 @@ namespace MCPForUnity.Editor.Services
             process.EnableRaisingEvents = true;
             process.Exited += (_, __) =>
             {
+                int? processExitCode = null;
+                try { processExitCode = process.ExitCode; } catch { }
+                ManagedServerStatus status = null;
+                if (!string.IsNullOrWhiteSpace(stateFilePath))
+                {
+                    ServerRunStateReader.TryReadPath(stateFilePath, out status);
+                }
                 lock (logLock)
                 {
-                    try { writer.Dispose(); } catch { }
+                    try
+                    {
+                        writer.WriteLine(BuildManagedSupervisorExitLine(
+                            DateTimeOffset.UtcNow,
+                            process.Id,
+                            processExitCode,
+                            status));
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { writer.Dispose(); } catch { }
+                    }
                 }
             };
             if (closeInput)
@@ -1237,6 +1258,33 @@ namespace MCPForUnity.Editor.Services
             }
             if (captureOutput) process.BeginOutputReadLine();
             if (captureError) process.BeginErrorReadLine();
+        }
+
+        internal static string BuildManagedSupervisorExitLine(
+            DateTimeOffset timestampUtc,
+            int supervisorPid,
+            int? processExitCode,
+            ManagedServerStatus status)
+        {
+            string processExit = processExitCode.HasValue
+                ? processExitCode.Value.ToString(CultureInfo.InvariantCulture)
+                : "unknown";
+            string stateExit = string.IsNullOrWhiteSpace(status?.ExitReason)
+                ? "unclassified"
+                : status.ExitReason.Replace('\r', ' ').Replace('\n', ' ');
+            string serverPid = status == null
+                ? "unknown"
+                : status.ServerPid.ToString(CultureInfo.InvariantCulture);
+            string serverExit = status?.ServerExitCode.HasValue == true
+                ? status.ServerExitCode.Value.ToString(CultureInfo.InvariantCulture)
+                : "unknown";
+            return "[MCP managed-supervisor-exited] " +
+                   $"timestamp_utc={timestampUtc.ToUniversalTime():O} " +
+                   $"supervisor_pid={supervisorPid} " +
+                   $"process_exit_code={processExit} " +
+                   $"state_exit_reason={stateExit} " +
+                   $"server_pid={serverPid} " +
+                   $"server_exit_code={serverExit}";
         }
 
         public string GetLocalHttpServerLaunchLogPath()

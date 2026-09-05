@@ -491,6 +491,75 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void GetComponentData_SkipsUnavailableAndObsoleteAudioSourceProperties()
+        {
+            AudioSource audioSource = testGameObject.AddComponent<AudioSource>();
+            List<string> audioSourceWarnings = new();
+            Application.LogCallback logCallback = (condition, stackTrace, type) =>
+            {
+                if (type == LogType.Warning
+                    && (condition.Contains("Attempting to get `time`")
+                        || condition.Contains("Attempting to get `timeSamples`")
+                        || condition.Contains("minVolume is not supported anymore")
+                        || condition.Contains("maxVolume is not supported anymore")
+                        || condition.Contains("rolloffFactor is not supported anymore")))
+                {
+                    audioSourceWarnings.Add(condition);
+                }
+            };
+
+            object result;
+            Application.logMessageReceived += logCallback;
+            try
+            {
+                result = MCPForUnity.Editor.Helpers.GameObjectSerializer.GetComponentData(audioSource);
+            }
+            finally
+            {
+                Application.logMessageReceived -= logCallback;
+            }
+
+            Dictionary<string, object> data = result as Dictionary<string, object>;
+            Assert.IsNotNull(data, "GetComponentData should return dictionary data.");
+            Assert.IsTrue(data.TryGetValue("properties", out object propertiesValue),
+                "GetComponentData should include safe AudioSource properties.");
+            Dictionary<string, object> properties = propertiesValue as Dictionary<string, object>;
+            Assert.IsNotNull(properties, "Reflected AudioSource properties should be dictionary data.");
+            Assert.IsTrue(properties.ContainsKey("volume"),
+                "Safe AudioSource properties should remain available.");
+            Assert.IsFalse(properties.ContainsKey("time"));
+            Assert.IsFalse(properties.ContainsKey("timeSamples"));
+            Assert.IsFalse(properties.ContainsKey("minVolume"));
+            Assert.IsFalse(properties.ContainsKey("maxVolume"));
+            Assert.IsFalse(properties.ContainsKey("rolloffFactor"));
+            Assert.IsEmpty(audioSourceWarnings,
+                "Serializing an AudioSource without an AudioClip should not emit invalid or obsolete getter warnings.");
+        }
+
+        [Test]
+        public void GetComponentData_SkipsObsoleteMembersWithoutInvokingGetters()
+        {
+            ObsoleteMemberSerializationTestComponent.ObsoleteGetterInvocationCount = 0;
+            ObsoleteMemberSerializationTestComponent component =
+                testGameObject.AddComponent<ObsoleteMemberSerializationTestComponent>();
+
+            object result = MCPForUnity.Editor.Helpers.GameObjectSerializer.GetComponentData(component);
+
+            Dictionary<string, object> data = result as Dictionary<string, object>;
+            Assert.IsNotNull(data, "GetComponentData should return dictionary data.");
+            Assert.IsTrue(data.TryGetValue("properties", out object propertiesValue),
+                "GetComponentData should include safe reflected members.");
+            Dictionary<string, object> properties = propertiesValue as Dictionary<string, object>;
+            Assert.IsNotNull(properties, "Reflected component properties should be dictionary data.");
+            Assert.IsTrue(properties.ContainsKey(nameof(ObsoleteMemberSerializationTestComponent.SafeProperty)));
+            Assert.IsFalse(properties.ContainsKey("ObsoleteProperty"));
+            Assert.IsFalse(properties.ContainsKey("GetterObsoleteProperty"));
+            Assert.IsFalse(properties.ContainsKey("ObsoleteField"));
+            Assert.AreEqual(0, ObsoleteMemberSerializationTestComponent.ObsoleteGetterInvocationCount,
+                "Obsolete property getters must never be invoked during component serialization.");
+        }
+
+        [Test]
         public void GetComponentData_DoesNotInstantiateMeshesInEditMode()
         {
             // Arrange - Create a GameObject with MeshFilter component
@@ -748,5 +817,35 @@ namespace MCPForUnityTests.Editor.Tools
     public sealed class BoundedSerializationTestComponent : MonoBehaviour
     {
         public int[] Values;
+    }
+
+    public sealed class ObsoleteMemberSerializationTestComponent : MonoBehaviour
+    {
+        public static int ObsoleteGetterInvocationCount;
+
+        [Obsolete("Test-only obsolete field.")]
+        public int ObsoleteField = 13;
+
+        public int SafeProperty => 7;
+
+        [Obsolete("Test-only obsolete property.")]
+        public int ObsoleteProperty
+        {
+            get
+            {
+                ObsoleteGetterInvocationCount++;
+                return 11;
+            }
+        }
+
+        public int GetterObsoleteProperty
+        {
+            [Obsolete("Test-only obsolete getter.")]
+            get
+            {
+                ObsoleteGetterInvocationCount++;
+                return 17;
+            }
+        }
     }
 }

@@ -10,6 +10,7 @@ from core.telemetry import record_milestone, record_telemetry, MilestoneType, Re
 from services.resources import register_all_resources
 from transport.plugin_registry import PluginRegistry
 from transport.plugin_hub import PluginHub
+from core.logging_config import configure_server_logging
 from services.custom_tool_service import (
     CustomToolService,
     resolve_project_id_for_unity_instance,
@@ -39,68 +40,12 @@ from typing import AsyncIterator, Any
 from urllib.parse import urlparse
 
 from fastmcp import FastMCP
-from logging.handlers import RotatingFileHandler
 
 
-class WindowsSafeRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that gracefully handles Windows file locking during rotation."""
-
-    def doRollover(self):
-        """Override to catch PermissionError on Windows when log file is locked."""
-        try:
-            super().doRollover()
-        except PermissionError:
-            # On Windows, another process may have the log file open.
-            # Skip rotation this time - we'll try again on the next rollover.
-            pass
-
-
-# Configure logging using settings from config
-logging.basicConfig(
-    level=getattr(logging, config.log_level),
-    format=config.log_format,
-    stream=None,  # None -> defaults to sys.stderr; avoid stdout used by MCP stdio
-    force=True    # Ensure our handler replaces any prior stdout handlers
-)
+# stdout is reserved for MCP stdio protocol frames. The listener owns all
+# formatting and local I/O through stderr and the rotating server log.
+_logging_runtime = configure_server_logging(config)
 logger = logging.getLogger("mcp-for-unity-server")
-
-# Also write logs to a rotating file so logs are available when launched via stdio.
-# Location follows OS conventions; override with UNITY_MCP_LOG_DIR.
-try:
-    from utils.log_paths import resolve_log_dir
-    _log_dir = resolve_log_dir()
-    os.makedirs(_log_dir, exist_ok=True)
-    _file_path = os.path.join(_log_dir, "unity_mcp_server.log")
-    _fh = WindowsSafeRotatingFileHandler(
-        _file_path, maxBytes=512*1024, backupCount=2, encoding="utf-8")
-    _fh.setFormatter(logging.Formatter(config.log_format))
-    _fh.setLevel(getattr(logging, config.log_level))
-    logger.addHandler(_fh)
-    logger.propagate = False  # Prevent double logging to root logger
-    # Add file handler to root logger so __name__-based loggers (e.g. utils.focus_nudge,
-    # services.tools.run_tests) also write to the log file. Named loggers with
-    # propagate=False won't double-log.
-    logging.getLogger().addHandler(_fh)
-    # Also route telemetry logger to the same rotating file and normal level
-    try:
-        tlog = logging.getLogger("unity-mcp-telemetry")
-        tlog.setLevel(getattr(logging, config.log_level))
-        tlog.addHandler(_fh)
-        tlog.propagate = False  # Prevent double logging for telemetry too
-    except Exception as exc:
-        # Never let logging setup break startup
-        logger.debug("Failed to configure telemetry logger", exc_info=exc)
-except Exception as exc:
-    # Never let logging setup break startup
-    logger.debug("Failed to configure main logger file handler", exc_info=exc)
-# Quieten noisy third-party loggers to avoid clutter during stdio handshake
-for noisy in ("httpx", "urllib3", "mcp.server.lowlevel.server"):
-    try:
-        logging.getLogger(noisy).setLevel(
-            max(logging.WARNING, getattr(logging, config.log_level)))
-        logging.getLogger(noisy).propagate = False
-    except Exception:
-        pass
 
 # Import telemetry only after logging is configured to ensure its logs use stderr and proper levels
 # Ensure a slightly higher telemetry timeout unless explicitly overridden by env
@@ -128,7 +73,7 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[dict[str, Any]]:
     """Handle server startup and shutdown."""
     global _unity_connection_pool, _server_version
     _server_version = get_package_version()
-    logger.info(f"MCP for Unity Server v{_server_version} starting up")
+    logger.info("MCP for Unity Server v%s starting up", _server_version)
 
     # Register custom tool management endpoints with FastMCP
     # Routes are declared globally below after FastMCP initialization
@@ -323,6 +268,7 @@ def _normalize_instance_token(instance_token: str | None) -> tuple[str | None, s
 def create_mcp_server(project_scoped_tools: bool) -> FastMCP:
     mcp = FastMCP(
         name="mcp-for-unity-server",
+        version=get_package_version(),
         lifespan=server_lifespan,
         instructions=_build_instructions(project_scoped_tools),
     )
@@ -790,12 +736,14 @@ Examples:
     if args.default_instance:
         os.environ["UNITY_MCP_DEFAULT_INSTANCE"] = args.default_instance
         logger.info(
-            f"Using default Unity instance from command-line: {args.default_instance}")
+            "Using default Unity instance from command-line: %s",
+            args.default_instance,
+        )
 
     # Set transport mode
     config.transport_mode = args.transport or os.environ.get(
         "UNITY_MCP_TRANSPORT", "stdio")
-    logger.info(f"Transport mode: {config.transport_mode}")
+    logger.info("Transport mode: %s", config.transport_mode)
 
     config.http_remote_hosted = (
         bool(args.http_remote_hosted)
@@ -937,11 +885,11 @@ Examples:
                 "Failed to write pidfile '%s': %s", args.pidfile, exc)
 
     if args.http_url != "http://127.0.0.1:8080":
-        logger.info(f"HTTP URL set to: {http_url}")
+        logger.info("HTTP URL set to: %s", http_url)
     if args.http_host:
-        logger.info(f"HTTP host override: {http_host}")
+        logger.info("HTTP host override: %s", http_host)
     if args.http_port:
-        logger.info(f"HTTP port override: {http_port}")
+        logger.info("HTTP port override: %s", http_port)
 
     # Explicit CLI/env overrides always win
     project_scoped_tools_explicit = (

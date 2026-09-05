@@ -16,6 +16,9 @@ namespace MCPForUnity.Editor.Tools
     [McpForUnityTool("find_gameobjects")]
     public static class FindGameObjects
     {
+        private const string AmbiguousComponentTypeCode = "ambiguous_component_type";
+        private const string ComponentTypeNotFoundCode = "component_type_not_found";
+
         /// <summary>
         /// Handles the find_gameobjects command.
         /// </summary>
@@ -55,11 +58,44 @@ namespace MCPForUnity.Editor.Tools
 
             try
             {
+                GameObjectLookup.SearchMethod parsedSearchMethod = GameObjectLookup.ParseSearchMethod(searchMethod);
+                if (parsedSearchMethod == GameObjectLookup.SearchMethod.ByComponent &&
+                    !UnityTypeResolver.TryResolveDetailed(
+                        searchTerm,
+                        out System.Type _,
+                        out UnityTypeResolver.ResolutionFailure failure,
+                        typeof(Component)))
+                {
+                    string code = failure.Code switch
+                    {
+                        UnityTypeResolver.AmbiguousTypeCode => AmbiguousComponentTypeCode,
+                        UnityTypeResolver.TypeNotFoundCode => ComponentTypeNotFoundCode,
+                        _ => failure.Code
+                    };
+                    McpLog.Warn(
+                        $"[FindGameObjects] Component type resolution failed ({code}): {failure.Message}");
+                    return ErrorResponse.Structured(
+                        code,
+                        failure.Message,
+                        new
+                        {
+                            searchMethod = "by_component",
+                            searchTerm,
+                            candidateCount = failure.CandidateCount,
+                            candidates = failure.Candidates
+                        },
+                        failure.Hint);
+                }
+
                 // Get all matching instance IDs
-                var allIds = GameObjectLookup.SearchGameObjects(searchMethod, searchTerm, includeInactive, 0);
+                List<int> allIds = GameObjectLookup.SearchGameObjects(
+                    parsedSearchMethod,
+                    searchTerm,
+                    includeInactive,
+                    0);
                 
                 // Use standard pagination response
-                var paginatedResult = PaginationResponse<int>.Create(allIds, pagination);
+                PaginationResponse<int> paginatedResult = PaginationResponse<int>.Create(allIds, pagination);
 
                 return new SuccessResponse("Found GameObjects", new
                 {

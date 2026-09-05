@@ -60,6 +60,7 @@ jobs:
           --cov-report=xml:Server/coverage.xml
           --cov-report=html:Server/htmlcov
           --cov-report=term
+          --cov-fail-under=62
 
       - name: Upload coverage reports
         uses: codecov/codecov-action@v4

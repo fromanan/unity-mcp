@@ -99,8 +99,13 @@ async def manage_tools(
         }
 
     if action == "sync":
-        from services.tools import sync_tool_visibility_from_unity
-        result = await sync_tool_visibility_from_unity(notify=True)
+        from services.tools import get_unity_instance_from_context, sync_tool_visibility_from_unity
+        instance_id = await get_unity_instance_from_context(ctx)
+        result = await sync_tool_visibility_from_unity(
+            ctx=ctx,
+            instance_id=instance_id,
+            notify=True,
+        )
         if result.get("error"):
             msg = result["error"]
             if result.get("unsupported"):

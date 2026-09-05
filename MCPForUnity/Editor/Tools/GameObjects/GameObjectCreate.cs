@@ -1,7 +1,9 @@
 #nullable disable
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Security;
 using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -12,6 +14,205 @@ namespace MCPForUnity.Editor.Tools.GameObjects
 {
     internal static class GameObjectCreate
     {
+        private const int MaxCapturedLogs = 8;
+        private const int MaxCapturedLogCharacters = 512;
+
+        private enum PrefabInstancePolicy
+        {
+            AlwaysCreate,
+            FailIfSamePrefab,
+            ReuseSamePrefab
+        }
+
+        private sealed class ScopedLogCollector : IDisposable
+        {
+            private readonly List<Dictionary<string, string>> _entries = new();
+
+            internal ScopedLogCollector()
+            {
+                Application.logMessageReceived += OnLogMessageReceived;
+            }
+
+            internal IReadOnlyList<Dictionary<string, string>> Snapshot()
+            {
+                return _entries.ToArray();
+            }
+
+            public void Dispose()
+            {
+                Application.logMessageReceived -= OnLogMessageReceived;
+            }
+
+            private void OnLogMessageReceived(string condition, string stackTrace, LogType type)
+            {
+                if (_entries.Count >= MaxCapturedLogs)
+                {
+                    return;
+                }
+
+                string message = SecretRedactor.Scrub(condition ?? string.Empty)
+                    .Replace('\r', ' ')
+                    .Replace('\n', ' ')
+                    .Trim();
+                if (message.Length > MaxCapturedLogCharacters)
+                {
+                    message = message.Substring(0, MaxCapturedLogCharacters) + "...";
+                }
+
+                _entries.Add(new Dictionary<string, string>
+                {
+                    ["type"] = type.ToString(),
+                    ["message"] = message
+                });
+            }
+        }
+
+        internal static bool IsPlayModePrefabCreationBlocked(bool isPlaying, bool allowPlayModeCreate)
+        {
+            return isPlaying && !allowPlayModeCreate;
+        }
+
+        private static bool TryReadOptionalBoolean(JObject @params, string parameterName, bool defaultValue, out bool value)
+        {
+            JToken token = @params[parameterName];
+            if (token == null || token.Type == JTokenType.Null)
+            {
+                value = defaultValue;
+                return true;
+            }
+
+            if (token.Type == JTokenType.Boolean)
+            {
+                value = token.Value<bool>();
+                return true;
+            }
+
+            if (token.Type == JTokenType.String && bool.TryParse(token.ToString(), out bool parsed))
+            {
+                value = parsed;
+                return true;
+            }
+
+            value = defaultValue;
+            return false;
+        }
+
+        private static bool TryParseInstancePolicy(string rawPolicy, out PrefabInstancePolicy policy)
+        {
+            switch ((rawPolicy ?? "always_create").Trim().ToLowerInvariant())
+            {
+                case "always_create":
+                {
+                    policy = PrefabInstancePolicy.AlwaysCreate;
+                    return true;
+                }
+                case "fail_if_same_prefab":
+                {
+                    policy = PrefabInstancePolicy.FailIfSamePrefab;
+                    return true;
+                }
+                case "reuse_same_prefab":
+                {
+                    policy = PrefabInstancePolicy.ReuseSamePrefab;
+                    return true;
+                }
+                default:
+                {
+                    policy = PrefabInstancePolicy.AlwaysCreate;
+                    return false;
+                }
+            }
+        }
+
+        private static List<GameObject> FindExistingPrefabInstances(GameObject prefabAsset, string prefabPath)
+        {
+            string prefabAssetName = prefabAsset.name;
+            string cloneName = prefabAssetName + "(Clone)";
+            List<GameObject> matches = new();
+
+            foreach (GameObject candidate in UnityEngine.Resources.FindObjectsOfTypeAll<GameObject>())
+            {
+                if (candidate == null || EditorUtility.IsPersistent(candidate) || candidate.transform.parent != null)
+                {
+                    continue;
+                }
+
+                if (!candidate.scene.IsValid() || !candidate.scene.isLoaded || EditorSceneManager.IsPreviewScene(candidate.scene))
+                {
+                    continue;
+                }
+
+                UnityEngine.Object source = PrefabUtility.GetCorrespondingObjectFromSource(candidate);
+                bool sourceMatches = source != null &&
+                    string.Equals(AssetDatabase.GetAssetPath(source), prefabPath, StringComparison.OrdinalIgnoreCase);
+                bool playModeNameMatches = EditorApplication.isPlaying &&
+                    (string.Equals(candidate.name, prefabAssetName, StringComparison.Ordinal) ||
+                     string.Equals(candidate.name, cloneName, StringComparison.Ordinal));
+
+                if (sourceMatches || playModeNameMatches)
+                {
+                    matches.Add(candidate);
+                }
+            }
+
+            return matches.OrderBy(candidate => candidate.GetInstanceID()).ToList();
+        }
+
+        private static ErrorResponse CreateLifecycleDestroyedError(
+            string prefabPath,
+            string phase,
+            IReadOnlyList<Dictionary<string, string>> logs,
+            bool assetLoaded)
+        {
+            bool isPrefab = !string.IsNullOrEmpty(prefabPath);
+            string code = isPrefab ? "prefab_instance_destroyed" : "gameobject_destroyed_during_creation";
+            string message = isPrefab
+                ? $"Prefab asset '{prefabPath}' loaded successfully, but its scene instance was destroyed during Unity lifecycle processing."
+                : "The newly created GameObject was destroyed during Unity lifecycle processing.";
+
+            return ErrorResponse.Structured(
+                code,
+                message,
+                new
+                {
+                    phase,
+                    prefabPath,
+                    editorMode = EditorApplication.isPlaying ? "play_mode" : "edit_mode",
+                    assetLoaded,
+                    instanceSurvived = false,
+                    stateChanged = true,
+                    retryable = false,
+                    logs
+                },
+                "Inspect Awake, OnEnable, OnValidate, parent-change callbacks, and singleton or persistence policies on the created object.");
+        }
+
+        private static ErrorResponse ValidateCreatedObject(
+            GameObject candidate,
+            string prefabPath,
+            string phase,
+            IReadOnlyList<Dictionary<string, string>> logs,
+            bool assetLoaded)
+        {
+            return candidate == null
+                ? CreateLifecycleDestroyedError(prefabPath, phase, logs, assetLoaded)
+                : null;
+        }
+
+        private static bool IndicatesLifecycleDestruction(
+            Exception exception,
+            IReadOnlyList<Dictionary<string, string>> logs)
+        {
+            if (exception?.Message?.IndexOf("destroy", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return logs.Any(entry =>
+                entry.TryGetValue("message", out string message) &&
+                message.IndexOf("destroy", StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
         internal static object Handle(JObject @params)
         {
             string name = @params["name"]?.ToString();
@@ -26,6 +227,40 @@ namespace MCPForUnity.Editor.Tools.GameObjects
             string tag = @params["tag"]?.ToString();
             string primitiveType = @params["primitiveType"]?.ToString();
             GameObject newGo = null;
+            IReadOnlyList<Dictionary<string, string>> creationDiagnostics = Array.Empty<Dictionary<string, string>>();
+
+            if (!TryReadOptionalBoolean(@params, "allowPlayModeCreate", false, out bool allowPlayModeCreate))
+            {
+                return ErrorResponse.Structured(
+                    "invalid_parameter",
+                    "'allowPlayModeCreate' must be a boolean.",
+                    new { parameter = "allowPlayModeCreate", stateChanged = false, retryable = false });
+            }
+
+            if (!TryReadOptionalBoolean(@params, "setActive", true, out bool setActive))
+            {
+                return ErrorResponse.Structured(
+                    "invalid_parameter",
+                    "'setActive' must be a boolean.",
+                    new { parameter = "setActive", stateChanged = false, retryable = false });
+            }
+
+            bool hasSetActive = @params["setActive"] != null && @params["setActive"].Type != JTokenType.Null;
+            string rawInstancePolicy = @params["instancePolicy"]?.ToString();
+            if (!TryParseInstancePolicy(rawInstancePolicy, out PrefabInstancePolicy instancePolicy))
+            {
+                return ErrorResponse.Structured(
+                    "invalid_instance_policy",
+                    $"Unsupported instance policy '{rawInstancePolicy}'.",
+                    new
+                    {
+                        provided = rawInstancePolicy,
+                        allowed = new[] { "always_create", "fail_if_same_prefab", "reuse_same_prefab" },
+                        stateChanged = false,
+                        retryable = false
+                    },
+                    "Use always_create, fail_if_same_prefab, or reuse_same_prefab.");
+            }
 
             // --- Try Instantiating Prefab First ---
             string originalPrefabPath = prefabPath;
@@ -89,14 +324,76 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                 GameObject prefabAsset = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
                 if (prefabAsset != null)
                 {
+                    List<GameObject> existingInstances = instancePolicy == PrefabInstancePolicy.AlwaysCreate
+                        ? new List<GameObject>()
+                        : FindExistingPrefabInstances(prefabAsset, prefabPath);
+                    if (existingInstances.Count > 0 && instancePolicy == PrefabInstancePolicy.FailIfSamePrefab)
+                    {
+                        return ErrorResponse.Structured(
+                            "prefab_instance_exists",
+                            $"At least one loaded scene instance already matches prefab '{prefabPath}'.",
+                            new
+                            {
+                                phase = "duplicate_preflight",
+                                prefabPath,
+                                editorMode = EditorApplication.isPlaying ? "play_mode" : "edit_mode",
+                                matchCount = existingInstances.Count,
+                                existingInstances = existingInstances.Take(MaxCapturedLogs).Select(instance => new
+                                {
+                                    name = instance.name,
+                                    instanceId = instance.GetInstanceID(),
+                                    scene = instance.scene.name
+                                }).ToArray(),
+                                stateChanged = false,
+                                retryable = false
+                            },
+                            "Target the existing instance or use reuse_same_prefab. Use always_create only when another instance is intentional.");
+                    }
+
+                    if (existingInstances.Count > 0 && instancePolicy == PrefabInstancePolicy.ReuseSamePrefab)
+                    {
+                        GameObject existingInstance = existingInstances[0];
+                        Selection.activeGameObject = existingInstance;
+                        return new SuccessResponse(
+                            $"Reused existing scene instance '{existingInstance.name}' for prefab '{prefabPath}'.",
+                            Helpers.GameObjectSerializer.GetGameObjectData(existingInstance));
+                    }
+
+                    if (IsPlayModePrefabCreationBlocked(EditorApplication.isPlaying, allowPlayModeCreate))
+                    {
+                        return ErrorResponse.Structured(
+                            "play_mode_create_blocked",
+                            "Prefab creation is blocked while Unity is in Play Mode unless allowPlayModeCreate (allow_play_mode_create in the MCP tool) is explicitly enabled.",
+                            new
+                            {
+                                phase = "preflight",
+                                prefabPath,
+                                editorMode = "play_mode",
+                                assetLoaded = true,
+                                instanceSurvived = false,
+                                stateChanged = false,
+                                retryable = false
+                            },
+                            "Exit Play Mode, reuse an existing runtime instance, or retry with allowPlayModeCreate=true (allow_play_mode_create=true in the MCP tool) after confirming the lifecycle side effects are intentional.");
+                    }
+
                     try
                     {
-                        newGo = PrefabUtility.InstantiatePrefab(prefabAsset) as GameObject;
+                        using (ScopedLogCollector logCollector = new())
+                        {
+                            try
+                            {
+                                newGo = PrefabUtility.InstantiatePrefab(prefabAsset) as GameObject;
+                            }
+                            finally
+                            {
+                                creationDiagnostics = logCollector.Snapshot();
+                            }
+                        }
 
                         if (newGo == null)
                         {
-                            McpLog.Error($"[ManageGameObject.Create] Failed to instantiate prefab at '{prefabPath}', asset might be corrupted or not a GameObject.");
-                            return new ErrorResponse($"Failed to instantiate prefab at '{prefabPath}'.");
+                            return CreateLifecycleDestroyedError(prefabPath, "prefab_instantiation", creationDiagnostics, true);
                         }
                         if (!string.IsNullOrEmpty(name))
                         {
@@ -107,7 +404,28 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     }
                     catch (Exception e)
                     {
-                        return new ErrorResponse($"Error instantiating prefab '{prefabPath}': {e.Message}");
+                        if (newGo == null && IndicatesLifecycleDestruction(e, creationDiagnostics))
+                        {
+                            return CreateLifecycleDestroyedError(prefabPath, "prefab_instantiation", creationDiagnostics, true);
+                        }
+
+                        string exceptionMessage = SecretRedactor.Scrub(e.Message);
+                        return ErrorResponse.Structured(
+                            "prefab_instantiation_exception",
+                            $"Unity threw an exception while instantiating prefab '{prefabPath}': {exceptionMessage}",
+                            new
+                            {
+                                phase = "prefab_instantiation",
+                                prefabPath,
+                                editorMode = EditorApplication.isPlaying ? "play_mode" : "edit_mode",
+                                assetLoaded = true,
+                                instanceSurvived = newGo != null,
+                                stateChanged = newGo != null,
+                                retryable = false,
+                                exceptionType = e.GetType().FullName,
+                                logs = creationDiagnostics
+                            },
+                            "Inspect the attached diagnostics and the prefab's lifecycle callbacks before retrying.");
                     }
                 }
                 else
@@ -181,6 +499,16 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     return new ErrorResponse($"Parent specified ('{parentToken}') but not found.");
                 }
                 newGo.transform.SetParent(parentGo.transform, true);
+                ErrorResponse parentLifecycleFailure = ValidateCreatedObject(
+                    newGo,
+                    prefabPath,
+                    "parent_assignment",
+                    creationDiagnostics,
+                    !string.IsNullOrEmpty(prefabPath));
+                if (parentLifecycleFailure != null)
+                {
+                    return parentLifecycleFailure;
+                }
             }
 
             // Set Transform
@@ -256,6 +584,16 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     if (!string.IsNullOrEmpty(typeName))
                     {
                         var addResult = GameObjectComponentHelpers.AddComponentInternal(newGo, typeName, properties);
+                        ErrorResponse componentLifecycleFailure = ValidateCreatedObject(
+                            newGo,
+                            prefabPath,
+                            $"component_add:{typeName}",
+                            creationDiagnostics,
+                            !string.IsNullOrEmpty(prefabPath));
+                        if (componentLifecycleFailure != null)
+                        {
+                            return componentLifecycleFailure;
+                        }
                         if (addResult != null)
                         {
                             UnityEngine.Object.DestroyImmediate(newGo);
@@ -266,6 +604,21 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     {
                         McpLog.Warn($"[ManageGameObject] Invalid component format in componentsToAdd: {compToken}");
                     }
+                }
+            }
+
+            if (hasSetActive)
+            {
+                newGo.SetActive(setActive);
+                ErrorResponse activationLifecycleFailure = ValidateCreatedObject(
+                    newGo,
+                    prefabPath,
+                    "activation",
+                    creationDiagnostics,
+                    !string.IsNullOrEmpty(prefabPath));
+                if (activationLifecycleFailure != null)
+                {
+                    return activationLifecycleFailure;
                 }
             }
 
@@ -302,6 +655,16 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                         UnityEngine.Object.DestroyImmediate(newGo);
                         return new ErrorResponse($"Failed to save GameObject '{name}' as prefab at '{finalPrefabPath}'. Check path and permissions.");
                     }
+                    ErrorResponse saveLifecycleFailure = ValidateCreatedObject(
+                        finalInstance,
+                        finalPrefabPath,
+                        "prefab_save_and_connect",
+                        creationDiagnostics,
+                        true);
+                    if (saveLifecycleFailure != null)
+                    {
+                        return saveLifecycleFailure;
+                    }
                     McpLog.Info($"[ManageGameObject.Create] GameObject '{name}' saved as prefab to '{finalPrefabPath}' and instance connected.");
                 }
                 catch (Exception e)
@@ -309,6 +672,17 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                     UnityEngine.Object.DestroyImmediate(newGo);
                     return new ErrorResponse($"Error saving prefab '{finalPrefabPath}': {e.Message}");
                 }
+            }
+
+            ErrorResponse finalLifecycleFailure = ValidateCreatedObject(
+                finalInstance,
+                prefabPath,
+                "final_serialization",
+                creationDiagnostics,
+                !string.IsNullOrEmpty(prefabPath));
+            if (finalLifecycleFailure != null)
+            {
+                return finalLifecycleFailure;
             }
 
             Selection.activeGameObject = finalInstance;
@@ -332,7 +706,10 @@ namespace MCPForUnity.Editor.Tools.GameObjects
                 successMessage = $"GameObject '{finalInstance.name}' created successfully in scene.";
             }
 
-            return new SuccessResponse(successMessage, Helpers.GameObjectSerializer.GetGameObjectData(finalInstance));
+            return new SuccessResponse(
+                successMessage,
+                Helpers.GameObjectSerializer.GetGameObjectData(finalInstance),
+                creationDiagnostics.Count > 0 ? creationDiagnostics : null);
         }
     }
 }

@@ -32,6 +32,18 @@ namespace MCPForUnityTests.Editor.Services
             public Task ReregisterToolsAsync() => Task.CompletedTask;
         }
 
+        private sealed class MutableStateTransportClient : IMcpTransportClient
+        {
+            public bool IsConnected => State.IsConnected;
+            public string TransportName => "http";
+            public TransportState State { get; set; } = TransportState.Connected("http");
+
+            public Task<bool> StartAsync() => Task.FromResult(true);
+            public Task StopAsync() => Task.CompletedTask;
+            public Task<bool> VerifyAsync() => Task.FromResult(IsConnected);
+            public Task ReregisterToolsAsync() => Task.CompletedTask;
+        }
+
         [Test]
         public void StartAsync_ConcurrentCallsSameMode_CoalesceIntoOneAttempt()
         {
@@ -61,6 +73,36 @@ namespace MCPForUnityTests.Editor.Services
             Task<bool> second = manager.StartAsync(TransportMode.Http);
             Assert.AreEqual(2, client.StartCalls, "a completed start must not block later restarts");
             Assert.IsTrue(second.IsCompleted && second.Result);
+        }
+
+        [Test]
+        public void GetState_UsesLiveClientStateAfterInternalDisconnect()
+        {
+            MutableStateTransportClient client = new();
+            TransportManager manager = new();
+            manager.Configure(() => client, () => client);
+
+            Assert.IsTrue(manager.StartAsync(TransportMode.Http).Result);
+            client.State = TransportState.Disconnected(
+                "http",
+                "socket closed",
+                phase: TransportPhase.Backoff);
+
+            Assert.IsFalse(manager.IsRunning(TransportMode.Http));
+            Assert.AreEqual(TransportPhase.Backoff, manager.GetState(TransportMode.Http).Phase);
+            Assert.AreEqual("socket closed", manager.GetState(TransportMode.Http).Error);
+        }
+
+        [Test]
+        public void TransitioningState_NeverReportsConnected()
+        {
+            TransportState state = TransportState.Transitioning(
+                "http",
+                TransportPhase.Handshaking,
+                details: "waiting for ready acknowledgement");
+
+            Assert.IsFalse(state.IsConnected);
+            Assert.AreEqual(TransportPhase.Handshaking, state.Phase);
         }
     }
 }

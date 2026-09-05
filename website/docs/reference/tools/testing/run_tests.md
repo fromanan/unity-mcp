@@ -25,7 +25,8 @@ Starts a Unity test run asynchronously and returns a job_id immediately. Poll wi
 | `assembly_names` | `list[str] \| str \| None` | — | Assembly names to filter tests by |
 | `include_failed_tests` | `bool` | — | Include details for failed/skipped tests (default: true) |
 | `include_details` | `bool` | — | Include details for all tests (default: false) |
-| `init_timeout` | `int \| None` | — | Initialization timeout in milliseconds. PlayMode tests may need longer due to domain reload (default: 15000). Recommended: 120000 for PlayMode. |
+| `init_timeout` | `int \| None` | — | Deprecated compatibility name for init_timeout_ms. Values are milliseconds; 60 means 60ms, not 60 seconds. |
+| `init_timeout_ms` | `int \| None` | — | Initialization timeout in milliseconds (1000-600000). Defaults to 15000 for EditMode and 120000 for PlayMode. Use 60000 for 60 seconds. |
 | `clear_stuck` | `bool` | — | Clear an orphaned running job instead of starting a run. Use when a job was lost to a domain reload and is blocking every subsequent run. |
 | `minimum_tests` | `int` | — | Minimum selected and executed test count required for a pass. |
 | `expected_tests` | `list[str] \| str \| None` | — | Exact full test names that must appear in the selected-test manifest. |
@@ -40,6 +41,17 @@ A `dict` containing the Unity response. The exact shape depends on the action.
 ## Examples
 
 <!-- examples:start -->
-*No examples yet. Add usage examples here — they will be preserved across regenerations.*
+Use the mode-specific initialization default when no override is required:
+
+```python
+job = run_tests(mode="EditMode", test_names=["MyTests.TestSomething"])
+result = get_test_job(job_id=job["job_id"], wait_timeout_seconds=60)
+```
+
+Timeout units are explicit. For a 60-second initialization allowance, pass `60000` milliseconds:
+
+```python
+job = run_tests(mode="PlayMode", init_timeout_ms=120000)
+```
 <!-- examples:end -->
 

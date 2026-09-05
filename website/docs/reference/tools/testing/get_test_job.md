@@ -21,7 +21,8 @@ Polls an async Unity test job by job_id.
 | `job_id` | `str` | yes | Job id returned by run_tests |
 | `include_failed_tests` | `bool` | — | Include details for failed/skipped tests (default: true) |
 | `include_details` | `bool` | — | Include details for all tests (default: false) |
-| `wait_timeout` | `int \| None` | — | If set, wait up to this many seconds for tests to complete before returning. Reduces polling frequency and avoids client-side loop detection. Recommended: 30-60 seconds. Returns immediately if tests complete sooner. |
+| `wait_timeout` | `int \| None` | — | Deprecated compatibility name for wait_timeout_seconds. If set, wait up to this many seconds for tests to complete before returning. Reduces polling frequency and avoids client-side loop detection. Recommended: 30-60 seconds. Returns immediately if tests complete sooner. |
+| `wait_timeout_seconds` | `int \| None` | — | If set, wait up to this many seconds for tests to complete before returning. Recommended: 30-60 seconds. |
 | `allow_focus_nudge` | `bool` | — | Allow OS focus changes when an unfocused Editor appears stalled. |
 
 ## Returns

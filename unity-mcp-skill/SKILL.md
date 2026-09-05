@@ -38,6 +38,8 @@ manage_tools(action="search", query="scene")
 manage_tools(action="activate", group="core")
 ```
 
+Use `execute_custom_tool` only for active-project extension tools advertised by `mcpforunity://custom-tools`. Built-in tools such as `run_tests` must be activated and called directly so their typed validation, preflight, parameter normalization, and polling behavior cannot be bypassed.
+
 Use `mcpforunity://tool-groups` for a compact group catalog. The live MCP schema is authoritative; this skill's references are curated operating guidance rather than an exhaustive copy of every tool schema.
 
 Large results may return a `result_uri` such as `mcpforunity://results/{result_id}/0`. Read that URI and follow `next_uri` until it is null. Do not repeat the original broad call merely to force the payload inline.

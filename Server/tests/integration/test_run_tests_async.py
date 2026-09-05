@@ -33,6 +33,7 @@ async def test_run_tests_async_forwards_params(monkeypatch):
     assert captured["params"]["failOnSkipped"] is True
     assert captured["params"]["fidelity"] == "native"
     assert captured["params"]["allowSceneSave"] is False
+    assert captured["params"]["initTimeout"] == 15000
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "abc123"
@@ -46,7 +47,15 @@ async def test_run_tests_forwards_init_timeout(monkeypatch):
 
     async def fake_send_with_unity_instance(send_fn, unity_instance, command_type, params, **kwargs):
         captured["params"] = params
-        return {"success": True, "data": {"job_id": "abc123", "status": "running", "mode": "PlayMode"}}
+        return {
+            "success": True,
+            "data": {
+                "job_id": "abc123",
+                "status": "running",
+                "mode": "PlayMode",
+                "effective_init_timeout_ms": params["initTimeout"],
+            },
+        }
 
     import services.tools.run_tests as mod
     monkeypatch.setattr(
@@ -59,10 +68,11 @@ async def test_run_tests_forwards_init_timeout(monkeypatch):
     )
     assert captured["params"]["initTimeout"] == 120000
     assert resp.success is True
+    assert resp.data.effective_init_timeout_ms == 120000
 
 
 @pytest.mark.asyncio
-async def test_run_tests_omits_init_timeout_when_none(monkeypatch):
+async def test_run_tests_uses_mode_specific_init_timeout_defaults(monkeypatch):
     from services.tools.run_tests import run_tests
 
     captured = {}
@@ -75,9 +85,57 @@ async def test_run_tests_omits_init_timeout_when_none(monkeypatch):
     monkeypatch.setattr(
         mod.unity_transport, "send_with_unity_instance", fake_send_with_unity_instance)
 
-    resp = await run_tests(DummyContext(), mode="EditMode")
-    assert "initTimeout" not in captured["params"]
+    edit_response = await run_tests(DummyContext(), mode="EditMode")
+    assert captured["params"]["initTimeout"] == 15000
+    assert edit_response.success is True
+
+    play_response = await run_tests(DummyContext(), mode="PlayMode")
+    assert captured["params"]["initTimeout"] == 120000
+    assert play_response.success is True
+
+
+@pytest.mark.asyncio
+async def test_run_tests_accepts_explicit_init_timeout_ms_alias(monkeypatch):
+    from services.tools.run_tests import run_tests
+
+    captured = {}
+
+    async def fake_send_with_unity_instance(send_fn, unity_instance, command_type, params, **kwargs):
+        captured["params"] = params
+        return {"success": True, "data": {"job_id": "abc123", "status": "running"}}
+
+    import services.tools.run_tests as mod
+    monkeypatch.setattr(
+        mod.unity_transport, "send_with_unity_instance", fake_send_with_unity_instance)
+
+    resp = await run_tests(DummyContext(), init_timeout_ms=60000)
     assert resp.success is True
+    assert captured["params"]["initTimeout"] == 60000
+
+
+@pytest.mark.asyncio
+async def test_run_tests_rejects_ambiguous_60ms_timeout():
+    from services.tools.run_tests import run_tests
+
+    resp = await run_tests(DummyContext(), mode="EditMode", init_timeout=60)
+    assert resp.success is False
+    assert resp.code == "invalid_init_timeout"
+    assert resp.error == "invalid_init_timeout"
+    assert "Use 60000 for 60 seconds" in resp.message
+    assert resp.data["received_ms"] == 60
+
+
+@pytest.mark.asyncio
+async def test_run_tests_rejects_conflicting_timeout_aliases():
+    from services.tools.run_tests import run_tests
+
+    resp = await run_tests(
+        DummyContext(),
+        init_timeout=60000,
+        init_timeout_ms=120000,
+    )
+    assert resp.success is False
+    assert resp.code == "invalid_init_timeout"
 
 
 @pytest.mark.asyncio
@@ -96,6 +154,16 @@ async def test_run_tests_rejects_zero_init_timeout():
     resp = await run_tests(DummyContext(), mode="EditMode", init_timeout=0)
     assert resp.success is False
     assert "init_timeout" in resp.error
+
+
+@pytest.mark.asyncio
+async def test_run_tests_rejects_init_timeout_above_hard_cap():
+    from services.tools.run_tests import run_tests
+
+    resp = await run_tests(DummyContext(), mode="PlayMode", init_timeout_ms=600001)
+    assert resp.success is False
+    assert resp.code == "invalid_init_timeout"
+    assert resp.data["maximum_ms"] == 600000
 
 
 @pytest.mark.asyncio
@@ -214,6 +282,40 @@ async def test_get_test_job_forwards_job_id(monkeypatch):
     assert resp.success is True
     assert resp.data is not None
     assert resp.data.job_id == "job-1"
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_accepts_explicit_wait_timeout_seconds_alias(monkeypatch):
+    from services.tools.run_tests import get_test_job
+
+    async def fake_send_with_unity_instance(send_fn, unity_instance, command_type, params, **kwargs):
+        return {"success": True, "data": {"job_id": "job-1", "status": "passed"}}
+
+    import services.tools.run_tests as mod
+    monkeypatch.setattr(
+        mod.unity_transport, "send_with_unity_instance", fake_send_with_unity_instance)
+
+    resp = await get_test_job(
+        DummyContext(),
+        job_id="job-1",
+        wait_timeout_seconds=60,
+    )
+    assert resp.success is True
+    assert resp.data.status == "passed"
+
+
+@pytest.mark.asyncio
+async def test_get_test_job_rejects_conflicting_wait_timeout_aliases():
+    from services.tools.run_tests import get_test_job
+
+    resp = await get_test_job(
+        DummyContext(),
+        job_id="job-1",
+        wait_timeout=30,
+        wait_timeout_seconds=60,
+    )
+    assert resp.success is False
+    assert resp.code == "invalid_wait_timeout"
 
 
 @pytest.mark.asyncio

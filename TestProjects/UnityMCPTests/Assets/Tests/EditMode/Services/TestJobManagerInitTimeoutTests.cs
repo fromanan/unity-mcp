@@ -1,10 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
+using Newtonsoft.Json.Linq;
 using NUnit.Framework;
 using MCPForUnity.Editor.Services;
 using UnityEditor;
 using UnityEditor.SceneManagement;
+using UnityEditor.TestTools.TestRunner.Api;
 using UnityEngine.SceneManagement;
 
 namespace MCPForUnityTests.Editor.Services
@@ -23,6 +26,7 @@ namespace MCPForUnityTests.Editor.Services
         private Type _testJobType;
 
         private string _originalJobId;
+        private string _artifactDirectory;
 
         [SetUp]
         public void SetUp()
@@ -64,10 +68,45 @@ namespace MCPForUnityTests.Editor.Services
             jobs?.Remove("test-init-timeout-job");
             jobs?.Remove("test-init-timeout-default");
             jobs?.Remove("test-init-timeout-persist");
+            jobs?.Remove("test-init-timeout-reload-grace");
+            jobs?.Remove("test-init-timeout-artifact");
+            jobs?.Remove("test-callback-old-job");
+            jobs?.Remove("test-callback-current-job");
             // Flush cleaned state to SessionState so synthetic jobs don't survive domain reloads.
             // The persist test writes to SessionState; without this, the stub job would be
             // restored on the next [InitializeOnLoadMethod] and pollute later test runs.
             _persistMethod.Invoke(null, new object[] { true });
+            if (!string.IsNullOrWhiteSpace(_artifactDirectory) && Directory.Exists(_artifactDirectory))
+            {
+                Directory.Delete(_artifactDirectory, true);
+            }
+        }
+
+        [Test]
+        public void TryResolveInitializationTimeout_UsesModeSpecificDefaultsAndRejectsAmbiguousValues()
+        {
+            bool editValid = TestJobManager.TryResolveInitializationTimeout(
+                TestMode.EditMode,
+                0,
+                out long editTimeout,
+                out string editError);
+            bool playValid = TestJobManager.TryResolveInitializationTimeout(
+                TestMode.PlayMode,
+                0,
+                out long playTimeout,
+                out string playError);
+            bool ambiguousValid = TestJobManager.TryResolveInitializationTimeout(
+                TestMode.EditMode,
+                60,
+                out _,
+                out string ambiguousError);
+
+            Assert.IsTrue(editValid, editError);
+            Assert.AreEqual(15_000L, editTimeout);
+            Assert.IsTrue(playValid, playError);
+            Assert.AreEqual(120_000L, playTimeout);
+            Assert.IsFalse(ambiguousValid);
+            StringAssert.Contains("Use 60000 for 60 seconds", ambiguousError);
         }
 
         [Test]
@@ -127,6 +166,82 @@ namespace MCPForUnityTests.Editor.Services
             var status = (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result);
             Assert.AreEqual(TestJobStatus.InfrastructureError, status,
                 "Job with default timeout should auto-fail after 20s");
+            Assert.AreEqual("test-init-timeout-default", _currentJobIdField.GetValue(null));
+            Assert.IsTrue((bool)_testJobType.GetProperty("InitializationCleanupPending").GetValue(result));
+            Assert.IsFalse(TestJobManager.CanDispatch("test-init-timeout-default"));
+        }
+
+        [Test]
+        public void InitializationTimeout_PersistsTerminalArtifactAndTimelineEvent()
+        {
+            System.Collections.IDictionary jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _artifactDirectory = Path.Combine(
+                Path.GetTempPath(),
+                $"unity-mcp-test-job-{Guid.NewGuid():N}");
+
+            object job = Activator.CreateInstance(_testJobType);
+            _testJobType.GetProperty("JobId").SetValue(job, "test-init-timeout-artifact");
+            _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
+            _testJobType.GetProperty("Mode").SetValue(job, "EditMode");
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 20_000);
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now - 20_000);
+            _testJobType.GetProperty("InitializationIdleSinceUnixMs").SetValue(job, now - 20_000);
+            _testJobType.GetProperty("TotalTests").SetValue(job, null);
+            _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 15_000L);
+            _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
+            _testJobType.GetProperty("ExpectedTestNames").SetValue(job, new List<string>());
+            _testJobType.GetProperty("SelectedTestNames").SetValue(job, new List<string>());
+            _testJobType.GetProperty("MissingExpectedTests").SetValue(job, new List<string>());
+            _testJobType.GetProperty("ArtifactDirectory").SetValue(job, _artifactDirectory);
+
+            jobs["test-init-timeout-artifact"] = job;
+            _currentJobIdField.SetValue(null, "test-init-timeout-artifact");
+
+            object result = _getJobMethod.Invoke(null, new[] { "test-init-timeout-artifact" });
+            string runPath = Path.Combine(_artifactDirectory, "run.json");
+            string timelinePath = Path.Combine(_artifactDirectory, "timeline.jsonl");
+            JObject run = JObject.Parse(File.ReadAllText(runPath));
+
+            Assert.AreEqual(TestJobStatus.InfrastructureError,
+                (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result));
+            Assert.AreEqual("infrastructure_error", run["status"]?.ToString());
+            Assert.AreEqual("cleanup_pending", run["initialization"]?["phase"]?.ToString());
+            Assert.IsTrue(run["initialization"]?["cleanup_pending"]?.Value<bool>());
+            StringAssert.Contains("\"event\":\"initialization_timed_out\"", File.ReadAllText(timelinePath));
+        }
+
+        [Test]
+        public void JobCorrelatedCallback_DoesNotMutateAnotherCurrentJob()
+        {
+            System.Collections.IDictionary jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            object oldJob = CreateSyntheticRunningJob("test-callback-old-job", now);
+            object currentJob = CreateSyntheticRunningJob("test-callback-current-job", now);
+            jobs["test-callback-old-job"] = oldJob;
+            jobs["test-callback-current-job"] = currentJob;
+            _currentJobIdField.SetValue(null, "test-callback-current-job");
+
+            TestJobManager.OnRunStarted("test-callback-old-job", new[] { "Suite.Old" });
+
+            Assert.IsNull(_testJobType.GetProperty("TotalTests").GetValue(oldJob));
+            Assert.IsNull(_testJobType.GetProperty("TotalTests").GetValue(currentJob));
+        }
+
+        private object CreateSyntheticRunningJob(string jobId, long now)
+        {
+            object job = Activator.CreateInstance(_testJobType);
+            _testJobType.GetProperty("JobId").SetValue(job, jobId);
+            _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
+            _testJobType.GetProperty("Mode").SetValue(job, "EditMode");
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 15_000L);
+            _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
+            _testJobType.GetProperty("ExpectedTestNames").SetValue(job, new List<string>());
+            _testJobType.GetProperty("SelectedTestNames").SetValue(job, new List<string>());
+            _testJobType.GetProperty("MissingExpectedTests").SetValue(job, new List<string>());
+            return job;
         }
 
         [Test]
@@ -166,6 +281,48 @@ namespace MCPForUnityTests.Editor.Services
             var restoredTimeout = (long)_testJobType.GetProperty("InitTimeoutMs").GetValue(restoredJob);
             Assert.AreEqual(90_000L, restoredTimeout,
                 "InitTimeoutMs should survive persist/restore cycle");
+        }
+
+        [Test]
+        public void InitializationTimeout_AfterDomainReload_RestartsFromContinuousEditorReadiness()
+        {
+            var jobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            var job = Activator.CreateInstance(_testJobType);
+            _testJobType.GetProperty("JobId").SetValue(job, "test-init-timeout-reload-grace");
+            _testJobType.GetProperty("Status").SetValue(job, TestJobStatus.Running);
+            _testJobType.GetProperty("Mode").SetValue(job, "EditMode");
+            _testJobType.GetProperty("StartedUnixMs").SetValue(job, now - 60_000);
+            _testJobType.GetProperty("LastUpdateUnixMs").SetValue(job, now);
+            _testJobType.GetProperty("TotalTests").SetValue(job, null);
+            _testJobType.GetProperty("InitTimeoutMs").SetValue(job, 15_000L);
+            _testJobType.GetProperty("UnityRunGuid").SetValue(job, "test-unity-run-guid");
+            _testJobType.GetProperty("InitializationIdleSinceUnixMs").SetValue(job, now - 60_000);
+            _testJobType.GetProperty("FailuresSoFar").SetValue(job, new List<TestJobFailure>());
+
+            jobs["test-init-timeout-reload-grace"] = job;
+            _currentJobIdField.SetValue(null, "test-init-timeout-reload-grace");
+            _persistMethod.Invoke(null, new object[] { true });
+            jobs.Remove("test-init-timeout-reload-grace");
+            _currentJobIdField.SetValue(null, null);
+
+            long restoreStarted = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            _restoreMethod.Invoke(null, null);
+
+            var restoredJobs = _jobsField.GetValue(null) as System.Collections.IDictionary;
+            var restoredJob = restoredJobs["test-init-timeout-reload-grace"];
+            long idleSince = (long)_testJobType.GetProperty("InitializationIdleSinceUnixMs").GetValue(restoredJob);
+            bool resumed = (bool)_testJobType.GetProperty("ResumedAfterDomainReload").GetValue(restoredJob);
+            string unityRunGuid = (string)_testJobType.GetProperty("UnityRunGuid").GetValue(restoredJob);
+            var result = _getJobMethod.Invoke(null, new object[] { "test-init-timeout-reload-grace" });
+            var status = (TestJobStatus)_testJobType.GetProperty("Status").GetValue(result);
+
+            Assert.GreaterOrEqual(idleSince, restoreStarted);
+            Assert.IsTrue(resumed);
+            Assert.AreEqual("test-unity-run-guid", unityRunGuid);
+            Assert.AreEqual(TestJobStatus.Running, status,
+                "A restored job must receive a fresh continuous-idle initialization window.");
         }
     }
 

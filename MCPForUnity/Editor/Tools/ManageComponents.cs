@@ -103,15 +103,34 @@ namespace MCPForUnity.Editor.Tools
 
             // Set properties if provided
             JObject properties = @params["properties"] as JObject ?? @params["componentProperties"] as JObject;
+            List<string> propertyErrors = new();
             if (properties != null && properties.HasValues)
             {
                 // Record for undo before modifying properties
                 Undo.RecordObject(newComponent, "Modify Component Properties");
-                SetPropertiesOnComponent(newComponent, properties);
+                propertyErrors = SetPropertiesOnComponent(newComponent, properties);
             }
 
             EditorUtility.SetDirty(targetGo);
             MarkOwningSceneDirty(targetGo);
+
+            if (propertyErrors.Count > 0)
+            {
+                McpLog.Warn(
+                    $"[ManageComponents] Component '{componentTypeName}' was added to '{targetGo.name}', " +
+                    $"but {propertyErrors.Count} properties failed: {string.Join(", ", propertyErrors)}");
+                return ErrorResponse.Structured(
+                    "component_added_with_property_errors",
+                    $"Component '{componentTypeName}' was added to '{targetGo.name}', but some properties failed to set.",
+                    new
+                    {
+                        instanceID = targetGo.GetInstanceIDCompat(),
+                        componentType = type.FullName,
+                        componentInstanceID = newComponent.GetInstanceIDCompat(),
+                        errors = propertyErrors
+                    },
+                    "The component remains added. Correct the reported properties and retry with action='set_property'.");
+            }
 
             return new
             {
@@ -272,6 +291,9 @@ namespace MCPForUnity.Editor.Tools
 
                 if (errors.Count > 0)
                 {
+                    McpLog.Warn(
+                        $"[ManageComponents] {errors.Count} properties failed to set on '{componentType}': " +
+                        string.Join(", ", errors));
                     return new
                     {
                         success = false,
@@ -381,23 +403,20 @@ namespace MCPForUnity.Editor.Tools
             return GameObjectLookup.FindByTarget(targetToken, searchMethod ?? "by_name", true);
         }
 
-        private static void SetPropertiesOnComponent(Component component, JObject properties)
+        private static List<string> SetPropertiesOnComponent(Component component, JObject properties)
         {
+            List<string> errors = new();
             if (component == null || properties == null)
-                return;
+                return errors;
 
-            var errors = new List<string>();
-            foreach (var prop in properties.Properties())
+            foreach (JProperty prop in properties.Properties())
             {
-                var error = TrySetProperty(component, prop.Name, prop.Value);
+                string error = TrySetProperty(component, prop.Name, prop.Value);
                 if (error != null)
                     errors.Add(error);
             }
-            
-            if (errors.Count > 0)
-            {
-                McpLog.Warn($"[ManageComponents] Some properties failed to set on {component.GetType().Name}: {string.Join(", ", errors)}");
-            }
+
+            return errors;
         }
 
         /// <summary>
@@ -414,7 +433,6 @@ namespace MCPForUnity.Editor.Tools
                 return null; // Success
             }
 
-            McpLog.Warn($"[ManageComponents] {error}");
             return error;
         }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Helpers;
+using MCPForUnity.Editor.Services.Server;
 using MCPForUnity.Editor.Services.Transport;
 using MCPForUnity.Editor.Windows;
 using UnityEditor;
@@ -20,6 +21,9 @@ namespace MCPForUnity.Editor.Services
         // crash mid-compile would leave a stale flag that resurrects the bridge on the next
         // launch (#1229).
         internal const string ResumeSessionKey = "MCPForUnity.ResumeHttpAfterReload";
+        internal const string ResumeWarningSessionKey =
+            "MCPForUnity.ResumeHttpAfterReload.WarningIssued";
+        private const double PersistentReconnectIntervalSeconds = 30.0;
 
         private static readonly TimeSpan[] ResumeRetrySchedule =
         {
@@ -30,6 +34,9 @@ namespace MCPForUnity.Editor.Services
             TimeSpan.FromSeconds(10),
             TimeSpan.FromSeconds(30)
         };
+
+        private static bool _persistentReconnectInFlight;
+        private static double _nextPersistentReconnectAt;
 
         static HttpBridgeReloadHandler()
         {
@@ -58,7 +65,14 @@ namespace MCPForUnity.Editor.Services
         /// bridge lifecycle (Connect, End Session, transport switch, orphan cleanup); the
         /// retry loop re-checks the flag per attempt, so this also aborts an in-flight loop.
         /// </summary>
-        internal static void CancelPendingResume() => SessionState.EraseBool(ResumeSessionKey);
+        internal static void CancelPendingResume()
+        {
+            SessionState.EraseBool(ResumeSessionKey);
+            SessionState.EraseBool(ResumeWarningSessionKey);
+            EditorApplication.update -= PersistentResumeTick;
+            _persistentReconnectInFlight = false;
+            _nextPersistentReconnectAt = 0;
+        }
 
         private static void OnBeforeAssemblyReload()
         {
@@ -150,7 +164,7 @@ namespace MCPForUnity.Editor.Services
         /// <summary>
         /// Decision core, separated so EditMode tests can drive it. Returns true when a resume
         /// should be scheduled. Does not consume the flag — it survives until the resume
-        /// succeeds, is cancelled, or exhausts its retries, so a further reload in the middle
+        /// succeeds or is explicitly cancelled, so a further reload in the middle
         /// of any deferral re-enters here instead of losing the resume.
         /// </summary>
         internal static bool OnAfterAssemblyReloadCore()
@@ -162,7 +176,8 @@ namespace MCPForUnity.Editor.Services
                 // Only resume HTTP if it is still the selected transport.
                 if (!EditorConfigurationCache.Instance.UseHttpTransport)
                 {
-                    SessionState.EraseBool(ResumeSessionKey);
+                    LogTransportConfigurationChanged("after_reload_selection_check");
+                    CancelPendingResume();
                     return false;
                 }
 
@@ -172,8 +187,8 @@ namespace MCPForUnity.Editor.Services
             {
                 // Transport-config read failed (services racing the reload boundary): schedule
                 // the resume anyway rather than dropping it — the retry loop re-checks the
-                // transport per attempt and erases the flag itself on cancel/switch/exhaustion,
-                // so a stale flag cannot wedge the session.
+                // transport per attempt and retains the flag until connection or an explicit
+                // cancel/switch, so a transient config read failure cannot drop reconnect intent.
                 McpLog.Warn($"Failed to read HTTP bridge reload flag: {ex.Message}");
                 return true;
             }
@@ -201,6 +216,8 @@ namespace MCPForUnity.Editor.Services
         {
             TimeSpan[] schedule = scheduleOverride ?? ResumeRetrySchedule;
             Exception lastException = null;
+            string lastReason = null;
+            bool supervisorArmed = false;
 
             for (int i = 0; i < schedule.Length; i++)
             {
@@ -227,7 +244,8 @@ namespace MCPForUnity.Editor.Services
                     // Abort retries if the user switched transports while we were waiting.
                     if (!EditorConfigurationCache.Instance.UseHttpTransport)
                     {
-                        SessionState.EraseBool(ResumeSessionKey);
+                        LogTransportConfigurationChanged("retry_selection_check");
+                        CancelPendingResume();
                         return;
                     }
 
@@ -235,43 +253,286 @@ namespace MCPForUnity.Editor.Services
                     // (WebSocketTransportClient.StartAsync tears down a live connection first).
                     if (MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http))
                     {
-                        SessionState.EraseBool(ResumeSessionKey);
+                        CompleteResume(attempt);
                         return;
                     }
 
-                    bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
-                    if (started)
+                    TransportManager transport = MCPServiceLocator.TransportManager;
+                    supervisorArmed = await transport.EnsurePersistentReconnectAsync(TransportMode.Http);
+                    if (transport.IsRunning(TransportMode.Http))
                     {
-                        SessionState.EraseBool(ResumeSessionKey);
-                        McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
-                        MCPForUnityEditorWindow.RequestHealthVerification();
+                        CompleteResume(attempt);
                         return;
                     }
 
-                    var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
-                    string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
-                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
+                    TransportState state = transport.GetState(TransportMode.Http);
+                    string reconnectFailure = transport.GetLastReconnectFailure(TransportMode.Http);
+                    lastReason = !string.IsNullOrWhiteSpace(reconnectFailure)
+                        ? reconnectFailure
+                        : state?.Error;
+                    string reason = string.IsNullOrWhiteSpace(lastReason)
+                        ? "reconnect supervisor armed; connection is not ready"
+                        : lastReason;
+                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} pending: {reason}");
                 }
                 catch (Exception ex)
                 {
                     lastException = ex;
+                    lastReason = ex.Message;
                     McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} threw: {ex.Message}");
                 }
             }
 
-            // Exhausted: erase the flag so later reload boundaries don't replay this failure
-            // loop for the rest of the session. This cannot swallow a multi-pass resume — a
-            // reload mid-loop kills the task before this line, leaving the flag set.
-            SessionState.EraseBool(ResumeSessionKey);
+            TransportManager currentTransport = MCPServiceLocator.TransportManager;
+            if (currentTransport.IsRunning(TransportMode.Http))
+            {
+                CompleteResume(schedule.Length);
+                return;
+            }
 
-            if (lastException != null)
+            ArmPersistentResumeMonitor();
+            bool supervisorActive = supervisorArmed
+                && currentTransport.IsPersistentReconnectActive(TransportMode.Http);
+            LogPersistentFailureOnce(
+                schedule.Length,
+                supervisorActive,
+                lastReason ?? lastException?.Message);
+        }
+
+        internal static async Task PersistentResumeOnceAsync(TransportManager transport)
+        {
+            if (!IsResumePending)
             {
-                McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
+                EditorApplication.update -= PersistentResumeTick;
+                return;
             }
-            else
+
+            if (!EditorConfigurationCache.Instance.UseHttpTransport)
             {
-                McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                LogTransportConfigurationChanged("persistent_monitor_selection_check");
+                CancelPendingResume();
+                return;
             }
+
+            if (transport.IsRunning(TransportMode.Http))
+            {
+                CompleteResume(0);
+                return;
+            }
+
+            bool supervisorActive = transport.IsPersistentReconnectActive(TransportMode.Http);
+            if (!supervisorActive)
+            {
+                supervisorActive = await transport.EnsurePersistentReconnectAsync(TransportMode.Http);
+            }
+
+            if (transport.IsRunning(TransportMode.Http))
+            {
+                CompleteResume(0);
+                return;
+            }
+
+            LogPersistentFailureOnce(
+                0,
+                supervisorActive,
+                transport.GetLastReconnectFailure(TransportMode.Http));
+        }
+
+        internal static string ClassifyResumeFailure(
+            bool httpSelected,
+            bool serverReachable,
+            bool supervisorActive,
+            string lastReason)
+        {
+            if (!httpSelected)
+            {
+                return "transport_configuration_changed";
+            }
+
+            string normalizedReason = lastReason?.ToLowerInvariant() ?? string.Empty;
+            if (normalizedReason.Contains("handshake")
+                || normalizedReason.Contains("registration")
+                || normalizedReason.Contains("did not become ready"))
+            {
+                return "plugin_handshake_timeout";
+            }
+
+            if (!supervisorActive && serverReachable)
+            {
+                return "supervisor_disappeared_unclassified";
+            }
+
+            if (!serverReachable
+                || normalizedReason.Contains("connection failed")
+                || normalizedReason.Contains("actively refused")
+                || normalizedReason.Contains("unable to connect"))
+            {
+                return "server_unreachable_after_reload";
+            }
+
+            return supervisorActive
+                ? "plugin_handshake_timeout"
+                : "supervisor_disappeared_unclassified";
+        }
+
+        private static void ArmPersistentResumeMonitor()
+        {
+            _nextPersistentReconnectAt = EditorApplication.timeSinceStartup
+                + PersistentReconnectIntervalSeconds;
+            EditorApplication.update -= PersistentResumeTick;
+            EditorApplication.update += PersistentResumeTick;
+        }
+
+        private static void PersistentResumeTick()
+        {
+            if (!IsResumePending)
+            {
+                EditorApplication.update -= PersistentResumeTick;
+                return;
+            }
+
+            TransportManager transport = MCPServiceLocator.TransportManager;
+            if (transport.IsRunning(TransportMode.Http))
+            {
+                CompleteResume(0);
+                return;
+            }
+
+            if (_persistentReconnectInFlight
+                || IsEditorBusy()
+                || EditorApplication.timeSinceStartup < _nextPersistentReconnectAt)
+            {
+                return;
+            }
+
+            _persistentReconnectInFlight = true;
+            _nextPersistentReconnectAt = EditorApplication.timeSinceStartup
+                + PersistentReconnectIntervalSeconds;
+            _ = RunPersistentResumeTickAsync(transport);
+        }
+
+        private static async Task RunPersistentResumeTickAsync(TransportManager transport)
+        {
+            try
+            {
+                await PersistentResumeOnceAsync(transport);
+            }
+            catch (Exception ex)
+            {
+                LogPersistentFailureOnce(
+                    0,
+                    transport.IsPersistentReconnectActive(TransportMode.Http),
+                    ex.Message);
+            }
+            finally
+            {
+                _persistentReconnectInFlight = false;
+            }
+        }
+
+        private static void CompleteResume(int attempt)
+        {
+            bool warningIssued = SessionState.GetBool(ResumeWarningSessionKey, false);
+            CancelPendingResume();
+            if (attempt > 0)
+            {
+                McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
+            }
+            if (warningIssued)
+            {
+                McpLog.Info("[HTTP Reload] Persistent reconnect recovered the MCP bridge");
+            }
+            MCPForUnityEditorWindow.RequestHealthVerification();
+        }
+
+        private static void LogPersistentFailureOnce(
+            int attempts,
+            bool supervisorActive,
+            string lastReason)
+        {
+            if (SessionState.GetBool(ResumeWarningSessionKey, false))
+            {
+                return;
+            }
+
+            SessionState.SetBool(ResumeWarningSessionKey, true);
+            bool serverReachable = IsConfiguredServerReachable();
+            string code = ClassifyResumeFailure(
+                EditorConfigurationCache.Instance.UseHttpTransport,
+                serverReachable,
+                supervisorActive,
+                lastReason);
+            string retryState = supervisorActive
+                ? "persistent_reconnect_active_30s_tail"
+                : "persistent_reconnect_rearm_30s";
+            McpLog.Warn(
+                $"[HTTP Reload] code={code} endpoint='{GetSafeEndpoint()}' " +
+                $"last_reason='{NormalizeLogField(lastReason)}' attempts={attempts} " +
+                $"retry_state={retryState} lifecycle_log='{GetLifecycleLogPath()}'");
+        }
+
+        private static void LogTransportConfigurationChanged(string reason)
+        {
+            McpLog.Info(
+                $"[HTTP Reload] code=transport_configuration_changed " +
+                $"endpoint='{GetSafeEndpoint()}' last_reason='{reason}' " +
+                "retry_state=cancelled_by_transport_switch");
+        }
+
+        private static bool IsConfiguredServerReachable()
+        {
+            try
+            {
+                return HttpEndpointUtility.IsRemoteScope()
+                    || MCPServiceLocator.Server.IsLocalHttpServerReachable();
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string GetSafeEndpoint()
+        {
+            try
+            {
+                Uri endpoint = new Uri(HttpEndpointUtility.GetBaseUrl());
+                UriBuilder safeEndpoint = new UriBuilder(endpoint)
+                {
+                    UserName = string.Empty,
+                    Password = string.Empty
+                };
+                return safeEndpoint.Uri.ToString();
+            }
+            catch
+            {
+                return "unavailable";
+            }
+        }
+
+        private static string GetLifecycleLogPath()
+        {
+            try
+            {
+                string baseUrl = HttpEndpointUtility.GetLocalBaseUrl();
+                if (Uri.TryCreate(baseUrl, UriKind.Absolute, out Uri uri) && uri.Port > 0)
+                {
+                    return ServerRunStateReader.GetLifecycleLogPathForPort(uri.Port);
+                }
+            }
+            catch
+            {
+            }
+            return "unavailable";
+        }
+
+        private static string NormalizeLogField(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "no error detail";
+            }
+            return value.Replace('\r', ' ').Replace('\n', ' ').Replace('\'', ' ').Trim();
         }
     }
 }

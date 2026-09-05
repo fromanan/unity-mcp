@@ -16,4 +16,12 @@ namespace MCPForUnity.Editor.Services.Transport
         Task<bool> VerifyAsync();
         Task ReregisterToolsAsync();
     }
+
+    public interface IPersistentReconnectTransportClient
+    {
+        bool IsReconnectSupervisorActive { get; }
+        string LastReconnectFailure { get; }
+
+        Task<bool> EnsureReconnectSupervisorAsync();
+    }
 }

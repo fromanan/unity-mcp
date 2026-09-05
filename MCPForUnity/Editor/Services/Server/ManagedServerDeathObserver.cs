@@ -1,10 +1,7 @@
 using System;
 using System.Diagnostics;
-using System.Globalization;
-using System.IO;
+using System.Runtime.InteropServices;
 using MCPForUnity.Editor.Helpers;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
 using UnityEditor;
 using UnityEngine;
 
@@ -15,6 +12,8 @@ namespace MCPForUnity.Editor.Services.Server
     {
         private const double PollIntervalSeconds = 5.0;
         private const int MissingPollsBeforeReport = 2;
+        private static readonly TimeSpan ShutdownRequestClassificationWindow =
+            TimeSpan.FromMinutes(1);
         private const string ReportedGenerationSessionKey =
             "MCPForUnity.ManagedServerDeathObserver.ReportedGeneration";
         private static readonly int CurrentUnityPid = GetCurrentUnityPid();
@@ -23,6 +22,8 @@ namespace MCPForUnity.Editor.Services.Server
         private static double _nextPollAt;
         private static string _generation;
         private static int _consecutiveMissing;
+        private static string _observedSupervisorGeneration;
+        private static Process _observedSupervisorProcess;
 
         static ManagedServerDeathObserver()
         {
@@ -35,6 +36,10 @@ namespace MCPForUnity.Editor.Services.Server
 
             EditorApplication.update -= Poll;
             EditorApplication.update += Poll;
+            AssemblyReloadEvents.beforeAssemblyReload -= DisposeObservedSupervisor;
+            AssemblyReloadEvents.beforeAssemblyReload += DisposeObservedSupervisor;
+            EditorApplication.quitting -= DisposeObservedSupervisor;
+            EditorApplication.quitting += DisposeObservedSupervisor;
         }
 
         internal static bool ShouldRunObserver(bool isBatchMode, string allowBatchEnv)
@@ -48,7 +53,8 @@ namespace MCPForUnity.Editor.Services.Server
             double currentUnityStartedAtUnix,
             bool supervisorAlive,
             int consecutiveMissing,
-            bool alreadyReported)
+            bool alreadyReported,
+            bool shutdownRequested = false)
         {
             if (status == null ||
                 status.SupervisorPid <= 0 ||
@@ -56,6 +62,7 @@ namespace MCPForUnity.Editor.Services.Server
                 supervisorAlive ||
                 consecutiveMissing < MissingPollsBeforeReport ||
                 alreadyReported ||
+                shutdownRequested ||
                 !string.IsNullOrWhiteSpace(status.ExitReason))
             {
                 return false;
@@ -99,12 +106,17 @@ namespace MCPForUnity.Editor.Services.Server
                     _consecutiveMissing = 0;
                 }
 
-                bool supervisorAlive = IsExpectedProcessAlive(
-                    status.SupervisorPid,
-                    status.LaunchedAtUnix);
+                bool supervisorAlive = ObserveExpectedProcess(
+                    status,
+                    generation,
+                    out int? observedSupervisorExitCode);
                 if (supervisorAlive || !string.IsNullOrWhiteSpace(status.ExitReason))
                 {
                     _consecutiveMissing = 0;
+                    if (!supervisorAlive)
+                    {
+                        DisposeObservedSupervisor();
+                    }
                     return;
                 }
 
@@ -116,19 +128,33 @@ namespace MCPForUnity.Editor.Services.Server
                     reportedGeneration,
                     generation,
                     StringComparison.Ordinal);
+                bool shutdownRequested = ServerRunStateReader.HasRecentShutdownRequest(
+                    status,
+                    DateTimeOffset.UtcNow,
+                    ShutdownRequestClassificationWindow);
+                if (ShouldPersistShutdownSuppression(
+                        shutdownRequested,
+                        _consecutiveMissing,
+                        alreadyReported))
+                {
+                    SessionState.SetString(ReportedGenerationSessionKey, generation);
+                    return;
+                }
                 if (!ShouldReportUnexpectedExit(
                         status,
                         CurrentUnityPid,
                         CurrentUnityStartedAtUnix,
                         supervisorAlive,
                         _consecutiveMissing,
-                        alreadyReported))
+                        alreadyReported,
+                        shutdownRequested))
                 {
                     return;
                 }
 
-                WriteUnexpectedExitDiagnostic(stateFilePath, status);
+                WriteUnexpectedExitDiagnostic(status, observedSupervisorExitCode);
                 SessionState.SetString(ReportedGenerationSessionKey, generation);
+                DisposeObservedSupervisor();
             }
             catch (Exception)
             {
@@ -136,33 +162,54 @@ namespace MCPForUnity.Editor.Services.Server
             }
         }
 
-        private static bool IsExpectedProcessAlive(int processId, double launchedAtUnix)
+        internal static bool ShouldPersistShutdownSuppression(
+            bool shutdownRequested,
+            int consecutiveMissing,
+            bool alreadyReported)
         {
-            if (processId <= 0)
+            return shutdownRequested
+                   && consecutiveMissing >= MissingPollsBeforeReport
+                   && !alreadyReported;
+        }
+
+        private static bool ObserveExpectedProcess(
+            ManagedServerStatus status,
+            string generation,
+            out int? observedExitCode)
+        {
+            observedExitCode = null;
+            if (status.SupervisorPid <= 0)
+            {
+                return false;
+            }
+
+            if (_observedSupervisorProcess == null ||
+                !string.Equals(
+                    _observedSupervisorGeneration,
+                    generation,
+                    StringComparison.Ordinal))
+            {
+                DisposeObservedSupervisor();
+                _observedSupervisorProcess = TryOpenExpectedProcess(
+                    status.SupervisorPid,
+                    status.LaunchedAtUnix);
+                _observedSupervisorGeneration = generation;
+            }
+            if (_observedSupervisorProcess == null)
             {
                 return false;
             }
 
             try
             {
-                using (Process process = Process.GetProcessById(processId))
+                _observedSupervisorProcess.Refresh();
+                if (_observedSupervisorProcess.HasExited)
                 {
-                    if (process.HasExited)
-                    {
-                        return false;
-                    }
-
-                    if (launchedAtUnix <= 0)
-                    {
-                        return true;
-                    }
-
-                    double processStartedAtUnix =
-                        new DateTimeOffset(process.StartTime.ToUniversalTime())
-                            .ToUnixTimeMilliseconds() / 1000.0;
-                    return processStartedAtUnix <= launchedAtUnix + 5.0 &&
-                           processStartedAtUnix >= launchedAtUnix - 60.0;
+                    observedExitCode = _observedSupervisorProcess.ExitCode;
+                    return false;
                 }
+
+                return true;
             }
             catch (ArgumentException)
             {
@@ -178,66 +225,142 @@ namespace MCPForUnity.Editor.Services.Server
             }
         }
 
-        private static void WriteUnexpectedExitDiagnostic(
-            string stateFilePath,
-            ManagedServerStatus status)
+        private static Process TryOpenExpectedProcess(int processId, double launchedAtUnix)
         {
-            DateTime stateLastWriteUtc = File.Exists(stateFilePath)
-                ? File.GetLastWriteTimeUtc(stateFilePath)
-                : DateTime.MinValue;
-            string projectRoot = Path.GetFullPath(Path.Combine(Application.dataPath, ".."));
-            string logDirectory = Path.Combine(
-                projectRoot,
-                "Library",
-                "MCPForUnity",
-                "Logs");
-            Directory.CreateDirectory(logDirectory);
-            string diagnosticPath = Path.Combine(
-                logDirectory,
-                $"server-lifecycle-{status.Port}.jsonl");
-
-            JObject diagnostic = new JObject
+            try
             {
-                ["schema_version"] = 1,
-                ["timestamp_utc"] = DateTimeOffset.UtcNow.ToString(
-                    "O",
-                    CultureInfo.InvariantCulture),
-                ["event"] = "supervisor_disappeared_unclassified",
-                ["supervisor_pid"] = status.SupervisorPid,
-                ["server_pid"] = status.ServerPid,
-                ["unity_pid"] = status.UnityPid,
-                ["port"] = status.Port,
-                ["launched_at_unix"] = status.LaunchedAtUnix,
-                ["state_last_write_utc"] = stateLastWriteUtc == DateTime.MinValue
-                    ? JValue.CreateNull()
-                    : JToken.FromObject(stateLastWriteUtc.ToString(
-                        "O",
-                        CultureInfo.InvariantCulture)),
-                ["active_processes"] = status.ActiveProcesses,
-                ["current_private_bytes"] = status.CurrentPrivateBytes,
-                ["peak_job_memory_bytes"] = status.PeakJobMemoryBytes,
-                ["soft_memory_limit_bytes"] = status.SoftMemoryLimitBytes,
-                ["hard_memory_limit_bytes"] = status.HardMemoryLimitBytes,
-                ["exit_reason"] = string.IsNullOrWhiteSpace(status.ExitReason)
-                    ? JValue.CreateNull()
-                    : JToken.FromObject(status.ExitReason),
-                ["server_exit_code"] = status.ServerExitCode.HasValue
-                    ? JToken.FromObject(status.ServerExitCode.Value)
-                    : JValue.CreateNull()
-            };
-            File.AppendAllText(
-                diagnosticPath,
-                diagnostic.ToString(Formatting.None) + Environment.NewLine);
+                Process process = Process.GetProcessById(processId);
+                if (launchedAtUnix <= 0)
+                {
+                    return process;
+                }
+
+                double processStartedAtUnix =
+                    new DateTimeOffset(process.StartTime.ToUniversalTime())
+                        .ToUnixTimeMilliseconds() / 1000.0;
+                if (processStartedAtUnix <= launchedAtUnix + 5.0 &&
+                    processStartedAtUnix >= launchedAtUnix - 60.0)
+                {
+                    return process;
+                }
+
+                process.Dispose();
+                return null;
+            }
+            catch (ArgumentException)
+            {
+                return null;
+            }
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static void DisposeObservedSupervisor()
+        {
+            if (_observedSupervisorProcess != null)
+            {
+                _observedSupervisorProcess.Dispose();
+                _observedSupervisorProcess = null;
+            }
+
+            _observedSupervisorGeneration = null;
+        }
+
+        private static void WriteUnexpectedExitDiagnostic(
+            ManagedServerStatus status,
+            int? observedSupervisorExitCode)
+        {
+            ResourcePressureSnapshot pressure = CaptureResourcePressure();
+            string eventName = observedSupervisorExitCode.HasValue
+                ? "supervisor_exited_unclassified"
+                : "supervisor_disappeared_unclassified";
+            string reason = observedSupervisorExitCode.HasValue
+                ? $"Supervisor exited with code {observedSupervisorExitCode.Value} before writing an exit classification"
+                : "Supervisor process disappeared before writing an exit classification";
+            ServerRunStateReader.TryAppendLifecycleEvent(
+                status,
+                eventName,
+                reason,
+                status.SupervisorPid,
+                out string diagnosticPath,
+                observedSupervisorExitCode,
+                pressure.UnityPrivateBytes,
+                pressure.SystemCommitUsedPercent,
+                pressure.SystemAvailablePhysicalBytes,
+                pressure.SystemCommitUsedBytes,
+                pressure.SystemCommitLimitBytes);
+            string exitCode = observedSupervisorExitCode.HasValue
+                ? observedSupervisorExitCode.Value.ToString()
+                : "unavailable";
             McpLog.Warn(
-                $"Managed MCP supervisor PID {status.SupervisorPid} disappeared without " +
-                $"recording an exit reason. Diagnostic: {diagnosticPath}");
+                $"Managed MCP supervisor PID {status.SupervisorPid} stopped without " +
+                $"recording an exit reason (observed exit code: {exitCode}; " +
+                $"Unity private bytes: {pressure.UnityPrivateBytes}; " +
+                $"system commit: {pressure.SystemCommitUsedPercent}%; " +
+                $"available physical bytes: {pressure.SystemAvailablePhysicalBytes}). " +
+                $"Diagnostic: {diagnosticPath}");
+        }
+
+        private static ResourcePressureSnapshot CaptureResourcePressure()
+        {
+            long unityPrivateBytes = -1;
+            try
+            {
+                using (Process process = Process.GetCurrentProcess())
+                {
+                    process.Refresh();
+                    unityPrivateBytes = process.PrivateMemorySize64;
+                }
+            }
+            catch (Exception)
+            {
+            }
+
+#if UNITY_EDITOR_WIN
+            try
+            {
+                MemoryStatusEx memoryStatus = new MemoryStatusEx
+                {
+                    Length = checked((uint)Marshal.SizeOf<MemoryStatusEx>())
+                };
+                if (!GlobalMemoryStatusEx(ref memoryStatus))
+                {
+                    return ResourcePressureSnapshot.Unavailable(unityPrivateBytes);
+                }
+
+                long commitLimitBytes = checked((long)memoryStatus.TotalPageFile);
+                long commitAvailableBytes = checked((long)memoryStatus.AvailablePageFile);
+                long commitUsedBytes = commitLimitBytes - commitAvailableBytes;
+                int commitUsedPercent = commitLimitBytes > 0
+                    ? checked((int)Math.Round(
+                        commitUsedBytes * 100d / commitLimitBytes,
+                        MidpointRounding.AwayFromZero))
+                    : -1;
+                return new ResourcePressureSnapshot(
+                    unityPrivateBytes,
+                    checked((long)memoryStatus.AvailablePhysical),
+                    commitUsedBytes,
+                    commitLimitBytes,
+                    commitUsedPercent);
+            }
+            catch (Exception)
+            {
+                return ResourcePressureSnapshot.Unavailable(unityPrivateBytes);
+            }
+#else
+            return ResourcePressureSnapshot.Unavailable(unityPrivateBytes);
+#endif
         }
 
         private static string BuildGeneration(ManagedServerStatus status)
         {
-            return status.SupervisorPid.ToString(CultureInfo.InvariantCulture) +
-                   ":" +
-                   status.LaunchedAtUnix.ToString("R", CultureInfo.InvariantCulture);
+            return ServerRunStateReader.BuildGeneration(status);
         }
 
         private static int GetCurrentUnityPid()
@@ -268,6 +391,63 @@ namespace MCPForUnity.Editor.Services.Server
             catch (Exception)
             {
                 return 0;
+            }
+        }
+
+#if UNITY_EDITOR_WIN
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GlobalMemoryStatusEx(ref MemoryStatusEx memoryStatus);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private struct MemoryStatusEx
+        {
+            public uint Length;
+            public uint MemoryLoad;
+            public ulong TotalPhysical;
+            public ulong AvailablePhysical;
+            public ulong TotalPageFile;
+            public ulong AvailablePageFile;
+            public ulong TotalVirtual;
+            public ulong AvailableVirtual;
+            public ulong AvailableExtendedVirtual;
+        }
+#endif
+
+        private readonly struct ResourcePressureSnapshot
+        {
+            public ResourcePressureSnapshot(
+                long unityPrivateBytes,
+                long systemAvailablePhysicalBytes,
+                long systemCommitUsedBytes,
+                long systemCommitLimitBytes,
+                int systemCommitUsedPercent)
+            {
+                UnityPrivateBytes = unityPrivateBytes;
+                SystemAvailablePhysicalBytes = systemAvailablePhysicalBytes;
+                SystemCommitUsedBytes = systemCommitUsedBytes;
+                SystemCommitLimitBytes = systemCommitLimitBytes;
+                SystemCommitUsedPercent = systemCommitUsedPercent;
+            }
+
+            public long UnityPrivateBytes { get; }
+
+            public long SystemAvailablePhysicalBytes { get; }
+
+            public long SystemCommitUsedBytes { get; }
+
+            public long SystemCommitLimitBytes { get; }
+
+            public int SystemCommitUsedPercent { get; }
+
+            public static ResourcePressureSnapshot Unavailable(long unityPrivateBytes)
+            {
+                return new ResourcePressureSnapshot(
+                    unityPrivateBytes,
+                    -1,
+                    -1,
+                    -1,
+                    -1);
             }
         }
     }

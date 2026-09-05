@@ -1,6 +1,8 @@
 using NUnit.Framework;
+using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.Events;
+using UnityEngine.TestTools;
 using UnityEditor;
 using Newtonsoft.Json.Linq;
 using MCPForUnity.Editor.Helpers;
@@ -178,6 +180,25 @@ namespace MCPForUnityTests.Editor.Tools
         }
 
         [Test]
+        public void SetProperty_SerializedPropertyName_IsCaseInsensitive()
+        {
+            UnityEventTestComponent comp = testGo.AddComponent<UnityEventTestComponent>();
+            JObject value = JObject.Parse(@"{
+                ""m_PersistentCalls"": {
+                    ""m_Calls"": []
+                }
+            }");
+
+            bool ok = ComponentOps.SetProperty(comp, "OnSimpleEvent", value, out string error);
+
+            Assert.IsTrue(ok, $"SerializedProperty casing alias should succeed, got error: {error}");
+            using SerializedObject serializedObject = new SerializedObject(comp);
+            SerializedProperty calls = serializedObject.FindProperty("onSimpleEvent.m_PersistentCalls.m_Calls");
+            Assert.IsNotNull(calls);
+            Assert.AreEqual(0, calls.arraySize);
+        }
+
+        [Test]
         public void SetProperty_SimpleFloat_StillWorksViaReflection()
         {
             var audioSource = testGo.AddComponent<AudioSource>();
@@ -228,6 +249,33 @@ namespace MCPForUnityTests.Editor.Tools
             var callsProp = so.FindProperty("onSimpleEvent.m_PersistentCalls.m_Calls");
             Assert.AreEqual(1, callsProp.arraySize, "Should have 1 persistent call after end-to-end");
             Assert.AreEqual("SetActive", callsProp.GetArrayElementAtIndex(0).FindPropertyRelative("m_MethodName").stringValue);
+        }
+
+        [Test]
+        public void HandleCommand_AddWithInvalidProperty_ReportsPartialMutationOnce()
+        {
+            LogAssert.Expect(
+                LogType.Warning,
+                new Regex("Component 'AudioSource' was added.*but 1 properties failed"));
+            JObject parameters = new JObject
+            {
+                ["action"] = "add",
+                ["target"] = testGo.name,
+                ["search_method"] = "by_name",
+                ["component_type"] = "AudioSource",
+                ["properties"] = new JObject
+                {
+                    ["notARealAudioSourceProperty"] = 1
+                }
+            };
+
+            object result = ManageComponents.HandleCommand(parameters);
+            JObject resultObject = JObject.FromObject(result);
+
+            Assert.IsFalse(resultObject.Value<bool>("success"));
+            Assert.AreEqual("component_added_with_property_errors", resultObject.Value<string>("code"));
+            Assert.IsNotNull(testGo.GetComponent<AudioSource>(), "The partial-mutation response must not hide or undo the added component.");
+            Assert.AreEqual(1, (resultObject["data"]?["errors"] as JArray)?.Count);
         }
     }
 }

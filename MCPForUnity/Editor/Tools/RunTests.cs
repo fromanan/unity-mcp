@@ -4,6 +4,7 @@ using MCPForUnity.Editor.Helpers;
 using MCPForUnity.Editor.Resources.Tests;
 using MCPForUnity.Editor.Services;
 using Newtonsoft.Json.Linq;
+using UnityEditor;
 using UnityEditor.TestTools.TestRunner.Api;
 
 namespace MCPForUnity.Editor.Tools
@@ -67,7 +68,26 @@ namespace MCPForUnity.Editor.Tools
                 }
 
                 TestFilterOptions filterOptions = GetFilterOptions(@params);
-                long initTimeoutMs = p.GetInt("initTimeout") ?? 0;
+                long requestedInitTimeoutMs = p.GetInt("initTimeout") ?? 0;
+                if (!TestJobManager.TryResolveInitializationTimeout(
+                        parsedMode.Value,
+                        requestedInitTimeoutMs,
+                        out long effectiveInitTimeoutMs,
+                        out string initTimeoutError))
+                {
+                    return Task.FromResult<object>(ErrorResponse.Structured(
+                        "invalid_init_timeout",
+                        initTimeoutError,
+                        new
+                        {
+                            received_ms = requestedInitTimeoutMs,
+                            minimum_ms = TestJobManager.MinimumInitializationTimeoutMs,
+                            maximum_ms = TestJobManager.MaximumInitializationTimeoutMs,
+                            editmode_default_ms = TestJobManager.DefaultEditModeInitializationTimeoutMs,
+                            playmode_default_ms = TestJobManager.DefaultPlayModeInitializationTimeoutMs
+                        },
+                        "Use 60000 for 60 seconds or omit init_timeout_ms for the mode-specific default."));
+                }
                 TestJobOptions options = new()
                 {
                     IncludeDetails = includeDetails,
@@ -81,13 +101,34 @@ namespace MCPForUnity.Editor.Tools
                         AllowSceneSave = p.GetBool("allowSceneSave", false)
                     }
                 };
-                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, initTimeoutMs, options);
+
+                bool isCompiling = EditorStateCache.GetActualIsCompiling();
+                bool isUpdating = EditorApplication.isUpdating;
+                if (isCompiling || isUpdating)
+                {
+                    return Task.FromResult<object>(ErrorResponse.Structured(
+                        "editor_busy",
+                        "Cannot start a Unity test job while scripts are compiling or assets are updating.",
+                        new { is_compiling = isCompiling, is_updating = isUpdating },
+                        "Wait for the Editor to become idle, then call run_tests directly again."));
+                }
+
+                if (EditorApplication.isPlaying || EditorApplication.isPlayingOrWillChangePlaymode)
+                {
+                    return Task.FromResult<object>(ErrorResponse.Structured(
+                        "play_mode_transition",
+                        "Cannot start a Unity test job while the Editor is in or entering Play Mode.",
+                        hint: "Stop Play Mode, wait for the Editor to become idle, then retry."));
+                }
+
+                string jobId = TestJobManager.StartJob(parsedMode.Value, filterOptions, effectiveInitTimeoutMs, options);
 
                 return Task.FromResult<object>(new SuccessResponse("Test job started.", new
                 {
                     job_id = jobId,
                     status = "running",
                     mode = parsedMode.Value.ToString(),
+                    effective_init_timeout_ms = effectiveInitTimeoutMs,
                     include_details = includeDetails,
                     include_failed_tests = includeFailedTests,
                     fidelity = fidelity == TestExecutionFidelity.Native ? "native" : "bridge_preserving",

@@ -22,7 +22,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
     /// Handles registration, keep-alives, and command dispatch back into Unity via
     /// <see cref="TransportCommandDispatcher"/>.
     /// </summary>
-    public class WebSocketTransportClient : IMcpTransportClient, IDisposable
+    public class WebSocketTransportClient : IMcpTransportClient, IPersistentReconnectTransportClient, IDisposable
     {
         private const string TransportDisplayName = "websocket";
         private const int MaxIncomingMessageBytes = 16 * 1024 * 1024;
@@ -127,6 +127,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         private bool _editorStateSubscribed;
         private volatile bool _reloadDraining;
         private bool _hasReportedOutage;
+        private volatile string _lastReconnectFailure;
         private int _connectionGeneration;
         private bool _disposed;
 
@@ -138,6 +139,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
         public bool IsConnected => _isConnected;
         public string TransportName => TransportDisplayName;
         public TransportState State => _state;
+        public bool IsReconnectSupervisorActive =>
+            _lifecycleCts != null
+            && !_lifecycleCts.IsCancellationRequested
+            && _supervisorTask != null
+            && !_supervisorTask.IsCompleted;
+        public string LastReconnectFailure => _lastReconnectFailure;
 
         private Task<List<ToolMetadata>> GetEnabledToolsOnMainThreadAsync(CancellationToken token)
         {
@@ -148,6 +155,43 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
 
         public async Task<bool> StartAsync()
         {
+            if (!await StartReconnectSupervisorAsync(replaceActiveSupervisor: true))
+            {
+                return false;
+            }
+
+            TaskCompletionSource<bool> firstReady = _firstReady;
+            CancellationToken lifecycleToken = _lifecycleCts.Token;
+            Task completed = await Task.WhenAny(
+                firstReady.Task,
+                Task.Delay(HandshakeTimeout, lifecycleToken)).ConfigureAwait(false);
+            if (completed != firstReady.Task || !await firstReady.Task.ConfigureAwait(false))
+            {
+                string error = "Connection did not become ready before the handshake timeout";
+                _lastReconnectFailure = error;
+                await StopAsync();
+                _state = TransportState.Disconnected(
+                    TransportDisplayName,
+                    error,
+                    phase: TransportPhase.Faulted,
+                    details: _endpointUri.ToString());
+                return false;
+            }
+            return true;
+        }
+
+        public Task<bool> EnsureReconnectSupervisorAsync()
+        {
+            return StartReconnectSupervisorAsync(replaceActiveSupervisor: false);
+        }
+
+        private async Task<bool> StartReconnectSupervisorAsync(bool replaceActiveSupervisor)
+        {
+            if (!replaceActiveSupervisor && IsReconnectSupervisorActive)
+            {
+                return true;
+            }
+
             // Capture identity values on the main thread before any async context switching
             _projectName = ProjectIdentityUtility.GetProjectName();
             _projectHash = ProjectIdentityUtility.GetProjectHash();
@@ -188,25 +232,12 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
             _firstReady = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             _reloadDraining = false;
             _hasReportedOutage = false;
+            _lastReconnectFailure = null;
             SubscribeEditorState();
 
             _supervisorTask = Task.Run(
                 () => SuperviseConnectionsAsync(_lifecycleCts.Token),
                 CancellationToken.None);
-            Task completed = await Task.WhenAny(
-                _firstReady.Task,
-                Task.Delay(HandshakeTimeout, _lifecycleCts.Token)).ConfigureAwait(false);
-            if (completed != _firstReady.Task || !await _firstReady.Task.ConfigureAwait(false))
-            {
-                string error = "Connection did not become ready before the handshake timeout";
-                await StopAsync();
-                _state = TransportState.Disconnected(
-                    TransportDisplayName,
-                    error,
-                    phase: TransportPhase.Faulted,
-                    details: _endpointUri.ToString());
-                return false;
-            }
             return true;
         }
 
@@ -355,6 +386,9 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                     connection = await EstablishConnectionAsync(token).ConfigureAwait(false);
                     if (connection == null)
                     {
+                        _lastReconnectFailure = string.IsNullOrWhiteSpace(_state?.Details)
+                            ? _state?.Error
+                            : _state.Details;
                         failedAttempts++;
                         continue;
                     }
@@ -373,12 +407,14 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                         disconnectReason = completed == handshakeTimeout
                             ? "Registration handshake timed out"
                             : (await connection.Disconnected.Task.ConfigureAwait(false)).Reason;
+                        _lastReconnectFailure = disconnectReason;
                         connection.SignalDisconnect(DisconnectKind.HandshakeFailure, disconnectReason);
                         failedAttempts++;
                         continue;
                     }
 
                     _isConnected = true;
+                    _lastReconnectFailure = null;
                     hasBeenReady = true;
                     failedAttempts = 0;
                     _state = TransportState.Connected(
@@ -403,6 +439,7 @@ namespace MCPForUnity.Editor.Services.Transport.Transports
                 catch (Exception ex)
                 {
                     disconnectReason = ex.Message;
+                    _lastReconnectFailure = disconnectReason;
                     failedAttempts++;
                     McpLog.Debug($"[WebSocket] Connection generation failed: {ex}");
                 }

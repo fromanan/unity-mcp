@@ -280,7 +280,9 @@ namespace MCPForUnity.Editor.Services
 
             // First, try to stop any existing server (quietly; we'll only warn if the port remains occupied).
             progress?.Report(new ServerStartProgress(0.03f, "Checking for an existing server…"));
-            StopLocalHttpServerInternal(quiet: true);
+            StopLocalHttpServerInternal(
+                quiet: true,
+                shutdownReason: "server_replacement_requested");
 
             // If the port is still occupied, don't start and explain why (avoid confusing "refusing to stop" warnings).
             try
@@ -462,7 +464,8 @@ namespace MCPForUnity.Editor.Services
             // can be terminated.
             return StopLocalHttpServerInternal(
                 quiet: false,
-                portOverride: configuredPort);
+                portOverride: configuredPort,
+                shutdownReason: "user_stop_requested");
         }
 
         public bool StopManagedLocalHttpServer()
@@ -489,7 +492,11 @@ namespace MCPForUnity.Editor.Services
                 return false;
             }
 
-            return StopLocalHttpServerInternal(quiet: true, portOverride: port, allowNonLocalUrl: true);
+            return StopLocalHttpServerInternal(
+                quiet: true,
+                portOverride: port,
+                allowNonLocalUrl: true,
+                shutdownReason: "managed_stop_requested");
         }
 
         public bool IsLocalHttpServerRunning()
@@ -670,7 +677,11 @@ namespace MCPForUnity.Editor.Services
             hosts.Add(candidate);
         }
 
-        private bool StopLocalHttpServerInternal(bool quiet, int? portOverride = null, bool allowNonLocalUrl = false)
+        private bool StopLocalHttpServerInternal(
+            bool quiet,
+            int? portOverride = null,
+            bool allowNonLocalUrl = false,
+            string shutdownReason = "server_stop_requested")
         {
             string httpUrl = HttpEndpointUtility.GetLocalBaseUrl();
             if (!allowNonLocalUrl && !IsLocalUrl(httpUrl))
@@ -720,7 +731,7 @@ namespace MCPForUnity.Editor.Services
                     // to port-based heuristics when a port override was supplied (managed-stop path).
                     if (!TryReadPidFromPidFile(pidFilePath, out var pidFromFile) || pidFromFile <= 0)
                     {
-                        if (TryStopManagedLaunchHandle(port, quiet))
+                        if (TryStopManagedLaunchHandle(port, quiet, shutdownReason))
                         {
                             try { DeletePidFile(pidFilePath); } catch { }
                             ClearLocalServerPidTracking();
@@ -781,6 +792,7 @@ namespace MCPForUnity.Editor.Services
 
                             if (pidIsListener && allowKill)
                             {
+                                RecordShutdownRequest(port, pidFromFile, shutdownReason);
                                 if (TryRequestGracefulShutdown(instanceToken, pidFromFile, port)
                                     || TerminateProcess(pidFromFile, port))
                                 {
@@ -896,6 +908,10 @@ namespace MCPForUnity.Editor.Services
                                                 || storedArgsLowerNow.Contains("python");
                                 }
 
+                                if (allowKill)
+                                {
+                                    RecordShutdownRequest(port, storedPid, shutdownReason);
+                                }
                                 if (allowKill && TerminateProcess(storedPid, port))
                                 {
                                     if (!quiet)
@@ -942,6 +958,7 @@ namespace MCPForUnity.Editor.Services
                         continue;
                     }
 
+                    RecordShutdownRequest(port, pid, shutdownReason);
                     if (TerminateProcess(pid, port))
                     {
                         McpLog.Info($"Stopped local HTTP server on port {port} (PID: {pid})");
@@ -1008,7 +1025,10 @@ namespace MCPForUnity.Editor.Services
             return _processTerminator.Terminate(pid, expectedPort);
         }
 
-        private bool TryStopManagedLaunchHandle(int port, bool quiet)
+        private bool TryStopManagedLaunchHandle(
+            int port,
+            bool quiet,
+            string shutdownReason)
         {
             try
             {
@@ -1024,6 +1044,7 @@ namespace MCPForUnity.Editor.Services
                     return false;
                 }
 
+                RecordShutdownRequest(port, pid, shutdownReason);
                 if (!TerminateProcess(pid, port))
                 {
                     return false;
@@ -1040,6 +1061,36 @@ namespace MCPForUnity.Editor.Services
             catch
             {
                 return false;
+            }
+        }
+
+        private void RecordShutdownRequest(
+            int port,
+            int targetProcessId,
+            string shutdownReason)
+        {
+            try
+            {
+                string stateFilePath = GetLocalHttpServerStateFilePath(port);
+                if (!ServerRunStateReader.TryReadPath(
+                        stateFilePath,
+                        out ManagedServerStatus status)
+                    || status.Port != port
+                    || (targetProcessId != status.ServerPid
+                        && targetProcessId != status.SupervisorPid))
+                {
+                    return;
+                }
+
+                ServerRunStateReader.TryAppendLifecycleEvent(
+                    status,
+                    "shutdown_requested",
+                    shutdownReason,
+                    targetProcessId,
+                    out _);
+            }
+            catch
+            {
             }
         }
 

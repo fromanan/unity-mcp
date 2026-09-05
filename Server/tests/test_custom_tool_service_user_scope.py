@@ -87,6 +87,26 @@ async def test_execute_custom_tool_threads_user_id_from_context(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_custom_tool_rejects_built_in_tools_before_dispatch():
+    ctx = Mock()
+    service = Mock()
+    service.execute_tool = AsyncMock()
+
+    with patch(
+        "services.tools.execute_custom_tool.get_registered_tools",
+        return_value=[{"name": "run_tests", "group": "testing"}],
+    ):
+        with patch("services.tools.execute_custom_tool.CustomToolService.get_instance", return_value=service):
+            response = await execute_custom_tool(ctx, "run_tests", {"test_names": ["Suite.Test"]})
+
+    assert response.success is False
+    assert response.error == "built_in_tool_requires_direct_call"
+    assert response.data == {"tool_name": "run_tests", "group": "testing"}
+    assert "Call 'run_tests' directly" in response.message
+    service.execute_tool.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_custom_tools_resource_threads_user_id_from_context(monkeypatch):
     monkeypatch.setattr(config, "http_remote_hosted", True)
 

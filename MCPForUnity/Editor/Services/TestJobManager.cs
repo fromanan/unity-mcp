@@ -66,6 +66,12 @@ namespace MCPForUnity.Editor.Services
         public string Error { get; set; }
         public TestRunResult Result { get; set; }
         public long InitTimeoutMs { get; set; }
+        public string UnityRunGuid { get; set; }
+        public long InitializationIdleSinceUnixMs { get; set; }
+        public bool ResumedAfterDomainReload { get; set; }
+        public bool InitializationCancellationAttempted { get; set; }
+        public bool? InitializationCancellationSucceeded { get; set; }
+        public bool InitializationCleanupPending { get; set; }
         public bool IncludeDetails { get; set; }
         public bool IncludeFailedTests { get; set; }
         public int MinimumExpectedTests { get; set; }
@@ -88,8 +94,10 @@ namespace MCPForUnity.Editor.Services
         // Keep this small to avoid ballooning payloads during polling.
         private const int FailureCap = 25;
         private const long StuckThresholdMs = 60_000;
-        private const long DefaultInitializationTimeoutMs = 15_000; // 15 seconds default; override per-job via run_tests init_timeout param
-        private const long MaxInitializationTimeoutMs = 600_000; // 10 minutes hard cap
+        internal const long MinimumInitializationTimeoutMs = 1_000;
+        internal const long MaximumInitializationTimeoutMs = 600_000;
+        internal const long DefaultEditModeInitializationTimeoutMs = 15_000;
+        internal const long DefaultPlayModeInitializationTimeoutMs = 120_000;
         private const int MaxJobsToKeep = 10;
         private const long MinPersistIntervalMs = 1000; // Throttle persistence to reduce overhead
 
@@ -133,6 +141,8 @@ namespace MCPForUnity.Editor.Services
         public static bool ClearStuckJob()
         {
             bool cleared = false;
+            string unityRunGuid = null;
+            TestJob clearedJob = null;
             lock (LockObj)
             {
                 if (string.IsNullOrEmpty(_currentJobId))
@@ -140,20 +150,42 @@ namespace MCPForUnity.Editor.Services
                     return false;
                 }
 
-                if (Jobs.TryGetValue(_currentJobId, out var job) && job.Status == TestJobStatus.Running)
+                if (Jobs.TryGetValue(_currentJobId, out TestJob job) &&
+                    (job.Status == TestJobStatus.Running || job.InitializationCleanupPending))
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    job.Status = TestJobStatus.Aborted;
-                    job.Error = "Job cleared manually (stuck or orphaned)";
+                    if (job.Status == TestJobStatus.Running)
+                    {
+                        job.Status = TestJobStatus.Aborted;
+                        job.Error = "Job cleared manually (stuck or orphaned)";
+                    }
                     job.FinishedUnixMs = now;
                     job.LastUpdateUnixMs = now;
+                    unityRunGuid = job.UnityRunGuid;
+                    job.InitializationCleanupPending = false;
+                    job.InitializationCancellationAttempted = !string.IsNullOrWhiteSpace(unityRunGuid);
                     McpLog.Warn($"[TestJobManager] Manually cleared stuck job {_currentJobId}");
                     cleared = true;
+                    clearedJob = job;
                 }
 
                 _currentJobId = null;
             }
+            if (!string.IsNullOrWhiteSpace(unityRunGuid))
+            {
+                bool cancellationSucceeded = TryCancelUnityRun(unityRunGuid, "manual clear");
+                clearedJob.InitializationCancellationSucceeded = cancellationSucceeded;
+            }
+            if (cleared)
+            {
+                TestRunStatus.MarkFinished();
+                if (PlayModeOptionsGuard.IsPending)
+                {
+                    PlayModeOptionsGuard.Restore();
+                }
+            }
             PersistToSessionState(force: true);
+            PersistJobArtifacts(clearedJob, "cleared_manually");
             return cleared;
         }
 
@@ -181,6 +213,12 @@ namespace MCPForUnity.Editor.Services
             public List<TestJobFailure> failures_so_far { get; set; }
             public string error { get; set; }
             public long init_timeout_ms { get; set; }
+            public string unity_run_guid { get; set; }
+            public long initialization_idle_since_unix_ms { get; set; }
+            public bool resumed_after_domain_reload { get; set; }
+            public bool initialization_cancellation_attempted { get; set; }
+            public bool? initialization_cancellation_succeeded { get; set; }
+            public bool initialization_cleanup_pending { get; set; }
             public bool include_details { get; set; }
             public bool include_failed_tests { get; set; }
             public int minimum_expected_tests { get; set; }
@@ -267,6 +305,12 @@ namespace MCPForUnity.Editor.Services
                             FailuresSoFar = pj.failures_so_far ?? new List<TestJobFailure>(),
                             Error = pj.error,
                             InitTimeoutMs = pj.init_timeout_ms,
+                            UnityRunGuid = pj.unity_run_guid,
+                            InitializationIdleSinceUnixMs = pj.initialization_idle_since_unix_ms,
+                            ResumedAfterDomainReload = pj.resumed_after_domain_reload,
+                            InitializationCancellationAttempted = pj.initialization_cancellation_attempted,
+                            InitializationCancellationSucceeded = pj.initialization_cancellation_succeeded,
+                            InitializationCleanupPending = pj.initialization_cleanup_pending,
                             IncludeDetails = pj.include_details,
                             IncludeFailedTests = pj.include_failed_tests,
                             MinimumExpectedTests = pj.minimum_expected_tests > 0 ? pj.minimum_expected_tests : 1,
@@ -306,6 +350,12 @@ namespace MCPForUnity.Editor.Services
                                 currentJob.Error = "Job orphaned after domain reload";
                                 currentJob.FinishedUnixMs = now;
                                 _currentJobId = null;
+                            }
+                            else if (currentJob.TotalTests == null)
+                            {
+                                currentJob.InitializationIdleSinceUnixMs = now;
+                                currentJob.ResumedAfterDomainReload = true;
+                                currentJob.LastUpdateUnixMs = now;
                             }
                         }
                     }
@@ -354,6 +404,12 @@ namespace MCPForUnity.Editor.Services
                             failures_so_far = (j.FailuresSoFar ?? new List<TestJobFailure>()).Take(FailureCap).ToList(),
                             error = j.Error,
                             init_timeout_ms = j.InitTimeoutMs,
+                            unity_run_guid = j.UnityRunGuid,
+                            initialization_idle_since_unix_ms = j.InitializationIdleSinceUnixMs,
+                            resumed_after_domain_reload = j.ResumedAfterDomainReload,
+                            initialization_cancellation_attempted = j.InitializationCancellationAttempted,
+                            initialization_cancellation_succeeded = j.InitializationCancellationSucceeded,
+                            initialization_cleanup_pending = j.InitializationCleanupPending,
                             include_details = j.IncludeDetails,
                             include_failed_tests = j.IncludeFailedTests,
                             minimum_expected_tests = j.MinimumExpectedTests,
@@ -386,6 +442,47 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
+        internal static bool TryResolveInitializationTimeout(
+            TestMode mode,
+            long requestedTimeoutMs,
+            out long effectiveTimeoutMs,
+            out string error)
+        {
+            effectiveTimeoutMs = requestedTimeoutMs == 0
+                ? GetDefaultInitializationTimeout(mode)
+                : requestedTimeoutMs;
+            if (effectiveTimeoutMs < MinimumInitializationTimeoutMs ||
+                effectiveTimeoutMs > MaximumInitializationTimeoutMs)
+            {
+                error = $"Initialization timeout must be {MinimumInitializationTimeoutMs}-{MaximumInitializationTimeoutMs} milliseconds. " +
+                        "Use 60000 for 60 seconds or omit it for the mode-specific default.";
+                return false;
+            }
+
+            error = null;
+            return true;
+        }
+
+        private static long GetDefaultInitializationTimeout(TestMode mode)
+        {
+            return mode == TestMode.PlayMode
+                ? DefaultPlayModeInitializationTimeoutMs
+                : DefaultEditModeInitializationTimeoutMs;
+        }
+
+        private static long GetEffectiveInitializationTimeout(TestJob job)
+        {
+            if (job.InitTimeoutMs > 0)
+            {
+                return job.InitTimeoutMs;
+            }
+
+            TestMode mode = string.Equals(job.Mode, TestMode.PlayMode.ToString(), StringComparison.OrdinalIgnoreCase)
+                ? TestMode.PlayMode
+                : TestMode.EditMode;
+            return GetDefaultInitializationTimeout(mode);
+        }
+
         public static string StartJob(
             TestMode mode,
             TestFilterOptions filterOptions = null,
@@ -394,9 +491,10 @@ namespace MCPForUnity.Editor.Services
         {
             options ??= new TestJobOptions();
             options.Execution ??= new TestExecutionOptions();
-            // Clamp to valid range: non-positive values mean "use default", cap at 10 minutes
-            if (initTimeoutMs < 0) initTimeoutMs = 0;
-            if (initTimeoutMs > MaxInitializationTimeoutMs) initTimeoutMs = MaxInitializationTimeoutMs;
+            if (!TryResolveInitializationTimeout(mode, initTimeoutMs, out long effectiveInitTimeoutMs, out string timeoutError))
+            {
+                throw new ArgumentOutOfRangeException(nameof(initTimeoutMs), timeoutError);
+            }
 
             string jobId = Guid.NewGuid().ToString("N");
             long started = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -420,7 +518,13 @@ namespace MCPForUnity.Editor.Services
                 FailuresSoFar = new List<TestJobFailure>(),
                 Error = null,
                 Result = null,
-                InitTimeoutMs = initTimeoutMs,
+                InitTimeoutMs = effectiveInitTimeoutMs,
+                UnityRunGuid = null,
+                InitializationIdleSinceUnixMs = started,
+                ResumedAfterDomainReload = false,
+                InitializationCancellationAttempted = false,
+                InitializationCancellationSucceeded = null,
+                InitializationCleanupPending = false,
                 IncludeDetails = options.IncludeDetails,
                 IncludeFailedTests = options.IncludeFailedTests,
                 MinimumExpectedTests = Math.Max(1, options.MinimumExpectedTests),
@@ -452,7 +556,8 @@ namespace MCPForUnity.Editor.Services
             Task<TestRunResult> task = MCPServiceLocator.Tests.RunTestsAsync(
                 mode,
                 filterOptions,
-                options.Execution);
+                options.Execution,
+                jobId);
 
             void FinalizeJob(Action finalize)
             {
@@ -474,13 +579,74 @@ namespace MCPForUnity.Editor.Services
             return jobId;
         }
 
-        public static TestJobStatus? FinalizeCurrentJobFromRunFinished(TestRunResult resultPayload)
+        private static bool TryGetActiveJobForCallback(string jobId, out TestJob job)
+        {
+            job = null;
+            return !string.IsNullOrWhiteSpace(jobId) &&
+                   string.Equals(_currentJobId, jobId, StringComparison.Ordinal) &&
+                   Jobs.TryGetValue(jobId, out job);
+        }
+
+        internal static bool CanDispatch(string jobId)
+        {
+            lock (LockObj)
+            {
+                return !string.IsNullOrWhiteSpace(jobId) &&
+                       string.Equals(_currentJobId, jobId, StringComparison.Ordinal) &&
+                       Jobs.TryGetValue(jobId, out TestJob job) &&
+                       job.Status == TestJobStatus.Running;
+            }
+        }
+
+        public static void OnRunDispatched(string jobId, string unityRunGuid)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            TestJob runningJob = null;
+            bool shouldCancel = false;
+            lock (LockObj)
+            {
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job))
+                {
+                    return;
+                }
+
+                job.UnityRunGuid = unityRunGuid;
+                job.LastUpdateUnixMs = now;
+                if (job.Status == TestJobStatus.Running)
+                {
+                    job.InitializationIdleSinceUnixMs = now;
+                }
+                else if (job.InitializationCleanupPending)
+                {
+                    job.InitializationCancellationAttempted = !string.IsNullOrWhiteSpace(unityRunGuid);
+                    shouldCancel = job.InitializationCancellationAttempted;
+                }
+                runningJob = job;
+            }
+
+            if (shouldCancel)
+            {
+                bool cancellationSucceeded = TryCancelUnityRun(unityRunGuid, "late dispatch after initialization timeout");
+                lock (LockObj)
+                {
+                    if (Jobs.TryGetValue(jobId, out TestJob timedOutJob))
+                    {
+                        timedOutJob.InitializationCancellationSucceeded = cancellationSucceeded;
+                    }
+                }
+            }
+            PersistToSessionState(force: true);
+            PersistJobArtifacts(runningJob, shouldCancel ? "late_run_dispatched_cancelled" : "run_dispatched");
+        }
+
+        public static TestJobStatus? FinalizeCurrentJobFromRunFinished(string jobId, TestRunResult resultPayload)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             TestJob completedJob = null;
+            string eventName = "finished";
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job))
                 {
                     return null;
                 }
@@ -488,34 +654,52 @@ namespace MCPForUnity.Editor.Services
                 job.LastUpdateUnixMs = now;
                 job.FinishedUnixMs = now;
                 job.Result = resultPayload;
-                job.Status = EvaluateOutcome(
-                    job,
-                    resultPayload,
-                    out string outcomeError,
-                    out List<string> missingExpectedTests);
-                job.Error = outcomeError;
-                job.MissingExpectedTests = missingExpectedTests;
+                if (resultPayload != null)
+                {
+                    job.TotalTests ??= resultPayload.Total;
+                    job.StartedTests = Math.Max(job.StartedTests, resultPayload.Total);
+                    job.CompletedTests = Math.Max(job.CompletedTests, resultPayload.Total);
+                }
+                if (job.InitializationCleanupPending && job.Status == TestJobStatus.InfrastructureError)
+                {
+                    job.InitializationCleanupPending = false;
+                    eventName = "finished_after_initialization_timeout";
+                }
+                else
+                {
+                    job.Status = EvaluateOutcome(
+                        job,
+                        resultPayload,
+                        out string outcomeError,
+                        out List<string> missingExpectedTests);
+                    job.Error = outcomeError;
+                    job.MissingExpectedTests = missingExpectedTests;
+                }
                 job.CurrentTestFullName = null;
-                _currentJobId = null;
+                if (string.Equals(_currentJobId, jobId, StringComparison.Ordinal))
+                {
+                    _currentJobId = null;
+                }
                 completedJob = job;
             }
             PersistToSessionState(force: true);
-            PersistJobArtifacts(completedJob, "finished");
+            PersistJobArtifacts(completedJob, eventName);
             return completedJob?.Status;
         }
 
-        public static void OnRunStarted(IReadOnlyList<string> selectedTestNames)
+        public static void OnRunStarted(string jobId, IReadOnlyList<string> selectedTestNames)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             TestJob runningJob = null;
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job) || job.Status != TestJobStatus.Running)
                 {
                     return;
                 }
 
                 job.LastUpdateUnixMs = now;
+                job.InitializationIdleSinceUnixMs = 0;
                 job.SelectedTestNames = NormalizeTestNames(selectedTestNames);
                 job.TotalTests = selectedTestNames == null ? null : job.SelectedTestNames.Count;
                 job.SelectionHash = ComputeSelectionHash(job.SelectedTestNames);
@@ -533,7 +717,7 @@ namespace MCPForUnity.Editor.Services
             PersistJobArtifacts(runningJob, "run_started");
         }
 
-        public static void OnTestStarted(string testFullName, bool isLeaf)
+        public static void OnTestStarted(string jobId, string testFullName, bool isLeaf)
         {
             if (string.IsNullOrWhiteSpace(testFullName))
             {
@@ -543,7 +727,7 @@ namespace MCPForUnity.Editor.Services
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job) || job.Status != TestJobStatus.Running)
                 {
                     return;
                 }
@@ -560,6 +744,7 @@ namespace MCPForUnity.Editor.Services
         }
 
         public static void OnLeafTestFinished(
+            string jobId,
             string testFullName,
             string state,
             bool isFailure,
@@ -570,7 +755,7 @@ namespace MCPForUnity.Editor.Services
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job) || job.Status != TestJobStatus.Running)
                 {
                     return;
                 }
@@ -599,12 +784,12 @@ namespace MCPForUnity.Editor.Services
             PersistToSessionState();
         }
 
-        public static void OnRunFinished()
+        public static void OnRunFinished(string jobId)
         {
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             lock (LockObj)
             {
-                if (string.IsNullOrEmpty(_currentJobId) || !Jobs.TryGetValue(_currentJobId, out var job))
+                if (!TryGetActiveJobForCallback(jobId, out TestJob job))
                 {
                     return;
                 }
@@ -624,6 +809,8 @@ namespace MCPForUnity.Editor.Services
 
             TestJob jobToReturn = null;
             bool shouldPersist = false;
+            bool initializationTimedOut = false;
+            string unityRunGuidToCancel = null;
             lock (LockObj)
             {
                 if (!Jobs.TryGetValue(jobId, out var job))
@@ -637,32 +824,58 @@ namespace MCPForUnity.Editor.Services
                 if (job.Status == TestJobStatus.Running && job.TotalTests == null)
                 {
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                    long initTimeout = job.InitTimeoutMs > 0 ? job.InitTimeoutMs : DefaultInitializationTimeoutMs;
-                    if (!EditorStateCache.GetActualIsCompiling() && !EditorApplication.isUpdating && now - job.StartedUnixMs > initTimeout)
+                    long initTimeout = GetEffectiveInitializationTimeout(job);
+                    bool editorBusy = EditorStateCache.GetActualIsCompiling() || EditorApplication.isUpdating;
+                    if (editorBusy)
                     {
-                        McpLog.Warn($"[TestJobManager] Job {jobId} failed to initialize within {initTimeout}ms, auto-failing");
-                        job.Status = TestJobStatus.InfrastructureError;
-                        job.Error = "Test job failed to initialize (tests did not start within timeout)";
-                        job.FinishedUnixMs = now;
+                        job.InitializationIdleSinceUnixMs = now;
                         job.LastUpdateUnixMs = now;
-                        if (_currentJobId == jobId)
-                        {
-                            _currentJobId = null;
-                            // Keep TestRunStatus in sync: when initialization times out, neither
-                            // RunStarted nor RunFinished fires, so the running flag would otherwise leak.
-                            // Only clear it if this job is still the active one — a newer job may have taken over.
-                            TestRunStatus.MarkFinished();
-                        }
                         shouldPersist = true;
+                    }
+                    else
+                    {
+                        long idleSince = job.InitializationIdleSinceUnixMs > 0
+                            ? job.InitializationIdleSinceUnixMs
+                            : job.StartedUnixMs;
+                        if (now - idleSince > initTimeout)
+                        {
+                            McpLog.Warn($"[TestJobManager] Job {jobId} failed to initialize within {initTimeout}ms of continuous editor readiness, auto-failing");
+                            job.Status = TestJobStatus.InfrastructureError;
+                            job.Error = $"Unity Test Runner did not send RunStarted within {initTimeout}ms of continuous editor readiness.";
+                            job.FinishedUnixMs = now;
+                            job.LastUpdateUnixMs = now;
+                            job.InitializationCleanupPending = true;
+                            unityRunGuidToCancel = job.UnityRunGuid;
+                            job.InitializationCancellationAttempted = !string.IsNullOrWhiteSpace(unityRunGuidToCancel);
+                            shouldPersist = true;
+                            initializationTimedOut = true;
+                        }
                     }
                 }
 
                 jobToReturn = job;
             }
 
+            if (!string.IsNullOrWhiteSpace(unityRunGuidToCancel))
+            {
+                bool cancellationSucceeded = TryCancelUnityRun(unityRunGuidToCancel, "initialization timeout");
+                lock (LockObj)
+                {
+                    if (Jobs.TryGetValue(jobId, out TestJob timedOutJob))
+                    {
+                        timedOutJob.InitializationCancellationSucceeded = cancellationSucceeded;
+                    }
+                }
+                shouldPersist = true;
+            }
+
             if (shouldPersist)
             {
                 PersistToSessionState(force: true);
+            }
+            if (initializationTimedOut)
+            {
+                PersistJobArtifacts(jobToReturn, "initialization_timed_out");
             }
             return jobToReturn;
         }
@@ -704,6 +917,23 @@ namespace MCPForUnity.Editor.Services
                 started_unix_ms = job.StartedUnixMs,
                 finished_unix_ms = job.FinishedUnixMs,
                 last_update_unix_ms = job.LastUpdateUnixMs,
+                initialization = new
+                {
+                    timeout_ms = GetEffectiveInitializationTimeout(job),
+                    phase = job.InitializationCleanupPending
+                        ? "cleanup_pending"
+                        : job.TotalTests.HasValue
+                            ? "started"
+                            : string.IsNullOrWhiteSpace(job.UnityRunGuid)
+                                ? "awaiting_dispatch"
+                                : "awaiting_run_started",
+                    idle_since_unix_ms = job.InitializationIdleSinceUnixMs,
+                    resumed_after_domain_reload = job.ResumedAfterDomainReload,
+                    unity_run_guid = job.UnityRunGuid,
+                    cancellation_attempted = job.InitializationCancellationAttempted,
+                    cancellation_succeeded = job.InitializationCancellationSucceeded,
+                    cleanup_pending = job.InitializationCleanupPending
+                },
                 progress = new
                 {
                     selected = job.TotalTests,
@@ -1049,6 +1279,7 @@ namespace MCPForUnity.Editor.Services
                         JObject progress = payload["progress"] as JObject;
                         JObject coverage = payload["coverage"] as JObject;
                         JObject artifacts = payload["artifacts"] as JObject;
+                        JObject initialization = payload["initialization"] as JObject;
                         Jobs[jobId] = new TestJob
                         {
                             JobId = jobId,
@@ -1062,6 +1293,13 @@ namespace MCPForUnity.Editor.Services
                             CompletedTests = progress?["completed"]?.Value<int>() ?? 0,
                             FailuresSoFar = new List<TestJobFailure>(),
                             Error = restoredError,
+                            InitTimeoutMs = initialization?["timeout_ms"]?.Value<long>() ?? 0,
+                            UnityRunGuid = initialization?["unity_run_guid"]?.ToString(),
+                            InitializationIdleSinceUnixMs = initialization?["idle_since_unix_ms"]?.Value<long>() ?? 0,
+                            ResumedAfterDomainReload = initialization?["resumed_after_domain_reload"]?.Value<bool>() ?? false,
+                            InitializationCancellationAttempted = initialization?["cancellation_attempted"]?.Value<bool>() ?? false,
+                            InitializationCancellationSucceeded = initialization?["cancellation_succeeded"]?.Value<bool?>(),
+                            InitializationCleanupPending = initialization?["cleanup_pending"]?.Value<bool>() ?? false,
                             IncludeFailedTests = true,
                             MinimumExpectedTests = coverage?["minimum_expected_tests"]?.Value<int>() ?? 1,
                             ExpectedTestNames = coverage?["expected_test_names"]?.ToObject<List<string>>() ?? new List<string>(),
@@ -1083,12 +1321,36 @@ namespace MCPForUnity.Editor.Services
             }
         }
 
+        private static bool TryCancelUnityRun(string unityRunGuid, string reason)
+        {
+            if (string.IsNullOrWhiteSpace(unityRunGuid))
+            {
+                return false;
+            }
+
+            try
+            {
+                bool cancelled = TestRunnerApi.CancelTestRun(unityRunGuid);
+                if (!cancelled)
+                {
+                    McpLog.Warn($"[TestJobManager] Unity Test Runner did not cancel run {unityRunGuid} after {reason}.");
+                }
+                return cancelled;
+            }
+            catch (Exception ex)
+            {
+                McpLog.Warn($"[TestJobManager] Failed to cancel Unity test run {unityRunGuid} after {reason}: {ex.Message}");
+                return false;
+            }
+        }
+
         private static void FinalizeFromTask(string jobId, Task<TestRunResult> task)
         {
             TestJob completedJob = null;
+            string eventName = "finished";
             lock (LockObj)
             {
-                if (!Jobs.TryGetValue(jobId, out var existing))
+                if (!Jobs.TryGetValue(jobId, out TestJob existing))
                 {
                     if (_currentJobId == jobId) _currentJobId = null;
                     return;
@@ -1097,49 +1359,60 @@ namespace MCPForUnity.Editor.Services
                 // If RunFinished already finalized the job, do nothing.
                 if (existing.Status != TestJobStatus.Running)
                 {
+                    if (!existing.InitializationCleanupPending)
+                    {
+                        if (_currentJobId == jobId) _currentJobId = null;
+                        return;
+                    }
+
+                    existing.InitializationCleanupPending = false;
+                    existing.LastUpdateUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     if (_currentJobId == jobId) _currentJobId = null;
-                    return;
-                }
-
-                existing.LastUpdateUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                existing.FinishedUnixMs = existing.LastUpdateUnixMs;
-
-                if (task.IsFaulted)
-                {
-                    Exception exception = task.Exception?.GetBaseException();
-                    existing.Status = exception is TestRunBlockedException
-                        ? TestJobStatus.Blocked
-                        : TestJobStatus.InfrastructureError;
-                    existing.Error = exception?.Message ?? "Unknown test infrastructure failure";
-                    existing.Result = null;
-                }
-                else if (task.IsCanceled)
-                {
-                    existing.Status = TestJobStatus.Cancelled;
-                    existing.Error = "Test job canceled";
-                    existing.Result = null;
+                    completedJob = existing;
+                    eventName = "initialization_cleanup_finished";
                 }
                 else
                 {
-                    TestRunResult result = task.Result;
-                    existing.Result = result;
-                    existing.Status = EvaluateOutcome(
-                        existing,
-                        result,
-                        out string outcomeError,
-                        out List<string> missingExpectedTests);
-                    existing.Error = outcomeError;
-                    existing.MissingExpectedTests = missingExpectedTests;
-                }
+                    existing.LastUpdateUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    existing.FinishedUnixMs = existing.LastUpdateUnixMs;
 
-                if (_currentJobId == jobId)
-                {
-                    _currentJobId = null;
+                    if (task.IsFaulted)
+                    {
+                        Exception exception = task.Exception?.GetBaseException();
+                        existing.Status = exception is TestRunBlockedException
+                            ? TestJobStatus.Blocked
+                            : TestJobStatus.InfrastructureError;
+                        existing.Error = exception?.Message ?? "Unknown test infrastructure failure";
+                        existing.Result = null;
+                    }
+                    else if (task.IsCanceled)
+                    {
+                        existing.Status = TestJobStatus.Cancelled;
+                        existing.Error = "Test job canceled";
+                        existing.Result = null;
+                    }
+                    else
+                    {
+                        TestRunResult result = task.Result;
+                        existing.Result = result;
+                        existing.Status = EvaluateOutcome(
+                            existing,
+                            result,
+                            out string outcomeError,
+                            out List<string> missingExpectedTests);
+                        existing.Error = outcomeError;
+                        existing.MissingExpectedTests = missingExpectedTests;
+                    }
+
+                    if (_currentJobId == jobId)
+                    {
+                        _currentJobId = null;
+                    }
+                    completedJob = existing;
                 }
-                completedJob = existing;
             }
             PersistToSessionState(force: true);
-            PersistJobArtifacts(completedJob, "finished");
+            PersistJobArtifacts(completedJob, eventName);
         }
     }
 }

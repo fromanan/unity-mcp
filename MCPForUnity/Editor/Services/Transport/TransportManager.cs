@@ -90,8 +90,50 @@ namespace MCPForUnity.Editor.Services.Transport
             return true;
         }
 
+        internal async Task<bool> EnsurePersistentReconnectAsync(TransportMode mode)
+        {
+            if (mode != TransportMode.Http)
+            {
+                return false;
+            }
+
+            IMcpTransportClient client = GetOrCreateClient(mode);
+            if (!(client is IPersistentReconnectTransportClient persistentClient))
+            {
+                return false;
+            }
+
+            bool armed = await persistentClient.EnsureReconnectSupervisorAsync();
+            UpdateState(
+                mode,
+                client.State ?? TransportState.Disconnected(
+                    client.TransportName,
+                    "Reconnect supervisor did not report state"));
+            return armed;
+        }
+
+        internal bool IsPersistentReconnectActive(TransportMode mode)
+        {
+            IMcpTransportClient client = GetClient(mode);
+            return client is IPersistentReconnectTransportClient persistentClient
+                && persistentClient.IsReconnectSupervisorActive;
+        }
+
+        internal string GetLastReconnectFailure(TransportMode mode)
+        {
+            IMcpTransportClient client = GetClient(mode);
+            return client is IPersistentReconnectTransportClient persistentClient
+                ? persistentClient.LastReconnectFailure
+                : client?.State?.Error;
+        }
+
         public async Task StopAsync(TransportMode? mode = null)
         {
+            if (mode == null || mode == TransportMode.Http)
+            {
+                HttpBridgeReloadHandler.CancelPendingResume();
+            }
+
             async Task StopClient(IMcpTransportClient client, TransportMode clientMode)
             {
                 if (client == null) return;

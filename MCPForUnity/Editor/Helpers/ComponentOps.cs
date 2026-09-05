@@ -455,8 +455,7 @@ namespace MCPForUnity.Editor.Helpers
             error = null;
             using var so = new SerializedObject(component);
 
-            SerializedProperty prop = so.FindProperty(propertyName)
-                                   ?? so.FindProperty(normalizedName);
+            SerializedProperty prop = FindSerializedProperty(so, propertyName, normalizedName);
             if (prop == null)
             {
                 error = $"SerializedProperty '{propertyName}' not found on component '{component.GetType().Name}'.";
@@ -474,8 +473,7 @@ namespace MCPForUnity.Editor.Helpers
                 && !(value is JValue jv && jv.Type == JTokenType.Null))
             {
                 so.Update();
-                var verifyProp = so.FindProperty(propertyName)
-                              ?? so.FindProperty(normalizedName);
+                SerializedProperty verifyProp = FindSerializedProperty(so, propertyName, normalizedName);
                 if (verifyProp != null
                     && verifyProp.propertyType == SerializedPropertyType.ObjectReference
                     && verifyProp.objectReferenceValue == null)
@@ -487,6 +485,43 @@ namespace MCPForUnity.Editor.Helpers
             }
 
             return true;
+        }
+
+        private static SerializedProperty FindSerializedProperty(
+            SerializedObject serializedObject,
+            string propertyName,
+            string normalizedName)
+        {
+            SerializedProperty property = serializedObject.FindProperty(propertyName)
+                                         ?? serializedObject.FindProperty(normalizedName);
+            if (property != null)
+            {
+                return property;
+            }
+
+            SerializedProperty iterator = serializedObject.GetIterator();
+            bool enterChildren = true;
+            while (iterator.NextVisible(enterChildren))
+            {
+                enterChildren = false;
+                if (iterator.depth != 0)
+                {
+                    continue;
+                }
+
+                string candidateName = iterator.name;
+                if (string.Equals(candidateName, propertyName, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(candidateName, normalizedName, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(
+                        ParamCoercion.NormalizePropertyName(candidateName),
+                        normalizedName,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return iterator.Copy();
+                }
+            }
+
+            return null;
         }
 
         private static bool SetSerializedPropertyRecursive(SerializedProperty prop, JToken value, out string error, int depth)
@@ -994,4 +1029,3 @@ namespace MCPForUnity.Editor.Helpers
         }
     }
 }
-

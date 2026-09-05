@@ -4,6 +4,7 @@
 // Note: Tests that trigger mid-run compilation may still stall due to OS-level throttling.
 
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using MCPForUnity.Editor.Helpers;
 using UnityEditor;
@@ -132,19 +133,141 @@ namespace MCPForUnity.Editor.Services
 
         private sealed class TestCallbacks : ICallbacks
         {
+            private readonly List<ITestResultAdaptor> _recoveredLeafResults = new();
+            private string _recoveredJobId;
+
             public void RunStarted(ITestAdaptor testsToRun)
             {
                 SetTestRunActive(true);
                 ApplyNoThrottling();
+
+                if (TestRunnerService.HasLiveCallbackOwner)
+                {
+                    return;
+                }
+
+                _recoveredLeafResults.Clear();
+                _recoveredJobId = TestJobManager.CurrentJobId;
+                try
+                {
+                    List<string> selectedTests = new();
+                    CollectLeafTestNames(testsToRun, selectedTests);
+                    TestJobManager.OnRunStarted(_recoveredJobId, selectedTests);
+                }
+                catch
+                {
+                    TestJobManager.OnRunStarted(_recoveredJobId, null);
+                }
             }
 
             public void RunFinished(ITestResultAdaptor result)
             {
-                RestoreThrottling();
+                try
+                {
+                    if (!TestRunnerService.HasLiveCallbackOwner)
+                    {
+                        TestRunResult payload = TestRunResult.Create(result, _recoveredLeafResults);
+                        TestJobManager.OnRunFinished(_recoveredJobId);
+                        TestJobStatus? validatedOutcome = TestJobManager.FinalizeCurrentJobFromRunFinished(_recoveredJobId, payload);
+                        TestRunStatus.MarkFinished(
+                            payload,
+                            validatedOutcome.HasValue
+                                ? TestJobManager.ToOutcomeString(validatedOutcome.Value)
+                                : null);
+
+                        if (PlayModeOptionsGuard.IsPending)
+                        {
+                            PlayModeOptionsGuard.Restore();
+                        }
+                    }
+                }
+                finally
+                {
+                    _recoveredJobId = null;
+                    RestoreThrottling();
+                }
             }
 
-            public void TestStarted(ITestAdaptor test) { }
-            public void TestFinished(ITestResultAdaptor result) { }
+            public void TestStarted(ITestAdaptor test)
+            {
+                if (TestRunnerService.HasLiveCallbackOwner)
+                {
+                    return;
+                }
+
+                try
+                {
+                    string fullName = GetTestName(test);
+                    bool isLeaf = test != null && !test.HasChildren;
+                    TestJobManager.OnTestStarted(_recoveredJobId, fullName, isLeaf);
+                }
+                catch
+                {
+                    // Best-effort recovery callback.
+                }
+            }
+
+            public void TestFinished(ITestResultAdaptor result)
+            {
+                if (TestRunnerService.HasLiveCallbackOwner || result == null || result.HasChildren)
+                {
+                    return;
+                }
+
+                _recoveredLeafResults.Add(result);
+                try
+                {
+                    string outcome = result.ResultState;
+                    string normalizedOutcome = outcome?.Trim().ToLowerInvariant();
+                    bool isFailure = normalizedOutcome != null &&
+                                     (normalizedOutcome.Contains("failed") || normalizedOutcome.Contains("error"));
+                    TestJobManager.OnLeafTestFinished(
+                        _recoveredJobId,
+                        GetTestName(result.Test),
+                        outcome,
+                        isFailure,
+                        result.Message,
+                        result.StackTrace,
+                        result.Output);
+                }
+                catch
+                {
+                    // Best-effort recovery callback.
+                }
+            }
+
+            private static string GetTestName(ITestAdaptor test)
+            {
+                return string.IsNullOrWhiteSpace(test?.FullName) ? test?.Name : test.FullName;
+            }
+
+            private static void CollectLeafTestNames(ITestAdaptor node, List<string> output)
+            {
+                if (node == null)
+                {
+                    return;
+                }
+
+                if (!node.HasChildren)
+                {
+                    string fullName = GetTestName(node);
+                    if (!string.IsNullOrWhiteSpace(fullName))
+                    {
+                        output.Add(fullName);
+                    }
+                    return;
+                }
+
+                if (node.Children == null)
+                {
+                    return;
+                }
+
+                foreach (ITestAdaptor child in node.Children)
+                {
+                    CollectLeafTestNames(child, output);
+                }
+            }
         }
     }
 }

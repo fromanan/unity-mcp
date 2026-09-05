@@ -67,9 +67,12 @@ namespace MCPForUnity.Editor.Services
         /// </summary>
         /// <param name="mode">The test mode (EditMode or PlayMode).</param>
         /// <param name="filterOptions">Optional filter options to run specific tests. Pass null to run all tests.</param>
+        /// <param name="executionOptions">Execution fidelity and scene-save policy.</param>
+        /// <param name="jobId">Owning MCP job id used to correlate asynchronous Unity callbacks.</param>
         Task<TestRunResult> RunTestsAsync(
             TestMode mode,
             TestFilterOptions filterOptions = null,
-            TestExecutionOptions executionOptions = null);
+            TestExecutionOptions executionOptions = null,
+            string jobId = null);
     }
 }

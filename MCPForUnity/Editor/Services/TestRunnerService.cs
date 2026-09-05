@@ -37,7 +37,7 @@ namespace MCPForUnity.Editor.Services
         {
             // After domain reload or editor restart: if a restore is pending and no test run
             // is active, restore now. TryLoad checks SessionState first, then the marker file.
-            if (TryLoad(out _, out _) && !TestRunStatus.IsRunning)
+            if (TryLoad(out _, out _) && !TestRunStatus.IsRunning && !TestJobManager.HasRunningJob)
             {
                 Restore();
             }
@@ -146,16 +146,23 @@ namespace MCPForUnity.Editor.Services
     internal sealed class TestRunnerService : ITestRunnerService, ICallbacks, IDisposable
     {
         private static readonly TestMode[] AllModes = { TestMode.EditMode, TestMode.PlayMode };
+        private static int _liveCallbackOwnerCount;
 
         private readonly TestRunnerApi _testRunnerApi;
         private readonly SemaphoreSlim _operationLock = new SemaphoreSlim(1, 1);
         private readonly List<ITestResultAdaptor> _leafResults = new List<ITestResultAdaptor>();
         private TaskCompletionSource<TestRunResult> _runCompletionSource;
+        private bool _callbacksRegistered;
+        private string _activeMcpJobId;
+
+        internal static bool HasLiveCallbackOwner => _liveCallbackOwnerCount > 0;
 
         public TestRunnerService()
         {
             _testRunnerApi = ScriptableObject.CreateInstance<TestRunnerApi>();
             _testRunnerApi.RegisterCallbacks(this);
+            _callbacksRegistered = true;
+            Interlocked.Increment(ref _liveCallbackOwnerCount);
         }
 
         public async Task<IReadOnlyList<Dictionary<string, string>>> GetTestsAsync(TestMode? mode)
@@ -185,7 +192,8 @@ namespace MCPForUnity.Editor.Services
         public async Task<TestRunResult> RunTestsAsync(
             TestMode mode,
             TestFilterOptions filterOptions = null,
-            TestExecutionOptions executionOptions = null)
+            TestExecutionOptions executionOptions = null,
+            string jobId = null)
         {
             executionOptions ??= new TestExecutionOptions();
             await _operationLock.WaitAsync().ConfigureAwait(true);
@@ -205,6 +213,12 @@ namespace MCPForUnity.Editor.Services
                     throw new InvalidOperationException("Cannot start a test run while the Editor is in or entering Play Mode. Stop Play Mode and try again.");
                 }
 
+                if (!string.IsNullOrWhiteSpace(jobId) && !TestJobManager.CanDispatch(jobId))
+                {
+                    throw new OperationCanceledException(
+                        $"Test job {jobId} is no longer active; Unity Test Runner dispatch was skipped.");
+                }
+
                 if (mode == TestMode.PlayMode &&
                     executionOptions.Fidelity == TestExecutionFidelity.BridgePreserving)
                 {
@@ -216,6 +230,7 @@ namespace MCPForUnity.Editor.Services
                 HandleDirtyScenes(executionOptions.AllowSceneSave);
 
                 _leafResults.Clear();
+                _activeMcpJobId = jobId;
                 _runCompletionSource = new TaskCompletionSource<TestRunResult>(TaskCreationOptions.RunContinuationsAsynchronously);
                 // Mark running immediately so readiness snapshots reflect the busy state even before callbacks fire.
                 TestRunStatus.MarkStarted(mode);
@@ -236,7 +251,8 @@ namespace MCPForUnity.Editor.Services
                     TestRunnerNoThrottle.ApplyNoThrottlingPreemptive();
                 }
 
-                _testRunnerApi.Execute(settings);
+                string unityRunGuid = _testRunnerApi.Execute(settings);
+                TestJobManager.OnRunDispatched(jobId, unityRunGuid);
 
                 runTask = _runCompletionSource.Task;
             }
@@ -244,6 +260,7 @@ namespace MCPForUnity.Editor.Services
             {
                 // Ensure the status is cleared if we failed to start the run.
                 TestRunStatus.MarkFinished();
+                _activeMcpJobId = null;
                 if (adjustedPlayModeOptions)
                 {
                     RestoreEnterPlayModeOptions(originalEnterPlayModeOptionsEnabled, originalEnterPlayModeOptions);
@@ -264,19 +281,28 @@ namespace MCPForUnity.Editor.Services
                     RestoreEnterPlayModeOptions(originalEnterPlayModeOptionsEnabled, originalEnterPlayModeOptions);
                 }
 
+                _activeMcpJobId = null;
                 _operationLock.Release();
             }
         }
 
         public void Dispose()
         {
-            try
+            if (_callbacksRegistered)
             {
-                _testRunnerApi?.UnregisterCallbacks(this);
-            }
-            catch
-            {
-                // Ignore cleanup errors
+                _callbacksRegistered = false;
+                try
+                {
+                    _testRunnerApi?.UnregisterCallbacks(this);
+                }
+                catch
+                {
+                    // Ignore cleanup errors
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _liveCallbackOwnerCount);
+                }
             }
 
             if (_testRunnerApi != null)
@@ -287,20 +313,32 @@ namespace MCPForUnity.Editor.Services
             _operationLock.Dispose();
         }
 
+        private string GetActiveMcpJobId()
+        {
+            return string.IsNullOrWhiteSpace(_activeMcpJobId)
+                ? TestJobManager.CurrentJobId
+                : _activeMcpJobId;
+        }
+
         #region TestRunnerApi callbacks
 
         public void RunStarted(ITestAdaptor testsToRun)
         {
             _leafResults.Clear();
+            if (string.IsNullOrWhiteSpace(_activeMcpJobId))
+            {
+                _activeMcpJobId = TestJobManager.CurrentJobId;
+            }
+            string jobId = GetActiveMcpJobId();
             try
             {
                 List<string> selectedTests = new();
                 CollectLeafTestNames(testsToRun, selectedTests);
-                TestJobManager.OnRunStarted(selectedTests);
+                TestJobManager.OnRunStarted(jobId, selectedTests);
             }
             catch
             {
-                TestJobManager.OnRunStarted(null);
+                TestJobManager.OnRunStarted(jobId, null);
             }
         }
 
@@ -311,11 +349,12 @@ namespace MCPForUnity.Editor.Services
             // is recreated and _runCompletionSource is lost, but TestJobManager state persists via
             // SessionState and the Test Runner still delivers the RunFinished callback.
             TestRunResult payload = TestRunResult.Create(result, _leafResults);
+            string jobId = GetActiveMcpJobId();
 
             // Clean up state regardless of _runCompletionSource - these methods safely handle
             // the case where no MCP job exists (e.g., manual test runs via Unity UI).
-            TestJobManager.OnRunFinished();
-            TestJobStatus? validatedOutcome = TestJobManager.FinalizeCurrentJobFromRunFinished(payload);
+            TestJobManager.OnRunFinished(jobId);
+            TestJobStatus? validatedOutcome = TestJobManager.FinalizeCurrentJobFromRunFinished(jobId, payload);
             TestRunStatus.MarkFinished(
                 payload,
                 validatedOutcome.HasValue
@@ -336,6 +375,10 @@ namespace MCPForUnity.Editor.Services
                 _runCompletionSource.TrySetResult(payload);
                 _runCompletionSource = null;
             }
+            else
+            {
+                _activeMcpJobId = null;
+            }
         }
 
         public void TestStarted(ITestAdaptor test)
@@ -349,7 +392,7 @@ namespace MCPForUnity.Editor.Services
                     fullName = test?.Name;
                 }
                 bool isLeaf = test != null && !test.HasChildren;
-                TestJobManager.OnTestStarted(fullName, isLeaf);
+                TestJobManager.OnTestStarted(GetActiveMcpJobId(), fullName, isLeaf);
             }
             catch
             {
@@ -394,6 +437,7 @@ namespace MCPForUnity.Editor.Services
                     }
 
                     TestJobManager.OnLeafTestFinished(
+                        GetActiveMcpJobId(),
                         fullName,
                         result.ResultState,
                         isFailure,

@@ -144,13 +144,17 @@ namespace MCPForUnityTests.Editor
     /// completes immediately with StartResult so retry loops run without awaits
     /// (the test framework floor cannot run async tests).
     /// </summary>
-    public sealed class FakeTransportClient : IMcpTransportClient
+    public sealed class FakeTransportClient : IMcpTransportClient, IPersistentReconnectTransportClient
     {
         public bool StartResult = true;
+        public bool PersistentConnectsImmediately = true;
         public int StartCalls;
+        public int PersistentStartCalls;
         public Action OnStart;
 
         public bool IsConnected { get; private set; }
+        public bool IsReconnectSupervisorActive { get; private set; }
+        public string LastReconnectFailure { get; private set; }
         public string TransportName => "http";
         public TransportState State { get; private set; }
             = TransportState.Disconnected("http");
@@ -160,15 +164,47 @@ namespace MCPForUnityTests.Editor
             StartCalls++;
             OnStart?.Invoke();
             IsConnected = StartResult;
+            IsReconnectSupervisorActive = StartResult;
+            LastReconnectFailure = StartResult ? null : "fake start failure";
             State = StartResult
                 ? TransportState.Connected("http")
                 : TransportState.Disconnected("http", "fake start failure");
             return Task.FromResult(StartResult);
         }
 
+        public Task<bool> EnsureReconnectSupervisorAsync()
+        {
+            if (IsReconnectSupervisorActive)
+            {
+                return Task.FromResult(true);
+            }
+
+            PersistentStartCalls++;
+            OnStart?.Invoke();
+            IsReconnectSupervisorActive = StartResult;
+            IsConnected = StartResult && PersistentConnectsImmediately;
+            LastReconnectFailure = StartResult ? null : "fake persistent start failure";
+            State = IsConnected
+                ? TransportState.Connected("http")
+                : TransportState.Disconnected(
+                    "http",
+                    LastReconnectFailure ?? "fake reconnect pending",
+                    phase: StartResult ? TransportPhase.Backoff : TransportPhase.Faulted);
+            return Task.FromResult(StartResult);
+        }
+
+        public void CompletePersistentConnection()
+        {
+            IsReconnectSupervisorActive = true;
+            IsConnected = true;
+            LastReconnectFailure = null;
+            State = TransportState.Connected("http");
+        }
+
         public Task StopAsync()
         {
             IsConnected = false;
+            IsReconnectSupervisorActive = false;
             State = TransportState.Disconnected("http");
             return Task.CompletedTask;
         }

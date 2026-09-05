@@ -21,6 +21,11 @@ from utils.focus_nudge import nudge_unity_focus, should_nudge, reset_nudge_backo
 
 logger = logging.getLogger(__name__)
 
+MIN_INIT_TIMEOUT_MS = 1_000
+MAX_INIT_TIMEOUT_MS = 600_000
+DEFAULT_EDITMODE_INIT_TIMEOUT_MS = 15_000
+DEFAULT_PLAYMODE_INIT_TIMEOUT_MS = 120_000
+
 # Strong references to background fire-and-forget tasks to prevent premature GC.
 _background_tasks: set[asyncio.Task] = set()
 
@@ -100,6 +105,7 @@ class RunTestsStartData(BaseModel):
     job_id: str
     status: str
     mode: str | None = None
+    effective_init_timeout_ms: int | None = None
     include_details: bool | None = None
     include_failed_tests: bool | None = None
     fidelity: str | None = None
@@ -145,6 +151,7 @@ class GetTestJobData(BaseModel):
     started_unix_ms: int | None = None
     finished_unix_ms: int | None = None
     last_update_unix_ms: int | None = None
+    initialization: dict[str, Any] | None = None
     progress: TestJobProgress | None = None
     error: str | None = None
     result: RunTestsResult | None = None
@@ -183,8 +190,11 @@ async def run_tests(
     include_details: Annotated[bool,
                                "Include details for all tests (default: false)"] = False,
     init_timeout: Annotated[int | None,
-                            "Initialization timeout in milliseconds. PlayMode tests may need longer "
-                            "due to domain reload (default: 15000). Recommended: 120000 for PlayMode."] = None,
+                            "Deprecated compatibility name for init_timeout_ms. Values are milliseconds; "
+                            "60 means 60ms, not 60 seconds."] = None,
+    init_timeout_ms: Annotated[int | None,
+                               "Initialization timeout in milliseconds (1000-600000). Defaults to 15000 "
+                               "for EditMode and 120000 for PlayMode. Use 60000 for 60 seconds."] = None,
     clear_stuck: Annotated[bool,
                            "Clear an orphaned running job instead of starting a run. Use when a job "
                            "was lost to a domain reload and is blocking every subsequent run."] = False,
@@ -201,7 +211,7 @@ async def run_tests(
 ) -> RunTestsStartResponse | MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)
 
-    # Runs before both the init_timeout check and preflight on purpose: neither is relevant to
+    # Runs before both initialization-timeout validation and preflight on purpose: neither is relevant to
     # clearing, and requires_no_tests would reject the very call that exists to clear the
     # orphaned job blocking it.
     if clear_stuck:
@@ -215,8 +225,42 @@ async def run_tests(
             return MCPResponse(**response)
         return MCPResponse(success=False, error=str(response))
 
-    if init_timeout is not None and init_timeout <= 0:
-        return MCPResponse(success=False, error="init_timeout must be a positive integer (milliseconds) or None")
+    if init_timeout is not None and init_timeout_ms is not None and init_timeout != init_timeout_ms:
+        return MCPResponse(
+            success=False,
+            code="invalid_init_timeout",
+            error="invalid_init_timeout",
+            message="init_timeout and init_timeout_ms must match when both are supplied.",
+            data={"init_timeout": init_timeout, "init_timeout_ms": init_timeout_ms},
+        )
+    requested_init_timeout_ms = init_timeout_ms if init_timeout_ms is not None else init_timeout
+    effective_init_timeout_ms = (
+        requested_init_timeout_ms
+        if requested_init_timeout_ms is not None
+        else (
+            DEFAULT_PLAYMODE_INIT_TIMEOUT_MS
+            if mode == "PlayMode"
+            else DEFAULT_EDITMODE_INIT_TIMEOUT_MS
+        )
+    )
+    if not MIN_INIT_TIMEOUT_MS <= effective_init_timeout_ms <= MAX_INIT_TIMEOUT_MS:
+        return MCPResponse(
+            success=False,
+            code="invalid_init_timeout",
+            error="invalid_init_timeout",
+            message=(
+                f"Initialization timeout must be {MIN_INIT_TIMEOUT_MS}-{MAX_INIT_TIMEOUT_MS} milliseconds. "
+                "Use 60000 for 60 seconds or omit it for the mode-specific default."
+            ),
+            data={
+                "received_ms": requested_init_timeout_ms,
+                "effective_ms": effective_init_timeout_ms,
+                "minimum_ms": MIN_INIT_TIMEOUT_MS,
+                "maximum_ms": MAX_INIT_TIMEOUT_MS,
+                "editmode_default_ms": DEFAULT_EDITMODE_INIT_TIMEOUT_MS,
+                "playmode_default_ms": DEFAULT_PLAYMODE_INIT_TIMEOUT_MS,
+            },
+        )
     if minimum_tests < 1:
         return MCPResponse(success=False, error="minimum_tests must be at least 1")
 
@@ -247,6 +291,7 @@ async def run_tests(
         "failOnSkipped": fail_on_skipped,
         "fidelity": fidelity,
         "allowSceneSave": allow_scene_save,
+        "initTimeout": effective_init_timeout_ms,
     }
     if (t := _coerce_string_list(test_names)):
         params["testNames"] = t
@@ -258,9 +303,6 @@ async def run_tests(
         params["assemblyNames"] = a
     if (expected := _coerce_string_list(expected_tests)):
         params["expectedTests"] = expected
-    if init_timeout is not None and init_timeout > 0:
-        params["initTimeout"] = init_timeout
-
     response = await unity_transport.send_with_unity_instance(
         async_send_command_with_retry,
         unity_instance,
@@ -291,13 +333,41 @@ async def get_test_job(
     include_details: Annotated[bool,
                                "Include details for all tests (default: false)"] = False,
     wait_timeout: Annotated[int | None,
-                            "If set, wait up to this many seconds for tests to complete before returning. "
+                            "Deprecated compatibility name for wait_timeout_seconds. If set, wait up to "
+                            "this many seconds for tests to complete before returning. "
                             "Reduces polling frequency and avoids client-side loop detection. "
                             "Recommended: 30-60 seconds. Returns immediately if tests complete sooner."] = None,
+    wait_timeout_seconds: Annotated[int | None,
+                                    "If set, wait up to this many seconds for tests to complete before "
+                                    "returning. Recommended: 30-60 seconds."] = None,
     allow_focus_nudge: Annotated[bool,
                                  "Allow OS focus changes when an unfocused Editor appears stalled."] = False,
 ) -> GetTestJobResponse | MCPResponse:
     unity_instance = await get_unity_instance_from_context(ctx)
+
+    if (
+        wait_timeout is not None
+        and wait_timeout_seconds is not None
+        and wait_timeout != wait_timeout_seconds
+    ):
+        return MCPResponse(
+            success=False,
+            code="invalid_wait_timeout",
+            error="invalid_wait_timeout",
+            message="wait_timeout and wait_timeout_seconds must match when both are supplied.",
+            data={"wait_timeout": wait_timeout, "wait_timeout_seconds": wait_timeout_seconds},
+        )
+    effective_wait_timeout_seconds = (
+        wait_timeout_seconds if wait_timeout_seconds is not None else wait_timeout
+    )
+    if effective_wait_timeout_seconds is not None and effective_wait_timeout_seconds <= 0:
+        return MCPResponse(
+            success=False,
+            code="invalid_wait_timeout",
+            error="invalid_wait_timeout",
+            message="wait_timeout_seconds must be a positive integer or None.",
+            data={"received_seconds": effective_wait_timeout_seconds},
+        )
 
     params: dict[str, Any] = {"job_id": job_id}
     params["includeFailedTests"] = include_failed_tests
@@ -312,8 +382,8 @@ async def get_test_job(
         )
 
     # If wait_timeout is specified, poll server-side until complete or timeout
-    if wait_timeout and wait_timeout > 0:
-        deadline = asyncio.get_event_loop().time() + wait_timeout
+    if effective_wait_timeout_seconds:
+        deadline = asyncio.get_event_loop().time() + effective_wait_timeout_seconds
         poll_interval = 2.0  # Poll Unity every 2 seconds
         prev_last_update_unix_ms = None
 
